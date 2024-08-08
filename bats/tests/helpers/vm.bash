@@ -186,9 +186,6 @@ start_container_engine() {
             --experimental.virtual-machine.mount.9p.security-model="$RD_9P_SECURITY_MODEL"
         )
     fi
-    if is_windows; then
-        args+=("--experimental.virtual-machine.networking-tunnel=$(bool using_networking_tunnel)")
-    fi
     if using_vz_emulation; then
         args+=(--experimental.virtual-machine.type vz)
         if is_macos aarch64; then
@@ -243,7 +240,7 @@ EOF
 start_kubernetes() {
     start_container_engine \
         --kubernetes.enabled \
-        --kubernetes.version "$RD_KUBERNETES_PREV_VERSION" \
+        --kubernetes.version "$RD_KUBERNETES_VERSION" \
         "$@"
 }
 

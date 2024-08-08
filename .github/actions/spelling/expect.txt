@@ -24,8 +24,10 @@ amazonec
 amazoneks
 ANamespace
 andsection
+apierrors
 apify
 apiservice
+apitracker
 apk
 appdata
 APPDIR
@@ -74,6 +76,7 @@ bpf
 bpffs
 brucebean
 bsd
+bsdextrautils
 bsdtar
 btime
 bugtracker
@@ -105,6 +108,8 @@ chirico
 cidata
 cidfile
 Cim
+clientcmd
+clientset
 clonefile
 cloudca
 clusterdomain
@@ -134,7 +139,6 @@ connectaddress
 connectport
 constrainttemplate
 CONTAINERENGINE
-containo
 copypac
 coredns
 corejs
@@ -167,6 +171,7 @@ deadcode
 debbuild
 debian
 Debugf
+Debugw
 decamelize
 decapsulates
 dedot
@@ -177,6 +182,7 @@ destinationrule
 DETECTEXCEPTIONS
 developercertificate
 dfile
+dhclient
 diffdisk
 digitalocean
 dirents
@@ -187,7 +193,7 @@ Dlg
 dlgbmp
 dlicense
 dmg
-DNAT
+dnat
 dnf
 dnsmasq
 dockercfg
@@ -199,13 +205,15 @@ dompurify
 donotuse
 dotfile
 Dowloading
-dports
+dport
 dri
 DSL
 Duex
+dustin
 Dwm
 dwmapi
 DWMWA
+EACCESS
 eagerzeroedthick
 eastus
 ebegin
@@ -226,6 +234,7 @@ EPONY
 ERRFILE
 errgroup
 Errorln
+Errorw
 estargz
 ESXi
 etcdbackup
@@ -260,6 +269,7 @@ fleetworkspace
 Fluentd
 FOLDERID
 fontstack
+Forwardings
 fqname
 freeipa
 frontends
@@ -269,6 +279,7 @@ gabcdef
 gazornaanplatt
 gcs
 GENERALIZEDTIME
+getfattr
 getwindowid
 ghp
 gitmodules
@@ -278,12 +289,14 @@ globalrole
 globalrolebinding
 Gluster
 gname
+gochecknoglobals
 gofmt
 goland
 golangci
 gomod
 googlegke
 googleoauth
+gopacket
 gosec
 govet
 govmm
@@ -311,8 +324,8 @@ hklm
 HMR
 hocs
 horizontalpodautoscaler
-hostfile
 hosthandshake
+HOSTPORT
 hoverable
 howett
 hpa
@@ -338,6 +351,7 @@ iife
 imageinfo
 IMAGENAME
 IMAGEPATH
+INADDR
 inbox
 ine
 Infof
@@ -348,6 +362,7 @@ INSTALLPROPERTY
 ioctl
 ipaddr
 iptable
+Isf
 isthebestmeshuggahalbum
 istio
 istiod
@@ -432,8 +447,8 @@ linting
 linuxkit
 Linuxy
 listenaddress
+listenertracker
 listenport
-lll
 loadbalancer
 loblaw
 logdir
@@ -483,7 +498,7 @@ msixbundle
 msize
 msvs
 msys
-mszip
+mtu
 multierror
 multiport
 munged
@@ -498,6 +513,7 @@ navlink
 neq
 nerdctl
 netcat
+netlink
 netns
 netsh
 networkpolicy
@@ -518,6 +534,7 @@ nolint
 nologin
 nologo
 nomount
+nonamedreturns
 NONINFRINGEMENT
 noproxy
 norestart
@@ -563,6 +580,7 @@ pagerduty
 parsesection
 pascalize
 pathspec
+pcap
 pcs
 pdp
 penpot
@@ -591,8 +609,9 @@ poppins
 POptions
 portforward
 portmap
-Portmapping
+portmapping
 portproxy
+portstorage
 postgresql
 postrotate
 POSTROUTING
@@ -601,7 +620,6 @@ poweroff
 PQgrl
 prakhar
 prebuilds
-prewk
 Privs
 progresskey
 projectroletemplatebinding
@@ -609,6 +627,7 @@ Prometheis
 prometheusrule
 PROMPTROLLBACKCOST
 protip
+protobuf
 PROXYLIST
 PSelected
 PSHOME
@@ -629,6 +648,7 @@ rawdata
 rcedit
 rcfiles
 rcompare
+rdagent
 rdctl
 rddepman
 rdinstall
@@ -636,6 +656,7 @@ RDRUNAFTERINSTALL
 rdshell
 rdsudo
 rdtest
+rdvsock
 rdx
 readyz
 redhat
@@ -651,6 +672,7 @@ requried
 resolv
 resourcequota
 resourceset
+restclient
 restoretip
 resyncing
 reusecab
@@ -692,6 +714,8 @@ serveraddress
 servernum
 serviceaccount
 servicemonitor
+servicewatcher
+setfattr
 setproxy
 SFC
 sharedscripts
@@ -719,6 +743,7 @@ snakize
 softmmu
 someothername
 somepaththatshouldnevereverexist
+songgao
 sourced
 spinkube
 spinoperator
@@ -740,6 +765,7 @@ subshells
 subvar
 sumologic
 suse
+svclb
 SVCNAME
 SYD
 syscalls
@@ -747,6 +773,7 @@ sysdeps
 sysfs
 tarballs
 TARGETDIR
+tcpip
 tcshrc
 TEAMID
 teamocil
@@ -778,17 +805,19 @@ topmenu
 TQF
 Tracef
 traefik
-traefikservices
 transitioning
+trimpath
 trivy
 TVar
 tvf
 UAC
 ucmonitor
+udhcpc
 UEFI
 Unauthed
 UNCONFIGURED
 unexpose
+unexposing
 unfetch
 Uninstalls
 unparam
@@ -803,21 +832,24 @@ userdb
 usermod
 userpreference
 UTCTIME
+varnamelen
 vcenter
 vcpus
 vcs
-vde
 ventura
 VERSIONSTRING
 vertificate
 veth
+Vhd
 vhdx
 vinzenz
 virt
 virtio
 virtiofs
 virtsock
+virtualnetwork
 virtualservice
+vishvananda
 VMGUID
 vmnet
 VModal
@@ -831,6 +863,7 @@ vnode
 vsock
 vtun
 vtunnel
+vtunneltracker
 vuex
 vul
 vznat
@@ -855,6 +888,7 @@ wslify
 WSLINSTALLED
 WSLIs
 WSLKERNELOUTDATED
+wslproxy
 wslutils
 WWID
 wwn

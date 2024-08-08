@@ -143,6 +143,12 @@ mainEvents.on('settings-update', async(newSettings) => {
   }
   k8smanager.debug = runInDebugMode;
 
+  if (gone) {
+    console.debug('Suppressing settings-update because app is quitting');
+
+    return;
+  }
+
   await setPathManager(newSettings.application.pathManagementStrategy);
   await pathManager.enforce();
 
@@ -821,7 +827,10 @@ ipcMainProxy.on('k8s-restart', async() => {
 });
 
 ipcMainProxy.on('k8s-versions', async() => {
-  window.send('k8s-versions', await k8smanager.kubeBackend.availableVersions, await k8smanager.kubeBackend.cachedVersionsOnly());
+  const versions = await k8smanager.kubeBackend.availableVersions;
+  const cachedOnly = await k8smanager.kubeBackend.cachedVersionsOnly();
+
+  window.send('k8s-versions', versions.map(v => v.versionEntry), cachedOnly);
 });
 
 ipcMainProxy.on('k8s-progress', () => {
@@ -1270,7 +1279,10 @@ function newK8sManager() {
   });
 
   mgr.kubeBackend.on('versions-updated', async() => {
-    window.send('k8s-versions', await mgr.kubeBackend.availableVersions, await mgr.kubeBackend.cachedVersionsOnly());
+    const versions = await mgr.kubeBackend.availableVersions;
+    const cachedOnly = await mgr.kubeBackend.cachedVersionsOnly();
+
+    window.send('k8s-versions', versions.map(v => v.versionEntry), cachedOnly);
   });
 
   return mgr;

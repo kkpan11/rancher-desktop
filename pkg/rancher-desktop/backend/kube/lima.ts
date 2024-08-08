@@ -22,6 +22,7 @@ import { ContainerEngine } from '@pkg/config/settings';
 import mainEvents from '@pkg/main/mainEvents';
 import { checkConnectivity } from '@pkg/main/networking';
 import clone from '@pkg/utils/clone';
+import { SemanticVersionEntry } from '@pkg/utils/kubeVersions';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
 import { RecursivePartial } from '@pkg/utils/typeUtils';
@@ -299,7 +300,7 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
     return this.activeVersion?.version ?? '';
   }
 
-  get availableVersions(): Promise<K8s.VersionEntry[]> {
+  get availableVersions(): Promise<SemanticVersionEntry[]> {
     return this.k3sHelper.availableVersions;
   }
 
@@ -313,9 +314,13 @@ export default class LimaKubernetesBackend extends events.EventEmitter implement
 
   protected get desiredVersion(): Promise<semver.SemVer> {
     return (async() => {
-      const availableVersions = (await this.k3sHelper.availableVersions).map(v => v.version);
+      const availableVersions = await this.k3sHelper.availableVersions;
 
-      return await BackendHelper.getDesiredVersion(this.cfg as BackendSettings, availableVersions, this.vm.noModalDialogs, this.vm.writeSetting.bind(this.vm));
+      return await BackendHelper.getDesiredVersion(
+        this.cfg as BackendSettings,
+        availableVersions,
+        this.vm.noModalDialogs,
+        this.vm.writeSetting.bind(this.vm));
     })();
   }
 

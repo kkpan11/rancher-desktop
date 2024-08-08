@@ -45,23 +45,10 @@ export class KuberlrAndKubectl implements Dependency {
   githubRepo = 'kuberlr';
 
   async download(context: DownloadContext): Promise<void> {
-    // We use the x86_64 version even on aarch64 because kubectl binaries before v1.21.0 are unavailable
-    const kuberlrPath = await this.downloadKuberlr(context, context.versions.kuberlr, 'amd64');
     const arch = context.isM1 ? 'arm64' : 'amd64';
+    const kuberlrPath = await this.downloadKuberlr(context, context.versions.kuberlr, arch);
 
     await this.bindKubectlToKuberlr(kuberlrPath, path.join(context.binDir, exeName(context, 'kubectl')));
-
-    if (context.platform === os.platform()) {
-      // Download Kubectl into kuberlr's directory of versioned kubectl's
-      const kubeVersion = (await getResource('https://dl.k8s.io/release/stable.txt')).trim();
-      const kubectlURL = `https://dl.k8s.io/${ kubeVersion }/bin/${ context.goPlatform }/${ arch }/${ exeName(context, 'kubectl') }`;
-      const kubectlSHA = await getResource(`${ kubectlURL }.sha256`);
-      const homeDir = await this.findHome(context.platform === 'win32');
-      const kuberlrDir = path.join(homeDir, '.kuberlr', `${ context.goPlatform }-${ arch }`);
-      const managedKubectlPath = path.join(kuberlrDir, exeName(context, `kubectl${ kubeVersion.replace(/^v/, '') }`));
-
-      await download(kubectlURL, managedKubectlPath, { expectedChecksum: kubectlSHA });
-    }
   }
 
   async downloadKuberlr(context: DownloadContext, version: string, arch: 'amd64' | 'arm64'): Promise<string> {
@@ -278,6 +265,30 @@ export class DockerCompose implements Dependency, GitHubDependency {
   }
 }
 
+export class GoLangCILint implements Dependency, GitHubDependency {
+  name = 'golangci-lint';
+  githubOwner = 'golangci';
+  githubRepo = 'golangci-lint';
+
+  download(context: DownloadContext): Promise<void> {
+    // We don't actually download anything; when we invoke the linter, we just
+    // use `go run` with the appropriate package.
+    return Promise.resolve();
+  }
+
+  async getAvailableVersions(includePrerelease = false): Promise<string[]> {
+    return await getPublishedVersions(this.githubOwner, this.githubRepo, includePrerelease);
+  }
+
+  versionToTagName(version: string): string {
+    return `v${ version }`;
+  }
+
+  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
+    return semver.rcompare(version1, version2);
+  }
+}
+
 export class Trivy implements Dependency, GitHubDependency {
   name = 'trivy';
   githubOwner = 'aquasecurity';
@@ -298,7 +309,8 @@ export class Trivy implements Dependency, GitHubDependency {
     const trivyURL = `${ trivyURLBase }/download/${ versionWithV }/${ trivyBasename }.tar.gz`;
     const checksumURL = `${ trivyURLBase }/download/${ versionWithV }/trivy_${ context.versions.trivy }_checksums.txt`;
     const trivySHA = await findChecksum(checksumURL, `${ trivyBasename }.tar.gz`);
-    const trivyPath = path.join(context.resourcesDir, 'linux', 'internal', 'trivy');
+    const trivyDir = context.dependencyPlatform === 'wsl' ? 'staging' : 'internal';
+    const trivyPath = path.join(context.resourcesDir, 'linux', trivyDir, 'trivy');
 
     // trivy.tgz files are top-level tarballs - not wrapped in a labelled directory :(
     await downloadTarGZ(trivyURL, trivyPath, { expectedChecksum: trivySHA });
@@ -344,33 +356,6 @@ export class Steve implements Dependency, GitHubDependency {
   // as of the time of writing, all releases of steve are prerelease versions.
   // If this changes, the default value of includePrelease should be changed to false.
   async getAvailableVersions(includePrerelease = true): Promise<string[]> {
-    return await getPublishedVersions(this.githubOwner, this.githubRepo, includePrerelease);
-  }
-
-  versionToTagName(version: string): string {
-    return `v${ version }`;
-  }
-
-  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
-    return semver.rcompare(version1, version2);
-  }
-}
-
-export class GuestAgent implements Dependency, GitHubDependency {
-  name = 'guestAgent';
-  githubOwner = 'rancher-sandbox';
-  githubRepo = 'rancher-desktop-agent';
-
-  async download(context: DownloadContext): Promise<void> {
-    const baseUrl = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ context.versions.guestAgent }`;
-    const executableName = 'rancher-desktop-guestagent';
-    const url = `${ baseUrl }/${ executableName }-v${ context.versions.guestAgent }.tar.gz`;
-    const destPath = path.join(context.internalDir, executableName);
-
-    await downloadTarGZ(url, destPath);
-  }
-
-  async getAvailableVersions(includePrerelease = false): Promise<string[]> {
     return await getPublishedVersions(this.githubOwner, this.githubRepo, includePrerelease);
   }
 

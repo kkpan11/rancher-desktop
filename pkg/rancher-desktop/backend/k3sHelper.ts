@@ -26,6 +26,7 @@ import { isUnixError } from '@pkg/typings/unix.interface';
 import DownloadProgressListener from '@pkg/utils/DownloadProgressListener';
 import * as childProcess from '@pkg/utils/childProcess';
 import fetch from '@pkg/utils/fetch';
+import { SemanticVersionEntry } from '@pkg/utils/kubeVersions';
 import Latch from '@pkg/utils/latch';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
@@ -112,31 +113,6 @@ export class ChannelMapping {
 }
 
 /**
- * VersionEntry implements K8s.VersionEntry.
- *
- * This only exists to aid in debugging (by implementing util.debug.custom).
- * This is only exported for tests.
- */
-export class VersionEntry implements K8s.VersionEntry {
-  version: semver.SemVer;
-  channels?: string[];
-
-  constructor(version: semver.SemVer, channels: string[] = []) {
-    this.version = version;
-    if (channels.length > 0) {
-      this.channels = channels;
-    }
-  }
-
-  [util.inspect.custom](depth: number, options: util.InspectOptionsStylized) {
-    return util.inspect({
-      ...this,
-      version: this.version.raw,
-    }, { ...options, depth });
-  }
-}
-
-/**
  * Given a version, return the K3s build version.
  *
  * Note that this is only exported for testing.
@@ -155,7 +131,7 @@ export default class K3sHelper extends events.EventEmitter {
   protected readonly releaseApiUrl = 'https://api.github.com/repos/k3s-io/k3s/releases?per_page=100';
   protected readonly releaseApiAccept = 'application/vnd.github.v3+json';
   protected readonly cachePath = path.join(paths.cache, 'k3s-versions.json');
-  protected readonly minimumVersion = new semver.SemVer('1.15.0');
+  protected readonly minimumVersion = new semver.SemVer('1.21.0');
   protected versionFromChannel: Record<string, string> = {};
 
   constructor(arch: Architecture) {
@@ -168,7 +144,7 @@ export default class K3sHelper extends events.EventEmitter {
    * without any build information (since we only ever take the latest build).
    * Note that the key is in the form `1.0.0` (i.e. without the `v` prefix).
    */
-  protected versions: Record<ShortVersion, VersionEntry> = {};
+  protected versions: Record<ShortVersion, SemanticVersionEntry> = {};
 
   protected pendingNetworkSetup = Latch();
   protected pendingInitialize: Promise<void> | undefined;
@@ -195,8 +171,8 @@ export default class K3sHelper extends events.EventEmitter {
       for (const versionString of cacheData.versions) {
         const version = semver.parse(versionString);
 
-        if (version) {
-          this.versions[version.version] = new VersionEntry(version);
+        if (version && semver.gte(version, this.minimumVersion)) {
+          this.versions[version.version] = new SemanticVersionEntry(version);
         }
       }
 
@@ -287,7 +263,7 @@ export default class K3sHelper extends events.EventEmitter {
 
       return true;
     }
-    if (version < this.minimumVersion) {
+    if (version.compare(this.minimumVersion) < 0) {
       console.log(`Version ${ version } is less than the minimum ${ this.minimumVersion }, skipping.`);
 
       // We may have new patch versions for really old releases; fetch more.
@@ -329,7 +305,7 @@ export default class K3sHelper extends events.EventEmitter {
       const foundImage = this.filenames.images.find(name => entry.assets.some(v => v.name === name));
 
       if (foundImage) {
-        this.versions[version.version] = new VersionEntry(version);
+        this.versions[version.version] = new SemanticVersionEntry(version);
         console.log(`Adding version ${ version.raw } - ${ foundImage }`);
       } else {
         console.debug(`Skipping version ${ version.raw } due to missing image`);
@@ -562,7 +538,7 @@ export default class K3sHelper extends events.EventEmitter {
   /**
    * The versions that are available to install.
    */
-  get availableVersions(): Promise<K8s.VersionEntry[]> {
+  get availableVersions(): Promise<SemanticVersionEntry[]> {
     return (async() => {
       await this.initialize();
       const upstreamSeemsReachable = await checkConnectivity('k3s.io');
@@ -577,7 +553,7 @@ export default class K3sHelper extends events.EventEmitter {
     return !(await checkConnectivity('k3s.io'));
   }
 
-  static async filterVersionsAgainstCache(fullVersionList: K8s.VersionEntry[]): Promise<K8s.VersionEntry[]> {
+  static async filterVersionsAgainstCache(fullVersionList: SemanticVersionEntry[]): Promise<SemanticVersionEntry[]> {
     try {
       const cacheDir = path.join(paths.cache, 'k3s');
       const k3sFilenames = (await fs.promises.readdir(cacheDir))
@@ -629,8 +605,8 @@ export default class K3sHelper extends events.EventEmitter {
    * that is considered closest to the desired version:
    *
    * @precondition the desired version wasn't found
-   * @param desiredVersion: a semver for the version currently specified in the config
-   * @param k3sNames: typically a list of names like 'v1.2.3+k3s4'
+   * @param desiredVersion a semver for the version currently specified in the config
+   * @param k3sNames typically a list of names like 'v1.2.3+k3s4'
    * @returns {semver.SemVer} the oldest version newer than the desired version
    *      If there is more than one such version, favor the one with the highest '+k3s' build version
    *      If there are none, the newest version older than the desired version

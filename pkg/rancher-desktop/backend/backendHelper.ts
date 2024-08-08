@@ -14,6 +14,7 @@ import { LockedFieldError } from '@pkg/config/commandLineOptions';
 import { ContainerEngine, Settings } from '@pkg/config/settings';
 import * as settingsImpl from '@pkg/config/settingsImpl';
 import SettingsValidator from '@pkg/main/commandServer/settingsValidator';
+import { minimumUpgradeVersion, SemanticVersionEntry } from '@pkg/utils/kubeVersions';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
 import { jsonStringifyWithWhiteSpace } from '@pkg/utils/stringify';
@@ -143,12 +144,22 @@ export default class BackendHelper {
     return patterns;
   }
 
-  /**
-   * k3s versions 1.24.1 to 1.24.3 don't support the --docker option and need to talk to
-   * a cri_dockerd endpoint when using the moby engine.
-   */
   static requiresCRIDockerd(engineName: string, kubeVersion: string | semver.SemVer): boolean {
-    return engineName === ContainerEngine.MOBY && semver.gte(kubeVersion, '1.24.1') && semver.lte(kubeVersion, '1.24.3');
+    if (engineName !== ContainerEngine.MOBY) {
+      return false;
+    }
+    const ranges = [
+      // versions 1.24.1 to 1.24.3 don't support the --docker option
+      '1.24.1 - 1.24.3',
+      // cri-dockerd bundled with k3s is not compatible with docker 25.x (using API 1.44)
+      // see https://github.com/k3s-io/k3s/issues/9279
+      '1.26.8 - 1.26.13',
+      '1.27.5 - 1.27.10',
+      '1.28.0 - 1.28.6',
+      '1.29.0 - 1.29.1',
+    ];
+
+    return semver.satisfies(kubeVersion, ranges.join('||'));
   }
 
   static checkForLockedVersion(newVersion: semver.SemVer, cfg: BackendSettings, sv: SettingsValidator): void {
@@ -166,13 +177,13 @@ export default class BackendHelper {
   /**
    * Validate the cfg.kubernetes.version string
    * If it's valid and available, use it.
-   * Otherwise fall back to the first (recommended) available version.
+   * Otherwise fall back to the minimum upgrade version (highest patch release of lowest available version).
    */
-  static async getDesiredVersion(cfg: BackendSettings, availableVersions: semver.SemVer[], noModalDialogs: boolean, settingsWriter: (_: any) => void): Promise<semver.SemVer> {
+  static async getDesiredVersion(cfg: BackendSettings, availableVersions: SemanticVersionEntry[], noModalDialogs: boolean, settingsWriter: (_: any) => void): Promise<semver.SemVer> {
     const currentConfigVersionString = cfg?.kubernetes?.version;
     let storedVersion: semver.SemVer | null;
-    let matchedVersion: semver.SemVer | undefined;
-    const invalidK8sVersionMainMessage = `Requested kubernetes version '${ currentConfigVersionString }' is not a valid version.`;
+    let matchedVersion: SemanticVersionEntry | undefined;
+    const invalidK8sVersionMainMessage = `Requested kubernetes version '${ currentConfigVersionString }' is not a supported version.`;
     const sv = new SettingsValidator();
     const lockedSettings = settingsImpl.getLockedSettings();
     const versionIsLocked = lockedSettings.kubernetes?.version ?? false;
@@ -187,13 +198,20 @@ export default class BackendHelper {
       throw new Error('No kubernetes version available.');
     }
 
-    sv.k8sVersions = availableVersions.map(v => v.version);
+    const upgradeVersion = minimumUpgradeVersion(availableVersions);
+
+    if (!upgradeVersion) {
+      // This should never be reached, as `availableVersions` isn't empty.
+      throw new Error('Failed to find upgrade version.');
+    }
+
+    sv.k8sVersions = availableVersions.map(v => v.version.version);
     if (currentConfigVersionString) {
       storedVersion = semver.parse(currentConfigVersionString);
       if (storedVersion) {
         matchedVersion = availableVersions.find((v) => {
           try {
-            return v.compare(storedVersion as semver.SemVer) === 0;
+            return semver.eq(v.version, storedVersion!);
           } catch (err: any) {
             console.error(`Can't compare versions ${ storedVersion } and ${ v }: `, err);
             if (!(err instanceof TypeError)) {
@@ -206,9 +224,9 @@ export default class BackendHelper {
         });
         if (matchedVersion) {
           // This throws a LockedFieldError if it fails.
-          this.checkForLockedVersion(matchedVersion, cfg, sv);
+          this.checkForLockedVersion(matchedVersion.version, cfg, sv);
 
-          return matchedVersion;
+          return matchedVersion.version;
         } else if (versionIsLocked) {
           // This is a bit subtle. If we're here, the user specified a nonexistent version in the locked manifest.
           // We can't switch to the default version, so throw a fatal error.
@@ -220,7 +238,7 @@ export default class BackendHelper {
         throw new LockedFieldError(`Locked kubernetes version '${ currentConfigVersionString }' isn't a valid version.`);
       }
       const message = invalidK8sVersionMainMessage;
-      const detail = `Falling back to the most recent stable version of ${ availableVersions[0] }`;
+      const detail = `Falling back to recommended minimum upgrade version of ${ upgradeVersion.version.version }`;
 
       if (noModalDialogs) {
         console.log(`${ message } ${ detail }`);
@@ -237,10 +255,10 @@ export default class BackendHelper {
       }
     }
     // No (valid) stored version; save the default one.
-    // Because no version was specified, there can't be a locked version field, so no need to call checkForLockedVersion
-    settingsWriter({ kubernetes: { version: availableVersions[0].version } });
+    // Because no version was specified, there can't be a locked version field, so no need to call checkForLockedVersion.
+    settingsWriter({ kubernetes: { version: upgradeVersion.version.version } });
 
-    return availableVersions[0];
+    return upgradeVersion.version;
   }
 
   /**

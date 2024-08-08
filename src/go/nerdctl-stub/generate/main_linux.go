@@ -1,6 +1,3 @@
-//go:build linux
-// +build linux
-
 // package main produces stubs for the nerdctl subcommands (and their
 // options); this is expected to be overridden for options that involve paths.
 // All options generated this will have their values ignored.
@@ -68,6 +65,8 @@ func main() {
 		logrus.WithError(err).WithField("path", outputPath).Fatal("error creating output")
 	}
 	defer output.Close()
+	//nolint:dogsled // we only require the file name; we can also ignore `ok`, as
+	// on failure we just have no useful file name.
 	_, filename, _, _ := runtime.Caller(0)
 	data := map[string]interface{}{
 		"package": filename,

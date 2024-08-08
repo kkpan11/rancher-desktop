@@ -674,11 +674,11 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
   /**
    * Copy a file from Windows to the WSL distribution.
    */
-  protected async wslInstall(windowsPath: string, targetDirectory: string): Promise<void> {
+  protected async wslInstall(windowsPath: string, targetDirectory: string, targetBasename: string = ''): Promise<void> {
     const wslSourcePath = await this.wslify(windowsPath);
     const basename = path.basename(windowsPath);
     // Don't use `path.join` or the backslashes will come back.
-    const targetFile = `${ targetDirectory }/${ basename }`;
+    const targetFile = `${ targetDirectory }/${ targetBasename || basename }`;
 
     console.log(`Installing ${ windowsPath } as ${ wslSourcePath } into ${ targetFile } ...`);
     try {
@@ -903,54 +903,24 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
     }
   }
 
-  /**
-   * On Windows Trivy is run via WSL as there's no native port.
-   * Ensure that all relevant files are in the wsl mount, not the windows one.
-   */
-  protected async installTrivy() {
-    // download-resources.sh installed trivy into the resources area
-    // This function moves it into /usr/local/bin/ so when trivy is
-    // invoked to run through wsl, it runs faster.
-
-    const trivyExecPath = path.join(paths.resources, 'linux', 'internal', 'trivy');
-
-    await this.execCommand('mkdir', '-p', '/var/local/bin');
-    await this.wslInstall(trivyExecPath, '/usr/local/bin');
-  }
-
   protected async installGuestAgent(kubeVersion: semver.SemVer | undefined, cfg: BackendSettings | undefined) {
-    let guestAgentConfig: Record<string, any>;
     const enableKubernetes = !!kubeVersion;
     const iptables = enableKubernetes && !K3sHelper.requiresPortForwardingFix(kubeVersion);
-    const rdNetworking = !!cfg?.experimental.virtualMachine.networkingTunnel;
+    const isAdminInstall = await this.getIsAdminInstall();
 
-    if (rdNetworking || this.privilegedServiceEnabled) {
-      guestAgentConfig = {
-        LOG_DIR:                       await this.wslify(paths.logs),
-        GUESTAGENT_ADMIN_INSTALL:      await this.getIsAdminInstall(),
-        GUESTAGENT_KUBERNETES:         enableKubernetes ? 'true' : 'false',
-        GUESTAGENT_IPTABLES:           iptables.toString(), // only enable IPTABLES for older K8s
-        GUESTAGENT_PRIVILEGED_SERVICE: rdNetworking ? 'false' : 'true',
-        GUESTAGENT_CONTAINERD:         cfg?.containerEngine.name === ContainerEngine.CONTAINERD ? 'true' : 'false',
-        GUESTAGENT_DOCKER:             cfg?.containerEngine.name === ContainerEngine.MOBY ? 'true' : 'false',
-        GUESTAGENT_DEBUG:              this.debug ? 'true' : 'false',
-        GUESTAGENT_K8S_SVC_ADDR:       cfg?.kubernetes.ingress.localhostOnly ? '127.0.0.1' : '0.0.0.0',
-      };
-    } else {
-      guestAgentConfig = {
-        LOG_DIR:                       await this.wslify(paths.logs),
-        GUESTAGENT_KUBERNETES:         enableKubernetes ? 'true' : 'false',
-        GUESTAGENT_PRIVILEGED_SERVICE: 'false',
-        GUESTAGENT_IPTABLES:           'true',
-        GUESTAGENT_DEBUG:              this.debug ? 'true' : 'false',
-        GUESTAGENT_K8S_SVC_ADDR:       '127.0.0.1', // always use localhost for non-privileged installation/user
-      };
-    }
-
-    const guestAgentPath = path.join(paths.resources, 'linux', 'internal', 'rancher-desktop-guestagent');
+    const guestAgentConfig: Record<string, string> = {
+      LOG_DIR:                       await this.wslify(paths.logs),
+      GUESTAGENT_ADMIN_INSTALL:      isAdminInstall ? 'true' : 'false',
+      GUESTAGENT_KUBERNETES:         enableKubernetes ? 'true' : 'false',
+      GUESTAGENT_IPTABLES:           iptables.toString(), // only enable IPTABLES for older K8s
+      GUESTAGENT_PRIVILEGED_SERVICE: this.privilegedServiceEnabled ? 'true' : 'false',
+      GUESTAGENT_CONTAINERD:         cfg?.containerEngine.name === ContainerEngine.CONTAINERD ? 'true' : 'false',
+      GUESTAGENT_DOCKER:             cfg?.containerEngine.name === ContainerEngine.MOBY ? 'true' : 'false',
+      GUESTAGENT_DEBUG:              this.debug ? 'true' : 'false',
+      GUESTAGENT_K8S_SVC_ADDR:       isAdminInstall && !cfg?.kubernetes.ingress.localhostOnly ? '0.0.0.0' : '127.0.0.1',
+    };
 
     await Promise.all([
-      this.wslInstall(guestAgentPath, '/usr/local/bin/'),
       this.writeFile('/etc/init.d/rancher-desktop-guestagent', SERVICE_GUEST_AGENT_INIT, 0o755),
       this.writeConf('rancher-desktop-guestagent', guestAgentConfig),
     ]);
@@ -1525,7 +1495,6 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
                 this.runWslProxy().catch(console.error);
               }
             }),
-            this.progressTracker.action('Installing image scanner', 100, this.installTrivy()),
             this.progressTracker.action('Installing CA certificates', 100, this.installCACerts()),
             this.progressTracker.action('Installing helpers', 50, this.installWSLHelpers()),
           ]));
@@ -1565,6 +1534,18 @@ export default class WSLBackend extends events.EventEmitter implements VMBackend
               }),
               this.progressTracker.action('Installing k3s', 100, async() => {
                 await this.kubeBackend.deleteIncompatibleData(version);
+                // On older versions of K3s, we need to enable ip_forward to allow traefik to work.
+                // Otherwise the "svclb" pods exit immediately.  This needs to be done in the
+                // default namespace; it does not seem to inherit from the RD network namespace.
+                const versionsNeedingForward = [
+                  '<1.23.13',
+                  '>=1.24.0 <1.24.7',
+                  '>=1.25.0 <1.25.3',
+                ];
+
+                if (semver.satisfies(version, versionsNeedingForward.join(' || '))) {
+                  await this.execCommand('/sbin/sysctl', '-w', 'net.ipv4.ip_forward=1');
+                }
                 await this.kubeBackend.install(config, version, false);
               })]));
           }

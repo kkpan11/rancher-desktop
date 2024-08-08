@@ -2,13 +2,17 @@ package reg
 
 import (
 	"fmt"
-	"github.com/stretchr/testify/assert"
 	"sort"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+const (
+	DefaultsHeader = "HKEY_CURRENT_USER\\SOFTWARE\\Policies\\Rancher Desktop\\defaults"
 )
 
 func TestJsonToRegFormat(t *testing.T) {
-
 	t.Run("complains about bad arguments", func(t *testing.T) {
 		type errorTestCases struct {
 			hiveType      string
@@ -47,15 +51,14 @@ func TestJsonToRegFormat(t *testing.T) {
 	t.Run("handles empty bodies", func(t *testing.T) {
 		lines, err := JsonToReg("hkcu", "defaults", "{}")
 		assert.NoError(t, err)
-		header := "HKEY_CURRENT_USER\\SOFTWARE\\Policies\\Rancher Desktop\\defaults"
 		assert.NoError(t, err)
-		assert.Equal(t, fmt.Sprintf("[%s]", header), lines[3])
+		assert.Equal(t, fmt.Sprintf("[%s]", DefaultsHeader), lines[3])
 		assert.Equal(t, 5, len(lines))
 		assert.Equal(t, "Windows Registry Editor Version 5.00", lines[0])
 		assert.Equal(t, "[HKEY_CURRENT_USER\\SOFTWARE\\Policies]", lines[1])
 		assert.Equal(t, "[HKEY_CURRENT_USER\\SOFTWARE\\Policies\\Rancher Desktop]", lines[2])
 		assert.Equal(t, "[HKEY_CURRENT_USER\\SOFTWARE\\Policies\\Rancher Desktop\\defaults]", lines[3])
-		assert.Equal(t, `"version"=dword:c`, lines[4])
+		assert.Equal(t, `"version"=dword:d`, lines[4])
 	})
 	t.Run("converts the registry-type arguments into reg headers", func(t *testing.T) {
 		type testCaseType struct {
@@ -67,7 +70,7 @@ func TestJsonToRegFormat(t *testing.T) {
 			{
 				hiveType:       "hkcu",
 				profileType:    "defaults",
-				expectedHeader: "HKEY_CURRENT_USER\\SOFTWARE\\Policies\\Rancher Desktop\\defaults",
+				expectedHeader: DefaultsHeader,
 			},
 			{
 				hiveType:       "hklm",
@@ -109,7 +112,7 @@ func TestJsonToRegFormat(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, 12, len(lines))
 		assert.Equal(t, fmt.Sprintf("[%s]", header), lines[3])
-		assert.Equal(t, `"version"=dword:c`, lines[4])
+		assert.Equal(t, `"version"=dword:d`, lines[4])
 		assert.Equal(t, fmt.Sprintf("[%s\\application]", header), lines[5])
 		assert.Equal(t, fmt.Sprintf("[%s\\application\\extensions]", header), lines[6])
 		assert.Equal(t, fmt.Sprintf("[%s\\application\\extensions\\allowed]", header), lines[7])

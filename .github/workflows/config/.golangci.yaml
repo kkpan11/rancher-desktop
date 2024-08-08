@@ -54,51 +54,17 @@ linters:
   enable:
     - bodyclose
     - dogsled
-    - dupl
     - errcheck
     - exportloopref
     - goconst
-    - gocritic
     - gofmt
     - goimports
-    - gomnd
     - goprintffuncname
-    - gosec
-    - gosimple
-    - govet
     - ineffassign
-    - lll
-    - misspell
-    - nakedret
-    - noctx
-    - staticcheck
-    - stylecheck
     - typecheck
     - unconvert
-    - unparam
     - unused
     - whitespace
-
-  # don't enable:
-  # - asciicheck
-  # - funlen
-  # - scopelint
-  # - gochecknoglobals
-  # - gochecknoinits
-  # - gocognit
-  # - godot
-  # - godox
-  # - goerr113
-  # - interfacer
-  # - maligned
-  # - nestif
-  # - nolintlint
-  # - prealloc
-  # - testpackage
-  # - revive
-  # - wsl
-  # - depguard # Requires configuration and by default only allows stdlib imports
-
 issues:
   # Excluding configuration per-path, per-linter, per-text and per-source
   exclude-rules:
@@ -107,6 +73,11 @@ issues:
         - gosec
         - errcheck
         - gocritic
+    - # Exclude bodyclose when it's passed to client.ProcessRequestForAPI
+      # or client.ProcessRequestForUtility which internally closes the body.
+      path: src/go/rdctl/
+      linters: [ bodyclose ]
+      source: "client.ProcessRequestFor(API|Utility)\\(rdClient.DoRequest(WithPayload)?\\("
     - # Exclude ST1005 when it encounters errors starting with proper noun
       linters: [ stylecheck ]
       text: "ST1005:"
@@ -119,6 +90,6 @@ issues:
       path: src/go/wsl-helper/pkg/dockerproxy/platform/vsock_linux\.go
       linters: [ gocritic ]
       text: todoCommentWithoutDetail
-    - # Exclude ignoring errors from syscall
+    - # Ignore errors from syscall
       linters: [ dogsled ]
       source: ^\s*_, _, _ = .*\.Call\(

@@ -23,13 +23,21 @@ on:
         description: Container engines to run
         default: 'containerd moby'
         type: string
+      kubernetes-version:
+        description: Primary Kubernetes version to test
+        default: '1.22.7' # Must also change in calculate step
+        type: string
+      kubernetes-alt-version:
+        description: Secondary Kubernetes version to test (e.g. for upgrades)
+        default: '1.28.11' # Must also change in calculate step
+        type: string
       package-id:
         description: Package run ID override; leave empty to use latest.
         default: ''
         type: string
-      rd-use-networking-tunnel:
-        description: Use networking tunnel (on Windows)
-        default: true
+      experimental:
+        description: Run with experimental settings (WSL)
+        default: false
         type: boolean
   schedule:
   - cron: '0 8 * * 1-5' # 8AM UTC weekdays as a baseline
@@ -82,9 +90,12 @@ jobs:
       # This script is not inline to make local testing easier
       run: python3 ${{ github.workspace }}/.github/workflows/bats/get-tests.py
       env:
-        TESTS: ${{ inputs.tests }}
-        PLATFORMS: ${{ inputs.platforms }}
-        ENGINES: ${{ inputs.engines }}
+        TESTS:                  ${{ inputs.tests }}
+        PLATFORMS:              ${{ inputs.platforms }}
+        ENGINES:                ${{ inputs.engines }}
+        KUBERNETES_VERSION:     ${{ inputs.kubernetes-version || '1.22.7' }}
+        # rancher/rancher helm chart 2.8.5 supports up to 1.28.*
+        KUBERNETES_ALT_VERSION: ${{ inputs.kubernetes-alt-version || '1.28.11' }}
       working-directory: bats/tests
     outputs:
       repo: ${{ steps.repo.outputs.repo }}
@@ -164,7 +175,27 @@ jobs:
       shell: pwsh
       run: >-
         wsl.exe -d Debian --exec /usr/bin/env DEBIAN_FRONTEND=noninteractive
-        sh -c 'apt-get update && apt-get install --yes coreutils curl'
+        sh -c 'apt-get update && apt-get install --yes bsdextrautils coreutils curl'
+
+    - name: "Windows: Enable experimental WSL settings"
+      if: runner.os == 'Windows' && inputs.experimental
+      shell: pwsh
+      run: |
+        Set-Content -Encoding UTF8NoBOM -Path "${HOME}/.wslconfig" -Value @"
+        ; Note that not all settings here make sense together.
+        [wsl]
+        dnsProxy=false
+        ; networkingMode=mirrored ; https://github.com/rancher-sandbox/rancher-desktop/issues/6665
+        firewall=true
+        dnsTunneling=true
+        autoProxy=true
+        [experimental]
+        autoMemoryReclaim=gradual
+        sparseVhd=true
+        useWindowsDnsCache=true
+        bestEffortDnsParsing=true
+        hostAddressLoopback=true
+        "@
 
     - name: Set log directory
       shell: bash
@@ -224,27 +255,29 @@ jobs:
         --report-formatter tap
         'tests/${{ steps.normalize.outputs.test }}'
       env:
-        BATS_COMMAND:             ${{ env.BATS_COMMAND }}
-        GITHUB_TOKEN:             ${{ github.token }}
-        LOGS_DIR:                 ${{ env.LOGS_DIR }}
-        RD_CAPTURE_LOGS:          "true"
-        RD_CONTAINER_ENGINE:      ${{ matrix.engine }}
-        RD_TAKE_SCREENSHOTS:      "true"
-        RD_TRACE:                 "true"
-        RD_USE_GHCR_IMAGES:       "true"
-        RD_USE_RAMDISK:           "true"
-        RD_USE_WINDOWS_EXE:       "${{ runner.os == 'Windows' }}"
-        RD_USE_NETWORKING_TUNNEL: "${{ runner.os == 'Windows' && format('{0}', inputs.rd-use-networking-tunnel) != 'false' }}"
+        BATS_COMMAND:              ${{ env.BATS_COMMAND }}
+        GITHUB_TOKEN:              ${{ github.token }}
+        LOGS_DIR:                  ${{ env.LOGS_DIR }}
+        RD_CAPTURE_LOGS:           "true"
+        RD_CONTAINER_ENGINE:       ${{ matrix.engine }}
+        RD_KUBERNETES_VERSION:     ${{ matrix.k3sVersion }}
+        RD_KUBERNETES_ALT_VERSION: ${{ matrix.k3sAltVersion }}
+        RD_TAKE_SCREENSHOTS:       "true"
+        RD_TRACE:                  "true"
+        RD_USE_GHCR_IMAGES:        "true"
+        RD_USE_RAMDISK:            "true"
+        RD_USE_WINDOWS_EXE:        "${{ runner.os == 'Windows' }}"
         WSLENV: "\
           GITHUB_TOKEN:\
           RD_CAPTURE_LOGS:\
           RD_CONTAINER_ENGINE:\
+          RD_KUBERNETES_VERSION:\
+          RD_KUBERNETES_ALT_VERSION:\
           RD_TAKE_SCREENSHOTS:\
           RD_TRACE:\
           RD_USE_GHCR_IMAGES:\
           RD_USE_RAMDISK:\
           RD_USE_WINDOWS_EXE:\
-          RD_USE_NETWORKING_TUNNEL:\
           "
       working-directory: bats
       timeout-minutes: 120
@@ -293,7 +326,7 @@ jobs:
 
   summarize:
     name: Summarize output
-    needs: bats
+    needs: [ get-tests, bats ]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
@@ -312,3 +345,5 @@ jobs:
       with:
         pattern: "*.logs"
     - run: node .github/workflows/bats/summarize.mjs
+      env:
+        EXPECTED_TESTS: ${{ needs.get-tests.outputs.tests }}

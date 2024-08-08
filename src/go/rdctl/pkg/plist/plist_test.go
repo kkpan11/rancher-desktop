@@ -1,8 +1,9 @@
 package plist
 
 import (
-	"github.com/stretchr/testify/assert"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestJsonToPlistFormat(t *testing.T) {
@@ -14,7 +15,7 @@ func TestJsonToPlistFormat(t *testing.T) {
 <plist version="1.0">
   <dict>
     <key>version</key>
-    <integer>12</integer>
+    <integer>13</integer>
   </dict>
 </plist>
 `, s)
@@ -32,7 +33,7 @@ func TestJsonToPlistFormat(t *testing.T) {
 <plist version="1.0">
   <dict>
     <key>version</key>
-    <integer>12</integer>
+    <integer>13</integer>
     <key>application</key>
     <dict>
       <key>extensions</key>
@@ -368,7 +369,7 @@ func TestJsonToPlistFormat(t *testing.T) {
 <plist version="1.0">
   <dict>
     <key>version</key>
-    <integer>12</integer>
+    <integer>13</integer>
     <key>application</key>
     <dict>
       <key>extensions</key>
@@ -408,5 +409,4 @@ func TestJsonToPlistFormat(t *testing.T) {
 </plist>
 `, s)
 	})
-
 }

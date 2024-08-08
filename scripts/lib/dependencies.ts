@@ -41,6 +41,7 @@ export type DependencyVersions = {
   dockerCLI: string;
   dockerBuildx: string;
   dockerCompose: string;
+  'golangci-lint': string;
   trivy: string;
   steve: string;
   guestAgent: string;
@@ -72,6 +73,11 @@ export async function writeDependencyVersions(path: string, depVersions: Depende
 
 export interface Dependency {
   name: string,
+  /**
+   * Other dependencies this one requires.
+   * This must be in the form <name>:<platform>, e.g. "kuberlr:linux"
+   */
+  dependencies?: (context: DownloadContext) => string[],
   download(context: DownloadContext): Promise<void>
   // Returns the available versions of the Dependency.
   // Includes prerelease versions if includePrerelease is true.

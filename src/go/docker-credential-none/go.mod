@@ -3,7 +3,7 @@ module github.com/rancher-sandbox/rancher-desktop/src/go/docker-credential-none
 go 1.21
 
 require (
-	github.com/docker/cli v27.0.2+incompatible
+	github.com/docker/cli v27.1.1+incompatible
 	github.com/docker/docker-credential-helpers v0.8.2
 )
 
@@ -14,6 +14,6 @@ require (
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/stretchr/testify v1.9.0 // indirect
-	golang.org/x/sys v0.21.0 // indirect
-	gotest.tools/v3 v3.5.0 // indirect
+	golang.org/x/sys v0.23.0 // indirect
+	gotest.tools/v3 v3.5.1 // indirect
 )
