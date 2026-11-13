@@ -7,9 +7,9 @@ import (
 	"strings"
 )
 
-func VersionCommand(version string, command string) string {
+func VersionCommand(version, command string) string {
 	if version == "" {
-		version = ApiVersion
+		version = APIVersion
 	}
 	if strings.HasPrefix(command, "/") {
 		return fmt.Sprintf("%s%s", version, command)
@@ -48,26 +48,27 @@ func ProcessRequestForUtility(response *http.Response, err error) ([]byte, error
 	if err := handleConnectionRefused(err); err != nil {
 		return nil, err
 	}
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+
 	statusMessage := ""
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		// Note that response.Status includes response.StatusCode
 		switch response.StatusCode {
-		case 400:
+		case http.StatusBadRequest: // 400
 			statusMessage = response.Status
 			// Prefer the error message in the body written by the command-server, not the one from the http server.
-			break
-		case 401:
+		case http.StatusUnauthorized: // 401
 			return nil, fmt.Errorf("%s: user/password not accepted", response.Status)
-		case 413:
+		case http.StatusRequestEntityTooLarge: // 413
 			return nil, fmt.Errorf("%s", response.Status)
-		case 500:
+		case http.StatusInternalServerError: // 500
 			return nil, fmt.Errorf("%s: server-side problem: please consult the server logs for more information", response.Status)
 		default:
 			return nil, fmt.Errorf("%s (unexpected server error)", response.Status)
 		}
 	}
-
-	defer response.Body.Close()
 
 	body, err := io.ReadAll(response.Body)
 	if err != nil {

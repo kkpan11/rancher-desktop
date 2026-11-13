@@ -9,34 +9,17 @@ on:
 
 jobs:
   check-paths:
-    uses: ./.github/workflows/paths-ignore.yaml
+    uses: $/.github/workflows/paths-ignore.yaml
   e2e-tests:
     needs: check-paths
     if: needs.check-paths.outputs.should-run == 'true'
     timeout-minutes: 150
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # For compatibility with runners without yarn, we need to install node
-      # once, install yarn, then install node again to get caching.
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: package.json
-      - run: npm install --global yarn
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: package.json
-          cache: yarn
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.work
-          cache-dependency-path: src/go/**/go.sum
-      # For now, we don't need to `pip install setuptools` because we're not on
-      # Python 3.12; we will need that later, however.
-      - name: Install dependencies
-        run: yarn install --frozen-lockfile
+      - uses: $/.github/actions/yarn-install
       - name: Disable admin-access before start up
         run: |
           mkdir -p $HOME/.config/rancher-desktop
@@ -60,7 +43,7 @@ jobs:
           CI: true
         timeout-minutes: 150
       - name: Upload failure reports
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: failure-reports.zip

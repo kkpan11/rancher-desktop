@@ -1,7 +1,4 @@
-# Test case 36
-# On Windows, You need to create a firewall rule to allow communication
-# between the host and the container. Please check the below link for instructions.
-# https://docs.rancherdesktop.io/faq#q-can-containers-reach-back-to-host-services-via-hostdockerinternal
+# bats file_tags=opensuse
 
 load '../helpers/load'
 
@@ -9,26 +6,37 @@ load '../helpers/load'
     factory_reset
 }
 
-skip_on_legacy_networking() {
-    if is_windows && ! using_networking_tunnel; then
-        # The test also works with a firewall rule, but somehow the rule seems to
-        # stop working randomly and then needs to be deleted and recreated. We are
-        # not automating this just for the sake of the legacy implementation.
-        skip "This test requires the new networking tunnel on Windows"
-    fi
-}
-
 @test 'start container engine' {
-    skip_on_legacy_networking
     start_container_engine
     wait_for_container_engine
 }
 
 verify_host_connectivity() {
-    skip_on_legacy_networking
     run ctrctl run --rm "$IMAGE_BUSYBOX" timeout -s INT 10 ping -c 5 "$1"
     assert_success
     assert_output --partial "5 packets transmitted, 5 packets received, 0% packet loss"
+}
+
+# Some networks drop pings, so the test can only pass where the host itself
+# gets a reply.
+skip_unless_network_allows_ping() {
+    local address=$1
+    local -a ping_once
+    if is_windows; then
+        ping_once=(ping.exe -n 1 -w 5000 "$address")
+    elif is_macos; then
+        ping_once=(ping -c 1 -t 5 "$address")
+    else
+        ping_once=(ping -c 1 -W 5 "$address")
+    fi
+    if ! "${ping_once[@]}" >/dev/null; then
+        skip "The host itself cannot ping $address"
+    fi
+}
+
+@test 'ping an external address from a container' {
+    skip_unless_network_allows_ping 1.1.1.1
+    verify_host_connectivity 1.1.1.1
 }
 
 @test 'ping host.docker.internal from a container' {

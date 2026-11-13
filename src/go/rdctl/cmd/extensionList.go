@@ -19,14 +19,17 @@ limitations under the License.
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 
+	"github.com/spf13/cobra"
+
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/client"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/config"
-	"github.com/spf13/cobra"
 )
 
 // listCmd represents the list command
@@ -38,7 +41,7 @@ var listCmd = &cobra.Command{
 	Args:    cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmd.SilenceUsage = true
-		return listExtensions()
+		return listExtensions(cmd.Context())
 	},
 }
 
@@ -46,14 +49,14 @@ func init() {
 	extensionCmd.AddCommand(listCmd)
 }
 
-func listExtensions() error {
+func listExtensions(ctx context.Context) error {
 	connectionInfo, err := config.GetConnectionInfo(false)
 	if err != nil {
 		return fmt.Errorf("failed to get connection info: %w", err)
 	}
 	rdClient := client.NewRDClient(connectionInfo)
-	endpoint := fmt.Sprintf("/%s/extensions", client.ApiVersion)
-	result, errorPacket, err := client.ProcessRequestForAPI(rdClient.DoRequest("GET", endpoint))
+	endpoint := fmt.Sprintf("/%s/extensions", client.APIVersion)
+	result, errorPacket, err := client.ProcessRequestForAPI(rdClient.DoRequest(ctx, http.MethodGet, endpoint))
 	if errorPacket != nil || err != nil {
 		return displayAPICallResult([]byte{}, errorPacket, err)
 	}

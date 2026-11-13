@@ -7,14 +7,10 @@ resources_dir=$(dirname "$0")
 
 # We run setup-spin in the rancher-desktop distro to setup spin on the Win32 host.
 if [ "${WSL_DISTRO_NAME:-}" = "rancher-desktop" ]; then
-  app_data_dir=$(/bin/wslpath "$(powershell.exe -Command "Write-Output \${Env:LOCALAPPDATA}")" | tr -d "\r")
-  system_root=$(/bin/wslpath "$(powershell.exe -Command "Write-Output \${Env:SystemRoot}")" | tr -d "\r")
   spin="${resources_dir}/win32/bin/spin.exe"
 elif [ "$(uname)" = "Linux" ]; then
-  app_data_dir="${XDG_DATA_HOME:-$HOME/.local/share}"
   spin="${resources_dir}/linux/bin/spin"
 else
-  app_data_dir="${HOME}/Library/Application Support"
   spin="${resources_dir}/darwin/bin/spin"
 fi
 
@@ -22,19 +18,6 @@ if [ ! -x "$spin" ]; then
   echo "Cannot execute '${spin}' (or does not exist)"
   exit 1
 fi
-
-assert_dir_is_empty() {
-  # shellcheck disable=SC2012 # Using `ls` is fine
-  if [ -d "$1" ] && [ "$(ls -1 "$1" | wc -l)" -gt 0 ]; then
-    echo "'$1' already exists and is not empty"
-    exit 0
-  fi
-}
-
-spin_dir="${app_data_dir}/spin"
-
-assert_dir_is_empty "${spin_dir}/templates"
-assert_dir_is_empty "${spin_dir}/plugins"
 
 if [ "${WSL_DISTRO_NAME:-}" = "rancher-desktop" ]; then
   echo "Waiting for github.com to become resolvable"
@@ -48,73 +31,32 @@ if [ "${WSL_DISTRO_NAME:-}" = "rancher-desktop" ]; then
   done
 fi
 
-# The reason for this complexity is to be able to run on systems without git.
-# We do need either curl or wget to be on the PATH though.
 install_templates() {
   repo=$1
-  branch=main
-  tmpdir="${spin_dir}/rancher-desktop.$$"
-  tarball="${tmpdir}/${repo}.tar.gz"
 
-  url="https://github.com/fermyon/${repo}/archive/refs/heads/${branch}.tar.gz"
-
-  if [ "${WSL_DISTRO_NAME:-}" = "rancher-desktop" ]; then
-    # Download and extract tarball on Win32 host side to avoid 9p syncing issues
-    tmpdir=$(/bin/wslpath -w "$tmpdir")
-    tarball=$(/bin/wslpath -w "$tarball")
-
-    "${system_root}/system32/cmd.exe" /c mkdir "$tmpdir"
-
-    echo "Downloading '${url}' to '${tarball}' with curl.exe"
-    "${system_root}/system32/curl.exe" --silent --location "$url" --output "$tarball"
-    rc=$?; test $rc -ne 0 && echo "curl.exe exit status is $rc"
-
-    if [ $rc -eq 0 ]; then
-      echo "Unpacking '${tarball}'"
-      "${system_root}/system32/tar.exe" xfz "$tarball" -C "$tmpdir"
-      rc=$?; test $rc -ne 0 && echo "tar.exe exit status is $rc"
-
-      dir="${tmpdir}\\${repo}-${branch}"
-      echo "Installing templates from '${dir}'"
-      "$spin" templates install --update --dir "$dir"
-      rc=$?; test $rc -ne 0 && echo "Exit status is $rc"
-    else
-      echo "Could not download '${url}'"
-    fi
-    "${system_root}/system32/cmd.exe" /c rmdir /s /q "$tmpdir"
-    return
+  echo "Installing ${repo} templates from tag ${SPIN_TEMPLATES_TAG}"
+  url="https://github.com/spinframework/${repo}/archive/refs/tags/${SPIN_TEMPLATES_TAG}.tar.gz"
+  if ! "$spin" templates install --update --tar "$url"; then
+    echo "Install failed, falling back to main branch"
+    url="https://github.com/spinframework/${repo}/archive/refs/heads/main.tar.gz"
+    "$spin" templates install --update --tar "$url"
   fi
-
-  mkdir -p "$tmpdir"
-  if command -v curl >/dev/null; then
-    echo "Downloading '${url}' to '${tarball}' with curl"
-    curl --silent --location "$url" --output "$tarball"
-    rc=$?; test $rc -ne 0 && echo "curl exit status is $rc"
-  elif command -v wget >/dev/null; then
-    echo "Downloading '${url}' to '${tarball}' with wget"
-    wget --no-verbose "$url" -O "$tarball"
-    rc=$?; test $rc -ne 0 && echo "wget exit status is $rc"
-  fi
-  if [ -f "$tarball" ]; then
-    echo "Unpacking '${tarball}'"
-    tar xfz "$tarball" -C "$tmpdir"
-    rc=$?; test $rc -ne 0 && echo "tar exit status is $rc"
-
-    dir="${tmpdir}/${repo}-${branch}"
-    echo "Installing templates from '${dir}'"
-    "$spin" templates install --update --dir "$dir"
-    rc=$?; test $rc -ne 0 && echo "Exit status is $rc"
-  else
-    echo "Could not download '${url}' (maybe no curl/wget)"
-  fi
-  rm -rf "$tmpdir"
 }
 
 install_plugin() {
   plugin=$1
-  url="https://raw.githubusercontent.com/fermyon/spin-plugins/main/manifests/${plugin}/${plugin}.json"
-  echo "Installing plugin from '${url}'"
-  "$spin" plugins install --yes --url "$url"
+  version=$2
+  echo "Installing plugin ${plugin} version ${version}"
+  "$spin" plugins uninstall "$plugin" || true
+  # `spin plugins install` requires `git`; however, we can provide the URL of a
+  # remote manifest instead.
+  local url_base="https://github.com/spinframework/spin-plugins/raw/refs/heads/main/manifests/${plugin}"
+  local url="${url_base}/${plugin}@${version}.json"
+  if ! curl --head --silent --fail "${url}" &>/dev/null; then
+    echo "Plugin not available at ${url}, installing unversioned instead."
+    url="${url_base}/${plugin}.json"
+  fi
+  "$spin" plugins install --yes --url "${url}"
   rc=$?; test $rc -ne 0 && echo "Exit status is $rc"
 }
 
@@ -122,7 +64,6 @@ install_templates spin
 install_templates spin-python-sdk
 install_templates spin-js-sdk
 
-install_plugin js2wasm
-install_plugin kube
+install_plugin kube "${KUBE_PLUGIN_VERSION:-0.3.1}"
 
 echo "'${spin}' setup complete"

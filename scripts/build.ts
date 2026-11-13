@@ -11,7 +11,7 @@ import * as path from 'path';
 
 import buildUtils from './lib/build-utils';
 
-import { simpleSpawn } from 'scripts/simple_process';
+import { simpleSpawn } from '@/scripts/simple_process';
 
 class Builder {
   async cleanup() {
@@ -50,14 +50,23 @@ class Builder {
   }
 
   async buildRenderer() {
-    process.env.VUE_CLI_SERVICE_CONFIG_PATH = 'pkg/rancher-desktop/vue.config.js';
+    process.env.VUE_CLI_SERVICE_CONFIG_PATH = 'pkg/rancher-desktop/vue.config.mjs';
     await simpleSpawn(
-      'node_modules/.bin/vue-cli-service',
+      process.execPath,
       [
+        '--stack-size=16384',
+        'node_modules/@vue/cli-service/bin/vue-cli-service.js',
         'build',
         '--skip-plugins',
         'eslint',
       ],
+      {
+        env: {
+          ...process.env,
+          RD_DOCS_URL: await buildUtils.docsUrl,
+          RD_VERSION:  await buildUtils.version,
+        },
+      },
     );
   }
 

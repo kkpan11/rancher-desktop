@@ -8,7 +8,13 @@ import util from 'util';
 import { expect, Page, TestInfo } from '@playwright/test';
 
 import {
-  createDefaultSettings, setUserProfile, startRancherDesktop, retry, teardown, reportAsset, startRancherDesktopOptions,
+  createDefaultSettings,
+  setUserProfile,
+  startRancherDesktop,
+  retry,
+  teardown,
+  reportAsset,
+  startRancherDesktopOptions,
 } from './TestUtils';
 import { NavPage } from '../pages/nav-page';
 
@@ -45,7 +51,7 @@ async function fileExists(fullPath: string): Promise<boolean> {
   return false;
 }
 
-function getDeploymentBaseNames(platform: 'linux'|'darwin'): string[] {
+function getDeploymentBaseNames(platform: 'linux' | 'darwin'): string[] {
   if (platform === 'linux') {
     return ['rancher-desktop.defaults.json', 'rancher-desktop.locked.json'];
   } else if (platform === 'darwin') {
@@ -55,12 +61,12 @@ function getDeploymentBaseNames(platform: 'linux'|'darwin'): string[] {
   }
 }
 
-function getDeploymentPaths(platform: 'linux'|'darwin', profileDir: string): string[] {
+function getDeploymentPaths(platform: 'linux' | 'darwin', profileDir: string): string[] {
   let baseNames = getDeploymentBaseNames(platform);
 
-  if (platform === 'linux' && profileDir === paths.deploymentProfileSystem) {
-    // macOS profile base-names are the same in both directories
-    // linux ones change...
+  if (platform === 'linux' && profileDir !== paths.deploymentProfileUser) {
+    // macOS system profiles live in a shared directory and include the application name;
+    // linux ones are in their own directory, and we need to remove the prefix.
     baseNames = baseNames.map(s => s.replace('rancher-desktop.', ''));
   }
 
@@ -118,8 +124,8 @@ export async function verifyNoRegistrySubtree(hive: string): Promise<void> {
     }
     try {
       await childProcess.spawnFile('reg', ['delete', registryPath, '/f'], { stdio: ['ignore', 'pipe', 'pipe'] });
-    } catch (ex: any) {
-      throw new Error(`Need to remove registry hive "${ registryPath }" (tried, got error ${ ex }`);
+    } catch (cause: any) {
+      throw new Error(`Need to remove registry hive "${ registryPath }" (tried, got error ${ cause })`, { cause });
     }
   }
 }
@@ -141,8 +147,11 @@ export async function verifyNoSystemProfile(): Promise<string[]> {
       return [ex.message];
     }
   }
-  const profilePaths = getDeploymentPaths(platform as 'linux'|'darwin', paths.deploymentProfileSystem);
   const existingProfiles = [];
+  const profilePaths = [
+    ...getDeploymentPaths(platform, paths.deploymentProfileSystem),
+    ...getDeploymentPaths(platform, paths.altDeploymentProfileSystem),
+  ];
 
   for (const profilePath of profilePaths) {
     if (await fileExists(profilePath)) {
@@ -159,7 +168,11 @@ export async function verifySystemProfile(): Promise<string[]> {
   if (platform === 'win32') {
     return await verifySystemRegistrySubtree();
   }
-  const profilePaths = getDeploymentPaths(platform, paths.deploymentProfileSystem);
+
+  const profilePaths = [
+    ...getDeploymentPaths(platform, paths.deploymentProfileSystem),
+    ...getDeploymentPaths(platform, paths.altDeploymentProfileSystem),
+  ];
 
   for (const profilePath of profilePaths) {
     if (await fileExists(profilePath)) {
@@ -175,7 +188,7 @@ export async function verifySystemProfile(): Promise<string[]> {
  * then wait for the main window to open.
  */
 export async function testForFirstRunWindow(testInfo: TestInfo, options: startRancherDesktopOptions) {
-  let page: Page|undefined;
+  let page: Page | undefined;
   let navPage: NavPage;
   let windowCount = 0;
   let windowCountForMainPage = 0;
@@ -237,7 +250,7 @@ export async function testForFirstRunWindow(testInfo: TestInfo, options: startRa
  * the first window to appear is the main window).
  */
 export async function testForNoFirstRunWindow(testInfo: TestInfo, options: startRancherDesktopOptions) {
-  let page: Page|undefined;
+  let page: Page | undefined;
   let navPage: NavPage;
   let windowCount = 0;
   let windowCountForMainPage = 0;

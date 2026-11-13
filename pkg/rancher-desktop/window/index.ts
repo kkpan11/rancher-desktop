@@ -7,7 +7,9 @@ import Electron, {
 
 import * as K8s from '@pkg/backend/k8s';
 import { getSettings } from '@pkg/config/settingsImpl';
+import { getLocale } from '@pkg/main/i18n';
 import { IpcRendererEvents } from '@pkg/typings/electron-ipc';
+import { removeParenthesizedAccessKey } from '@pkg/utils/accessKeys';
 import { isDevBuild } from '@pkg/utils/environment';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
@@ -52,6 +54,10 @@ export function getWindow(name: string): Electron.BrowserWindow | null {
   return (name in windowMapping) ? BrowserWindow.fromId(windowMapping[name]) : null;
 }
 
+function isInternalURL(url: string) {
+  return url.startsWith(`${ webRoot }/`) || url.startsWith('x-rd-extension://');
+}
+
 /**
  * Open a given window; if it is already open, focus it.
  * @param name The window identifier; this controls window re-use.
@@ -65,11 +71,13 @@ export function createWindow(name: string, url: string, options: Electron.Browse
     return window;
   }
 
-  const isInternalURL = (url: string) => {
-    return url.startsWith(`${ webRoot }/`) || url.startsWith('x-rd-extension://');
-  };
-
   window = new BrowserWindow(options);
+  window.webContents.on('console-message', (event) => {
+    const { level, lineNumber, message } = event;
+    const method = level === 'warning' ? 'warn' : level;
+
+    console[method](`${ name }@${ lineNumber }: ${ message }`);
+  });
   window.webContents.on('will-navigate', (event, input) => {
     if (isInternalURL(input)) {
       return;
@@ -90,7 +98,12 @@ export function createWindow(name: string, url: string, options: Electron.Browse
     console.log(`Failed to load ${ url }: ${ errorCode } (${ errorDescription })`, event);
   });
   console.debug('createWindow() name:', name, ' url:', url);
-  window.loadURL(url);
+  // Give the renderer its locale in the URL so the first paint is already
+  // localized, without waiting on a settings roundtrip.
+  const localizedUrl = new URL(url);
+
+  localizedUrl.searchParams.set('locale', getLocale());
+  window.loadURL(localizedUrl.toString());
   windowMapping[name] = window.id;
 
   return window;
@@ -183,32 +196,110 @@ export function openMain() {
 }
 
 let view: WebContentsView | undefined;
-let extId = '';
-let extPath = '';
+/** The extension that has been navigated to (but might not be loaded yet). */
+let currentExtension: { id: string, relPath: string } | undefined;
+/** The extension that has been loaded. */
+let lastOpenExtension: { id: string, relPath: string } | undefined;
+
+function updateViewBackground() {
+  if (view) {
+    view.setBackgroundColor(nativeTheme.shouldUseDarkColors ? '#202c33' : '#f4f4f6');
+  }
+}
 
 /**
  * Attaches a browser view to the main window
  */
-const createView = () => {
+function createView() {
   const mainWindow = getWindow('main');
-  const hostInfo = {
-    arch:     process.arch,
-    hostname: os.hostname(),
+  const decodedExtensionId = currentExtension?.id ? Buffer.from(currentExtension.id, 'hex').toString() : undefined;
+  const extensionVersion = decodedExtensionId ? getSettings().application.extensions.installed[decodedExtensionId] : undefined;
+  const extensionContext = {
+    arch:             process.arch,
+    hostname:         os.hostname(),
+    extensionVersion,
   };
 
   if (!mainWindow) {
     throw new Error('Failed to get main window, cannot create view');
   }
 
-  view = new WebContentsView({
-    webPreferences: {
-      nodeIntegration:     false,
-      contextIsolation:    true,
-      preload:             path.join(paths.resources, 'preload.js'),
-      sandbox:             true,
-      additionalArguments: [JSON.stringify(hostInfo)],
-    },
-  });
+  const webPreferences: Electron.WebPreferences = {
+    nodeIntegration:     false,
+    contextIsolation:    true,
+    sandbox:             true,
+    additionalArguments: [JSON.stringify(extensionContext)],
+  };
+
+  if (currentExtension?.id) {
+    webPreferences.partition = `persist:rdx-${ currentExtension.id }`;
+    const session = Electron.session.fromPartition(webPreferences.partition);
+    const { webRequest } = session;
+    const id = `rdx-preload-${ currentExtension.id }`;
+
+    if (!session.getPreloadScripts().some(script => script.id === id)) {
+      session.registerPreloadScript({
+        id,
+        filePath: path.join(paths.resources, 'preload.js'),
+        type:     'frame',
+      });
+    }
+
+    webRequest.onBeforeSendHeaders((details, callback) => {
+      const source = details.webContents?.getURL() ?? '';
+      const requestHeaders = { ...details.requestHeaders };
+
+      if (isInternalURL(source)) {
+        // If the request is coming from the extension, remove the Origin: header
+        // because it has x-rd-extension:// nonsense (relative to the server).
+        delete requestHeaders.Origin;
+      }
+      callback({ requestHeaders });
+    });
+
+    webRequest.onHeadersReceived((details, callback) => {
+      const sourceURL = details.webContents?.getURL() ?? '';
+
+      if (!isInternalURL(sourceURL)) {
+        // Do not rewrite requests from outside the extension (e.g. iframe).
+        callback({});
+
+        return;
+      }
+
+      // Insert (or overwrite) CORS headers to pretend this was allowed.  While
+      // ideally we can just disable `webSecurity` instead, that seems to break
+      // the preload script (which breaks the extension APIs).
+      const responseHeaders: Record<string, string | string[]> = { ...details.responseHeaders };
+      // HTTP headers use case-insensitive comparison; but accents should count
+      // as different characters (even though it should be ASCII only).
+      const { compare } = new Intl.Collator('en', { sensitivity: 'accent' });
+      const overwriteHeaders = [
+        'Access-Control-Allow-Headers',
+        'Access-Control-Allow-Methods',
+        'Access-Control-Allow-Origin',
+      ];
+
+      for (const header of overwriteHeaders) {
+        const match = Object.keys(responseHeaders).find(k => compare(header, k) === 0);
+
+        responseHeaders[match ?? header] = '*';
+      }
+
+      if (details.method !== 'OPTIONS') {
+        // For any request that's not a CORS preflight, just overwrite the headers.
+        callback({ responseHeaders });
+      } else {
+        // For CORS preflights, also change the status code.
+        const prefix = /\s+/.exec(details.statusLine)?.shift() ?? 'HTTP/1.1';
+
+        callback({ responseHeaders, statusLine: `${ prefix } 204 No Content` });
+      }
+    });
+  }
+  view = new WebContentsView({ webPreferences });
+  nativeTheme.off('updated', updateViewBackground);
+  nativeTheme.on('updated', updateViewBackground);
   mainWindow.contentView.addChildView(view);
   mainWindow.contentView.addListener('bounds-changed', () => {
     setImmediate(() => mainWindow.webContents.send('extensions/getContentArea'));
@@ -217,7 +308,7 @@ const createView = () => {
   const backgroundColor = nativeTheme.shouldUseDarkColors ? '#202c33' : '#f4f4f6';
 
   view.setBackgroundColor(backgroundColor);
-};
+}
 
 /**
  * Updates the browser view size and position
@@ -243,14 +334,18 @@ const updateView = (window: Electron.BrowserWindow, payload: { top: number, righ
  * Navigates to the current desired extension
  */
 function extensionNavigate() {
-  if (!extId || !extPath) {
+  if (!currentExtension) {
     return;
   }
+  const { id, relPath } = currentExtension;
 
-  const url = `x-rd-extension://${ extId }/ui/dashboard-tab/${ extPath }`;
+  const url = `x-rd-extension://${ id }/ui/dashboard-tab/${ relPath }`;
 
   view?.webContents
     .loadURL(url)
+    .then(() => {
+      lastOpenExtension = currentExtension;
+    })
     .then(() => {
       view?.webContents.setZoomLevel(getWindow('main')?.webContents.getZoomLevel() ?? 0);
     })
@@ -334,7 +429,9 @@ function extensionGetContentAreaListener(_event: Electron.IpcMainEvent, payload:
   }
 
   updateView(window, payload);
-  extensionNavigate();
+  if (currentExtension && (currentExtension.id !== lastOpenExtension?.id || currentExtension.relPath !== lastOpenExtension?.relPath)) {
+    extensionNavigate();
+  }
 }
 
 /**
@@ -351,8 +448,7 @@ export function openExtension(id: string, relPath: string) {
     return;
   }
 
-  extId = id;
-  extPath = relPath;
+  currentExtension = { id, relPath };
 
   if (!ipcMain.eventNames().includes('ok:extensions/getContentArea')) {
     ipcMain.on('ok:extensions/getContentArea', extensionGetContentAreaListener);
@@ -377,11 +473,14 @@ export function openExtension(id: string, relPath: string) {
  * Removes the extension's browser view from the main window
  */
 export function closeExtension() {
+  currentExtension = undefined;
+  lastOpenExtension = undefined;
   if (!view) {
     return;
   }
 
   view.webContents.close();
+  nativeTheme.off('updated', updateViewBackground);
 
   const window = getWindow('main');
 
@@ -460,19 +559,34 @@ export function openDialog(id: string, opts?: Electron.BrowserWindowConstructorO
     }
   });
 
-  window.webContents.on('preferred-size-changed', (_event, { width, height }) => {
-    if (os.platform() === 'linux') {
+  window.webContents.on('preferred-size-changed', async(_event, { width, height }) => {
+    switch (process.platform) {
+    case 'linux':
       resizeWindow(window, width, height);
-    } else {
-      window.setContentSize(width, height, true);
+      break;
+    case 'win32': {
+      // On Windows, if the primary display DPI is not the same as the current
+      // display DPI, or if the DPI has been change since Rancher Desktop
+      // started, we end up getting successively larger heights.  To work around
+      // this, check for the actual height of the body element and jump to the
+      // desired height directly, but only if the current content height is
+      // smaller.  Note that all the units here are already affected by DPI
+      // scaling, so we don't need to do that manually.
+      const scripts = [{ code: `document.body.offsetHeight` }];
+      const bodyHeight = await window.webContents.executeJavaScriptInIsolatedWorld(0, scripts);
+      const [, currentHeight] = window.getContentSize();
+
+      if (currentHeight < bodyHeight) {
+        window.setContentSize(width, bodyHeight);
+      }
+      break;
+    }
+    default:
+      window.setContentSize(width, height);
     }
   });
 
-  if (Shortcuts.isRegistered(window)) {
-    return window;
-  }
-
-  if (escapeKey) {
+  if (!Shortcuts.isRegistered(window) && escapeKey) {
     Shortcuts.register(
       window,
       { key: 'Escape' },
@@ -538,7 +652,7 @@ export async function openUnmetPrerequisitesDialog(reasonId: reqMessageId, ...ar
  */
 export async function openKubernetesErrorMessageWindow(titlePart: string, mainMessage: string, failureDetails: K8s.FailureDetails) {
   const window = openDialog('KubernetesError', {
-    title:  `Rancher Desktop - Kubernetes Error`,
+    title:  `Rancher Desktop - Error`,
     width:  800,
     height: 494,
     parent: getWindow('main') ?? undefined,
@@ -589,6 +703,13 @@ export async function openSudoPrompt(explanations: Record<string, string[]>): Pr
 export async function showMessageBox(options: Electron.MessageBoxOptions, couldBeModal = false) {
   const mainWindow = couldBeModal ? getWindow('main') : null;
 
+  // On macOS, normalizeAccessKeys removes only the "&", which would leave "削除(D)".
+  // Only dialogs shown through this function get the strip; imageEvents.ts,
+  // background.ts and window/preferences.ts call Electron's dialog API directly.
+  if (options.normalizeAccessKeys && process.platform === 'darwin') {
+    options = { ...options, buttons: options.buttons?.map(removeParenthesizedAccessKey) };
+  }
+
   return await (mainWindow ? Electron.dialog.showMessageBox(mainWindow, options) : Electron.dialog.showMessageBox(options));
 }
 
@@ -627,4 +748,18 @@ export function centerDialog(window: BrowserWindow, dialog: BrowserWindow, offse
   const y = Math.floor(windowBounds.y + offsetY);
 
   dialog.setPosition(x, y);
+}
+
+/**
+ * Returns a typed helper that sends a renderer IPC event to a specific
+ * WebContents, swallowing errors if the frame has been destroyed.
+ */
+export function makeSendToFrame(sender: Electron.WebContents, logger?: { debug: (...args: any[]) => void }) {
+  return <ch extends keyof IpcRendererEvents>(channel: ch, ...args: Parameters<IpcRendererEvents[ch]>) => {
+    try {
+      sender.send(channel, ...args);
+    } catch (ex) {
+      logger?.debug(`Failed to send ${ channel } to frame:`, ex);
+    }
+  };
 }

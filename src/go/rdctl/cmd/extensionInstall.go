@@ -18,10 +18,14 @@ limitations under the License.
 package cmd
 
 import (
+	"context"
 	"fmt"
+	"net/http"
+
+	"github.com/spf13/cobra"
+
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/client"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/config"
-	"github.com/spf13/cobra"
 )
 
 // installCmd represents the 'rdctl extensions install' command
@@ -34,7 +38,7 @@ The <image-id> is an image reference, e.g. splatform/epinio-docker-desktop:lates
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmd.SilenceUsage = true
-		return installExtension(args)
+		return installExtension(cmd.Context(), args)
 	},
 }
 
@@ -42,18 +46,18 @@ func init() {
 	extensionCmd.AddCommand(installCmd)
 }
 
-func installExtension(args []string) error {
+func installExtension(ctx context.Context, args []string) error {
 	connectionInfo, err := config.GetConnectionInfo(false)
 	if err != nil {
 		return fmt.Errorf("failed to get connection info: %w", err)
 	}
 	rdClient := client.NewRDClient(connectionInfo)
 	imageID := args[0]
-	endpoint := fmt.Sprintf("/%s/extensions/install?id=%s", client.ApiVersion, imageID)
+	endpoint := fmt.Sprintf("/%s/extensions/install?id=%s", client.APIVersion, imageID)
 	// https://stackoverflow.com/questions/20847357/golang-http-client-always-escaped-the-url
 	// Looks like http.NewRequest(method, url) escapes the URL
 
-	result, errorPacket, err := client.ProcessRequestForAPI(rdClient.DoRequest("POST", endpoint))
+	result, errorPacket, err := client.ProcessRequestForAPI(rdClient.DoRequest(ctx, http.MethodPost, endpoint))
 	if errorPacket != nil || err != nil {
 		return displayAPICallResult(result, errorPacket, err)
 	}

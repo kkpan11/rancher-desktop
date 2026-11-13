@@ -1,22 +1,20 @@
 import DOMPurify from 'dompurify';
 import _ from 'lodash';
 import { marked } from 'marked';
-import { GetterTree } from 'vuex';
+import { Plugin } from 'vuex';
 
-import { ActionContext, MutationsType } from './ts-helpers';
+import { ActionTree, MutationsType } from './ts-helpers';
 
-import { CURRENT_SETTINGS_VERSION, Settings } from '@pkg/config/settings';
-import type { ServerState } from '@pkg/main/commandServer/httpCommandServer';
+import { CURRENT_SETTINGS_VERSION } from '@pkg/config/settings';
+import { RootState } from '@pkg/entry/store';
 import type { DiagnosticsResult, DiagnosticsResultCollection } from '@pkg/main/diagnostics/diagnostics';
-import { RecursivePartial } from '@pkg/utils/typeUtils';
+import ipcRenderer from '@pkg/utils/ipcRenderer';
 
 interface DiagnosticsState {
-  diagnostics: Array<DiagnosticsResult>,
+  diagnostics: DiagnosticsResult[],
   timeLastRun: Date;
-  inError: boolean;
+  inError:     boolean;
 }
-
-type Credentials = Omit<ServerState, 'pid'>;
 
 const uri = (port: number, pathRemainder: string) => `http://localhost:${ port }/v1/${ pathRemainder }`;
 
@@ -27,7 +25,7 @@ const uri = (port: number, pathRemainder: string) => `http://localhost:${ port }
  * the ID for the diagnostic and a boolean value for muting the result.
  * @returns A collection of diagnostic results with an updated muted property.
  */
-const mapMutedDiagnostics = (checks: DiagnosticsResult[], mutedChecks: Record<string, boolean>) => {
+function mapMutedDiagnostics(checks: DiagnosticsResult[], mutedChecks: Record<string, boolean>) {
   return checks.map(check => ({ ...check, mute: !!mutedChecks[check.id] }));
 };
 
@@ -38,7 +36,7 @@ const mapMutedDiagnostics = (checks: DiagnosticsResult[], mutedChecks: Record<st
  * @returns A promise that resolves to the array of diagnostic results with the
  * 'description' property transformed to markdown.
  */
-const mapMarkdownToDiagnostics = async(diagnostics: DiagnosticsResult[]) => {
+async function mapMarkdownToDiagnostics(diagnostics: DiagnosticsResult[]) {
   return await Promise.all(
     diagnostics.map(async(x) => {
       return {
@@ -56,7 +54,7 @@ const mapMarkdownToDiagnostics = async(diagnostics: DiagnosticsResult[]) => {
  * @returns A promise that resolves to a sanitized HTML string generated
  * from the provided markdown.
  */
-const markdown = async(raw: string) => {
+async function markdown(raw: string) {
   const markedString = await marked.parseInline(raw);
 
   return DOMPurify.sanitize(markedString, { USE_PROFILES: { html: true } });
@@ -70,7 +68,7 @@ export const state: () => DiagnosticsState = () => (
   }
 );
 
-export const mutations: MutationsType<DiagnosticsState> = {
+export const mutations = {
   SET_DIAGNOSTICS(state: DiagnosticsState, diagnostics: DiagnosticsResult[]) {
     state.diagnostics = diagnostics.filter(result => !result.passed);
     state.inError = false;
@@ -81,42 +79,42 @@ export const mutations: MutationsType<DiagnosticsState> = {
   SET_IN_ERROR(state: DiagnosticsState, status: boolean) {
     state.inError = status;
   },
-};
-
-type DiagActionContext = ActionContext<DiagnosticsState>;
+} satisfies MutationsType<DiagnosticsState>;
 
 export const actions = {
-  async fetchDiagnostics({ commit, rootState }: DiagActionContext, args: Credentials) {
-    const {
-      port,
-      user,
-      password,
-    } = args;
-    const response = await fetch(
-      uri(port, 'diagnostic_checks'),
-      {
-        headers: new Headers({
-          Authorization:  `Basic ${ window.btoa(`${ user }:${ password }`) }`,
-          'Content-Type': 'application/x-www-form-urlencoded',
-        }),
-      });
+  async fetchDiagnostics({ commit, rootState }) {
+    try {
+      const { port, user, password } = rootState.credentials.credentials;
+      const response = await fetch(
+        uri(port, 'diagnostic_checks'),
+        {
+          headers: new Headers({
+            Authorization:  `Basic ${ window.btoa(`${ user }:${ password }`) }`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          }),
+        });
 
-    if (!response.ok) {
-      console.log(`fetchDiagnostics: failed: status: ${ response.status }:${ response.statusText }`);
+      if (!response.ok) {
+        console.log(`fetchDiagnostics: failed: status: ${ response.status }:${ response.statusText }`);
+        commit('SET_IN_ERROR', true);
+
+        return;
+      }
+      const result: DiagnosticsResultCollection = await response.json();
+
+      const mutedChecks = rootState.preferences.preferences.diagnostics.mutedChecks;
+      const checks = mapMutedDiagnostics(result.checks, mutedChecks);
+
+      commit('SET_DIAGNOSTICS', await mapMarkdownToDiagnostics(checks));
+      commit('SET_TIME_LAST_RUN', new Date(result.last_update));
+      commit('SET_IN_ERROR', false);
+    } catch (ex) {
+      console.error(`fetchDiagnostics failed:`, ex);
       commit('SET_IN_ERROR', true);
-
-      return;
     }
-    const result: DiagnosticsResultCollection = await response.json();
-
-    const mutedChecks = rootState.preferences.preferences.diagnostics.mutedChecks;
-    const checks = mapMutedDiagnostics(result.checks, mutedChecks);
-
-    commit('SET_DIAGNOSTICS', await mapMarkdownToDiagnostics(checks));
-    commit('SET_TIME_LAST_RUN', new Date(result.last_update));
   },
-  async runDiagnostics({ commit, rootState }:DiagActionContext, credentials: Credentials) {
-    const { port, user, password } = credentials;
+  async runDiagnostics({ commit, rootState }) {
+    const { port, user, password } = rootState.credentials.credentials;
     const response = await fetch(
       uri(port, 'diagnostic_checks'),
       {
@@ -142,8 +140,8 @@ export const actions = {
     commit('SET_TIME_LAST_RUN', new Date(result.last_update));
   },
   async updateDiagnostic({
-    commit, state, dispatch, rootState,
-  }: DiagActionContext, { isMuted, row }: { isMuted: boolean, row: DiagnosticsResult }) {
+    commit, state, dispatch,
+  }, { isMuted, row }: { isMuted: boolean, row: DiagnosticsResult }) {
     const diagnostics = _.cloneDeep(state.diagnostics);
     const rowToUpdate = diagnostics.find(x => x.id === row.id);
 
@@ -156,24 +154,23 @@ export const actions = {
     await dispatch(
       'preferences/commitPreferences',
       {
-        ...rootState.credentials.credentials as Credentials,
         payload: {
           version:     CURRENT_SETTINGS_VERSION,
           diagnostics: { mutedChecks: { [rowToUpdate.id]: isMuted } },
-        } as RecursivePartial<Settings>,
+        },
       },
       { root: true },
     );
 
     commit('SET_DIAGNOSTICS', await mapMarkdownToDiagnostics(diagnostics));
   },
-};
+} satisfies ActionTree<DiagnosticsState, any, typeof mutations>;
 
-export const getters: GetterTree<DiagnosticsState, DiagnosticsState> = {
-  diagnostics(state: DiagnosticsState, getters) {
-    return state.diagnostics;
+export const plugins: Plugin<RootState>[] = [
+  // Vuex plugin used to refresh diagnostics on command from the backend.
+  function(store) {
+    ipcRenderer.on('diagnostics/update', () => {
+      store.dispatch('diagnostics/fetchDiagnostics');
+    });
   },
-  timeLastRun(state: DiagnosticsState) {
-    return state.timeLastRun;
-  },
-};
+];

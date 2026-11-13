@@ -1,5 +1,7 @@
 # Rancher Desktop
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/rancher-sandbox/rancher-desktop)
+
 Rancher Desktop is an open-source project that brings Kubernetes and
 container management to the desktop. It runs on Windows, macOS and
 Linux. This README pertains to the development of Rancher Desktop.
@@ -86,7 +88,7 @@ You can now clone the repository and run `yarn`.
 2. Open a PowerShell prompt (hit Windows Key + `X` and open `Windows PowerShell`).
 3. Install [Scoop] via `iwr -useb get.scoop.sh | iex`.
 4. Install 7zip, git, go, mingw, nvm, and unzip via `scoop install 7zip git go mingw nvm python unzip`.
-   Check node version with `nvm list`. If node v18 is not installed or set as the current version, then install using `nvm install 18` and set as current using `nvm use 18.xx.xx`.
+   Check node version with `nvm list`. If node v22 is not installed or set as the current version, then install using `nvm install 22` and set as current using `nvm use 22.xx.xx`.
 5. Install the yarn package manager via `npm install --global yarn`
 6. Install Visual Studio 2017 or higher. As of this writing the latest version is available at [https://visualstudio.microsoft.com/downloads/]; if that's changed, a good search engine should find it.
 7. Make sure you have the `Windows SDK` component installed. This [Visual Studio docs] describes steps to install components.
@@ -139,10 +141,10 @@ Note that this script adds code dealing with `nvm` to a profile file
 (like `~/.bash_profile`). To add access to `nvm` to a current shell session,
 you'll need to `source` that file.
 
-Currently we build Rancher Desktop with Node 18. To install it, run:
+Currently we build Rancher Desktop with Node 22. To install it, run:
 
 ```
-nvm install 18.16
+nvm install 22.14
 ```
 
 Next, you'll need to install the yarn package manager:
@@ -173,13 +175,13 @@ yarn
 
 Ensure you have the following installed:
 
-- [Node.js][Node.js] v18. **Make sure you have any development packages
-  installed.** For example, on openSUSE Leap 15.3 you would need to install
-  `nodejs18` and `nodejs18-devel`.
+- [Node.js][Node.js] v22. **Make sure you have any development packages
+  installed.** For example, on openSUSE Leap 15.6 you would need to install
+  `nodejs22` and `nodejs22-devel`.
 
 - [yarn classic][yarn-classic]
 
-- Go 1.21 or later.
+- Go 1.22 or later.
 
 - Dependencies described in the [`node-gyp` docs][node-gyp] installation.
   This is required to install the [`ffi-napi`][ffi-napi] npm package. These docs mention
@@ -404,8 +406,9 @@ This works even if you already have a version of Rancher Desktop installed.
 
 #### Development AppImages
 
-There are no repositories for AppImages, but you can access the latest development
-AppImage builds [here](https://download.opensuse.org/repositories/isv:/Rancher:/dev/AppImage/).
+There are no repositories for AppImages, but you can access the [latest development AppImage builds].
+
+[latest development AppImage builds]: https://download.opensuse.org/repositories/isv:/Rancher:/dev/AppImage/
 
 ## API
 

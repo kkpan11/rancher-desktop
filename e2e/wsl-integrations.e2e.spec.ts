@@ -30,7 +30,7 @@ test.describe('WSL Integrations', () => {
   let preferencesWindow: Page;
 
   test.beforeAll(async() => {
-    const stubDir = path.resolve(__dirname, '..', 'src', 'go', 'mock-wsl');
+    const stubDir = path.resolve(import.meta.dirname, '..', 'src', 'go', 'mock-wsl');
 
     workdir = await fs.promises.mkdtemp(
       path.join(os.tmpdir(), 'rd-test-wsl-integration-'));
@@ -46,13 +46,13 @@ test.describe('WSL Integrations', () => {
       });
   });
 
-  const writeConfig = async(opts?: {[k in 'alpha'|'beta'|'gamma']?: boolean|string}) => {
+  const writeConfig = async(opts?: Partial<Record<'alpha' | 'beta' | 'gamma', boolean | string>>) => {
     const config: {
       commands: {
-        args: string[],
-        mode?: string,
-        stdout?: string,
-        stderr?: string,
+        args:     string[],
+        mode?:    string,
+        stdout?:  string,
+        stderr?:  string,
         utf16le?: boolean,
       }[]
     } = {
@@ -73,7 +73,11 @@ test.describe('WSL Integrations', () => {
             '  gamma  Stopped  2',
             '',
           ].join('\n'),
-          utf16le: true,
+        },
+        {
+          args:   ['--list', '--running', '--quiet'],
+          mode:   'repeated',
+          stdout: '',
         },
         ...['alpha', 'beta', 'gamma'].flatMap(distro => [
           ...[['bin', 'docker-compose'], ['internal', 'wsl-helper']].flatMap(tool => ([
@@ -175,9 +179,11 @@ test.describe('WSL Integrations', () => {
       },
     });
 
+    const prefWindowPromise = electronApp.waitForEvent('window', page => /preferences/i.test(page.url()));
+
     page = await electronApp.firstWindow();
     await new NavPage(page).preferencesButton.click();
-    preferencesWindow = await electronApp.waitForEvent('window', page => /preferences/i.test(page.url()));
+    preferencesWindow = await prefWindowPromise;
   });
   test.afterAll(({ colorScheme }, testInfo) => teardown(electronApp, testInfo));
 
@@ -205,11 +211,10 @@ test.describe('WSL Integrations', () => {
     await expect(wslPage.wslIntegrations).toBeVisible();
 
     await expect(wslPage.wslIntegrations).toHaveCount(1, { timeout: 10_000 });
-    const wslIntegrationList = wslPage.tabIntegrations.getByTestId('wsl-integration-list');
 
-    expect(wslIntegrationList.getByText('alpha')).not.toBeNull();
-    expect(wslIntegrationList.getByText('beta')).not.toBeNull();
-    expect(wslIntegrationList.getByText('gamma')).not.toBeNull();
+    await expect(wslPage.wslIntegrations.getByText('alpha')).toBeVisible({ timeout: 10_000 });
+    await expect(wslPage.wslIntegrations.getByText('beta')).toBeVisible({ timeout: 10_000 });
+    await expect(wslPage.wslIntegrations.getByText('gamma')).toBeVisible({ timeout: 10_000 });
   });
 
   /*

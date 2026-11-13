@@ -1,12 +1,8 @@
+# bats file_tags=opensuse
+
 load '../helpers/load'
 
 local_setup() {
-    if is_windows && using_containerd && using_windows_exe; then
-        # BUG BUG BUG
-        # There is a known issue of nerdctl.exe compose not working as expected in
-        # WSL distros. https://github.com/rancher-sandbox/rancher-desktop/issues/1431
-        skip "Test doesn't work with nerdctl in a WSL distro"
-    fi
     TESTDATA_DIR="${PATH_BATS_ROOT}/tests/compose/testdata/"
     TESTDATA_DIR_HOST=$(host_path "$TESTDATA_DIR")
 }
@@ -21,14 +17,35 @@ local_setup() {
 }
 
 @test 'compose up' {
-    run ctrctl compose --project-directory "$TESTDATA_DIR_HOST" up -d
-    assert_success
+    ctrctl compose --project-directory "$TESTDATA_DIR_HOST" build \
+        --build-arg IMAGE_NGINX="$IMAGE_NGINX" \
+        --build-arg IMAGE_PYTHON="$IMAGE_PYTHON"
+    ctrctl compose --project-directory "$TESTDATA_DIR_HOST" up -d --no-build
 }
 
-@test 'verify app' {
-    try --max 9 --delay 10 curl --silent --show-error "http://localhost:8000"
+verify_running_container() {
+    try --max 9 --delay 10 curl --silent --show-error "$1"
     assert_success
-    assert_output "Hello World!"
+    assert_output --partial "$2"
+}
+
+@test 'verify app bound to localhost' {
+    verify_running_container "http://localhost:8080" "Welcome to nginx!"
+    skip_unless_host_ip
+    run curl --verbose --head "http://${HOST_IP}:8080"
+    assert_output --partial "curl: (7) Failed to connect"
+}
+
+@test 'verify app bound to wildcard IP' {
+    local expected_output="Hello World!"
+    verify_running_container "http://localhost:8000" "$expected_output"
+    skip_unless_host_ip
+    verify_running_container "http://${HOST_IP}:8000" "$expected_output"
+}
+
+@test 'verify connectivity via host.docker.internal' {
+    local expected_output="Hello World!"
+    verify_running_container "http://localhost:8080/app" "$expected_output"
 }
 
 @test 'compose down' {

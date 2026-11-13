@@ -3,8 +3,9 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/snapshot"
 	"github.com/spf13/cobra"
+
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/snapshot"
 )
 
 var snapshotDeleteCmd = &cobra.Command{
@@ -14,13 +15,13 @@ var snapshotDeleteCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmd.SilenceUsage = true
 		err := deleteSnapshot(cmd, args)
-		return exitWithJsonOrErrorCondition(err)
+		return exitWithJSONOrErrorCondition(err)
 	},
 }
 
 func init() {
 	snapshotCmd.AddCommand(snapshotDeleteCmd)
-	snapshotDeleteCmd.Flags().BoolVarP(&outputJsonFormat, "json", "", false, "output json format")
+	snapshotDeleteCmd.Flags().BoolVarP(&outputJSONFormat, "json", "", false, "output json format")
 }
 
 func deleteSnapshot(_ *cobra.Command, args []string) error {

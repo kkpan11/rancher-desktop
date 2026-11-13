@@ -2,27 +2,20 @@
 
 import { RadioButton, RadioGroup } from '@rancher/components';
 import semver from 'semver';
-import Vue, { VueConstructor } from 'vue';
+import { defineComponent } from 'vue';
 import { mapGetters, mapState } from 'vuex';
 
 import IncompatiblePreferencesAlert, { CompatiblePrefs } from '@pkg/components/IncompatiblePreferencesAlert.vue';
 import RdCheckbox from '@pkg/components/form/RdCheckbox.vue';
 import RdFieldset from '@pkg/components/form/RdFieldset.vue';
-import TooltipIcon from '@pkg/components/form/TooltipIcon.vue';
 import { MountType, Settings, VMType } from '@pkg/config/settings';
 import { RecursiveTypes } from '@pkg/utils/typeUtils';
 
 import type { PropType } from 'vue';
 
-interface VuexBindings {
-  macOsVersion: semver.SemVer;
-  isArm: boolean;
-}
-
-export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
+export default defineComponent({
   name:       'preferences-virtual-machine-emulation',
   components: {
-    TooltipIcon,
     IncompatiblePreferencesAlert,
     RadioGroup,
     RdFieldset,
@@ -38,17 +31,19 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
   computed: {
     ...mapGetters('preferences', ['isPreferenceLocked']),
     ...mapState('transientSettings', ['macOsVersion', 'isArm']),
-    options(): { label: string, value: VMType, description: string, experimental: boolean, disabled: boolean,
-      compatiblePrefs: CompatiblePrefs | [] }[] {
-      const defaultOption = VMType.QEMU;
-
+    options(): {
+      label:           string,
+      value:           VMType,
+      description:     string,
+      disabled:        boolean,
+      compatiblePrefs: CompatiblePrefs | []
+    }[] {
       return Object.values(VMType)
         .map((x) => {
           return {
             label:           this.t(`virtualMachine.type.options.${ x }.label`),
             value:           x,
-            description:     this.t(`virtualMachine.type.options.${ x }.description`, {}, true),
-            experimental:    x !== defaultOption, // Mark experimental option
+            description:     this.t(`virtualMachine.type.options.${ x }.description`),
             disabled:        x === VMType.VZ && this.vzDisabled,
             compatiblePrefs: this.getCompatiblePrefs(x),
           };
@@ -58,13 +53,13 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
       return 'vmType';
     },
     vZSelected(): boolean {
-      return this.preferences.experimental.virtualMachine.type === VMType.VZ;
+      return this.preferences.virtualMachine.type === VMType.VZ;
     },
     vzDisabled(): boolean {
       return semver.lt(this.macOsVersion.version, '13.0.0') || (this.isArm && semver.lt(this.macOsVersion.version, '13.3.0'));
     },
     rosettaDisabled(): boolean {
-      return !this.isArm;
+      return !this.isArm && !(process.env.RD_TEST ?? '').includes('screenshots');
     },
     arch(): string {
       return this.isArm ? 'arm64' : 'x64';
@@ -88,7 +83,7 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
 
       switch (vmType) {
       case VMType.QEMU:
-        if (this.preferences.experimental.virtualMachine.mount.type === MountType.VIRTIOFS) {
+        if (this.preferences.virtualMachine.mount.type === MountType.VIRTIOFS) {
           compatiblePrefs.push(
             {
               title: MountType.REVERSE_SSHFS, navItemName: 'Virtual Machine', tabName: 'volumes',
@@ -99,7 +94,7 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
         }
         break;
       case VMType.VZ:
-        if (this.preferences.experimental.virtualMachine.mount.type === MountType.NINEP) {
+        if (this.preferences.virtualMachine.mount.type === MountType.NINEP) {
           compatiblePrefs.push(
             {
               title: MountType.REVERSE_SSHFS, navItemName: 'Virtual Machine', tabName: 'volumes',
@@ -124,39 +119,36 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
         <rd-fieldset
           data-test="vmType"
           :legend-text="t('virtualMachine.type.legend')"
-          :is-locked="isPreferenceLocked('experimental.virtualMachine.type')"
+          :is-locked="isPreferenceLocked('virtualMachine.type')"
         >
           <template #default="{ isLocked }">
             <radio-group
               :options="options"
               :name="groupName"
               :disabled="isLocked"
-              :class="{ 'locked-radio' : isLocked }"
+              :class="{ 'locked-radio': isLocked }"
             >
               <template
                 v-for="(option, index) in options"
                 #[index]="{ isDisabled }"
               >
                 <radio-button
-                  :key="groupName+'-'+index"
+                  :key="groupName + '-' + index"
                   v-tooltip="disabledVmTypeTooltip(option.disabled)"
                   :name="groupName"
-                  :value="preferences.experimental.virtualMachine.type"
+                  :value="preferences.virtualMachine.type"
                   :val="option.value"
                   :disabled="option.disabled || isDisabled"
                   :data-test="option.label"
-                  @input="onChange('experimental.virtualMachine.type', $event)"
+                  @update:value="onChange('virtualMachine.type', $event)"
                 >
                   <template #label>
                     {{ option.label }}
-                    <tooltip-icon
-                      v-if="option.experimental"
-                    />
                   </template>
                   <template #description>
                     {{ option.description }}
                     <incompatible-preferences-alert
-                      v-if="option.value === preferences.experimental.virtualMachine.type"
+                      v-if="option.value === preferences.virtualMachine.type"
                       :compatible-prefs="option.compatiblePrefs"
                     />
                   </template>
@@ -176,9 +168,9 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
         >
           <rd-checkbox
             :label="t('virtualMachine.useRosetta.label')"
-            :value="preferences.experimental.virtualMachine.useRosetta"
-            :is-locked="isPreferenceLocked('experimental.virtualMachine.useRosetta')"
-            @input="onChange('experimental.virtualMachine.useRosetta', $event)"
+            :value="preferences.virtualMachine.useRosetta"
+            :is-locked="isPreferenceLocked('virtualMachine.useRosetta')"
+            @update:value="onChange('virtualMachine.useRosetta', $event)"
           />
         </rd-fieldset>
       </div>

@@ -1,3 +1,5 @@
+# bats file_tags=opensuse
+
 load '../helpers/load'
 
 : "${RD_INFO:=false}"
@@ -48,6 +50,18 @@ succeeds() {
 fails() {
     # shellcheck disable=SC2086 # we want to split on whitespace
     run ${BATS_TEST_DESCRIPTION}
+    assert_failure
+}
+
+########################################################################
+
+errexit() {
+    false
+    true
+}
+
+@test 'run() calls functions with errexit enabled' {
+    run errexit
     assert_failure
 }
 
@@ -533,8 +547,21 @@ get_json_test_data() {
     fi
 }
 
+@test 'try multiplies max by RD_WAIT_FACTOR' {
+    RD_WAIT_FACTOR=3 run try --max 2 --delay 0 inc_counter
+    assert_failure
+    assert_counter_is 6
+}
+
+@test 'try --no-scale leaves max as given' {
+    RD_WAIT_FACTOR=3 run try --no-scale --max 2 --delay 0 inc_counter
+    assert_failure
+    assert_counter_is 2
+}
+
 @test 'try will return after max retries' {
-    run try --max 3 --delay 3 inc_counter
+    # This test counts attempts, so it pins RD_WAIT_FACTOR.
+    RD_WAIT_FACTOR=1 run try --max 3 --delay 3 inc_counter
     assert_failure
     assert_counter_is 3
     # "try" should have called "sleep 3" exactly twice
@@ -542,7 +569,7 @@ get_json_test_data() {
     if ((SECONDS >= 9)); then
         # maybe slow machine; try again with longer sleep
         reset_counter
-        run try --max 3 --delay 15 inc_counter
+        RD_WAIT_FACTOR=1 run try --max 3 --delay 15 inc_counter
         assert_failure
         assert_counter_is 3
         # "try" should have called "sleep 15" exactly twice

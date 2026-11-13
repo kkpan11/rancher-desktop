@@ -1,7 +1,7 @@
 <script lang="ts">
 import os from 'os';
 
-import Vue from 'vue';
+import { Component, defineComponent } from 'vue';
 import { mapGetters, mapState } from 'vuex';
 
 import PreferencesVirtualMachineEmulation from '@pkg/components/Preferences/VirtualMachineEmulation.vue';
@@ -14,7 +14,7 @@ import type { ServerState } from '@pkg/main/commandServer/httpCommandServer';
 
 import type { PropType } from 'vue';
 
-export default Vue.extend({
+export default defineComponent({
   name:       'preferences-body-virtual-machine',
   components: {
     RdTabbed,
@@ -41,7 +41,7 @@ export default Vue.extend({
     },
   },
   methods: {
-    async tabSelected({ tab }: { tab: Vue.Component }) {
+    async tabSelected({ tab }: { tab: Component }) {
       if (this.activeTab !== tab.name) {
         await this.navigate('Virtual Machine', tab.name || '');
       }
@@ -72,32 +72,26 @@ export default Vue.extend({
     <template #tabs>
       <tab
         v-if="isPlatformDarwin"
-        label="Emulation"
+        label-key="preferences.tabs.emulation"
         name="emulation"
         :weight="1"
       />
       <tab
-        v-if="isPlatformDarwin"
-        label="Network"
-        name="network"
-        :weight="2"
-      />
-      <tab
-        label="Volumes"
+        label-key="preferences.tabs.volumes"
         name="volumes"
         :weight="3"
       />
       <tab
-        label="Hardware"
+        label-key="preferences.tabs.hardware"
         name="hardware"
         :weight="4"
       />
     </template>
     <div class="virtual-machine-content">
       <component
-        :is="`preferences-virtual-machine-${ activeTab }`"
+        v-bind="$attrs"
+        :is="`preferences-virtual-machine-${activeTab}`"
         :preferences="preferences"
-        v-on="$listeners"
       />
     </div>
   </rd-tabbed>

@@ -1,11 +1,10 @@
 <template>
   <div>
     <h2>
-      Cannot run as Root
+      {{ t('denyRoot.title') }}
     </h2>
     <p>
-      Rancher Desktop cannot be run with root privileges.
-      Please run again as a regular user.
+      {{ t('denyRoot.message') }}
     </p>
     <div class="button-area">
       <button
@@ -13,18 +12,19 @@
         class="role-primary"
         @click="close"
       >
-        OK
+        {{ t('generic.ok') }}
       </button>
     </div>
   </div>
 </template>
 
 <script lang="ts">
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
 
-export default Vue.extend({
+export default defineComponent({
+  name:   'page-deny-root',
   layout: 'dialog',
   mounted() {
     ipcRenderer.send('dialog/ready');

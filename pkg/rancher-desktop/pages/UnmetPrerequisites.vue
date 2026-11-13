@@ -19,8 +19,7 @@
 </template>
 
 <script lang="ts">
-/* eslint-disable no-redeclare -- Conflicts with TypeScript overloading */
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
 import type { WSLVersionInfo } from '@pkg/utils/wslVersion';
@@ -50,7 +49,8 @@ function describeReason(reasonId: reqMessageId, ...extras: any[]): string {
   return `Reason ${ reasonId } is unknown`;
 }
 
-export default Vue.extend({
+export default defineComponent({
+  name:   'unmet-prerequisites-dialog',
   layout: 'dialog',
   data() {
     return {

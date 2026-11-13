@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import dns from 'dns';
 import http from 'http';
 import https from 'https';
@@ -5,9 +6,9 @@ import os from 'os';
 import util from 'util';
 
 import Electron from 'electron';
-import LinuxCA from 'linux-ca';
 
-import filterCert from './cert-parse';
+import { isDistrusted } from './distrusted-cas';
+import getLinuxCertificates from './linux-ca';
 import getMacCertificates from './mac-ca';
 import ElectronProxyAgent from './proxy';
 import getWinCertificates from './win-ca';
@@ -43,14 +44,6 @@ export default async function setupNetworking() {
 
   // Set up certificate handling for system certificates on Windows and macOS
   Electron.app.on('certificate-error', async(event, webContents, url, error, certificate, callback) => {
-    const tlsPort = 9443;
-    const dashboardUrls = [
-      `https://127.0.0.1:${ tlsPort }`,
-      `wss://127.0.0.1:${ tlsPort }`,
-      'http://127.0.0.1:6120',
-      'ws://127.0.0.1:6120',
-    ];
-
     const pluginDevUrls = [
       `https://localhost:8888`,
       `wss://localhost:8888`,
@@ -62,15 +55,7 @@ export default async function setupNetworking() {
       pluginDevUrls.some(x => url.startsWith(x))
     ) {
       event.preventDefault();
-      // eslint-disable-next-line n/no-callback-literal
-      callback(true);
 
-      return;
-    }
-
-    if (dashboardUrls.some(x => url.startsWith(x)) && 'dashboard' in windowMapping) {
-      event.preventDefault();
-      // eslint-disable-next-line n/no-callback-literal
       callback(true);
 
       return;
@@ -87,7 +72,7 @@ export default async function setupNetworking() {
           // an attacker generating a cert with the same serial.
           if (cert === certificate.data.replace(/\r/g, '')) {
             console.log(`Accepting system certificate for ${ certificate.subjectName } (${ certificate.fingerprint })`);
-            // eslint-disable-next-line n/no-callback-literal
+
             callback(true);
 
             return;
@@ -100,7 +85,6 @@ export default async function setupNetworking() {
 
     console.log(`Not handling certificate error ${ error } for ${ url }`);
 
-    // eslint-disable-next-line n/no-callback-literal
     callback(false);
   });
 
@@ -118,9 +102,19 @@ export default async function setupNetworking() {
 }
 
 /**
- * Get the system certificates in PEM format.
+ * Get the system certificates in PEM format, without the distrusted ones.
  */
-export async function *getSystemCertificates(): AsyncIterable<string> {
+export async function * getSystemCertificates(): AsyncIterable<string> {
+  for await (const cert of getPlatformCertificates()) {
+    if (isDistrusted(cert)) {
+      console.debug('Skipping distrusted certificate', new crypto.X509Certificate(cert).subject.replace(/[\r\n]+/g, ' '));
+    } else {
+      yield cert;
+    }
+  }
+}
+
+async function * getPlatformCertificates(): AsyncIterable<string> {
   const platform = os.platform();
 
   if (platform.startsWith('win')) {
@@ -128,7 +122,7 @@ export async function *getSystemCertificates(): AsyncIterable<string> {
   } else if (platform === 'darwin') {
     yield * getMacCertificates();
   } else if (platform === 'linux') {
-    yield * (await LinuxCA.getAllCerts(true)).flat().filter(filterCert);
+    yield * getLinuxCertificates();
   } else {
     throw new Error(`Cannot get system certificates on ${ platform }`);
   }

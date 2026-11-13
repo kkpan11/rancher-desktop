@@ -12,7 +12,6 @@ import type { TransientSettings } from '@pkg/config/transientSettings';
 import type { DiagnosticsResultCollection } from '@pkg/main/diagnostics/diagnostics';
 import { ExtensionMetadata } from '@pkg/main/extensions/types';
 import mainEvents from '@pkg/main/mainEvents';
-import { getVtunnelInstance } from '@pkg/main/networking/vtunnel';
 import * as serverHelper from '@pkg/main/serverHelper';
 import { Snapshot } from '@pkg/main/snapshots/types';
 import Logging from '@pkg/utils/logging';
@@ -23,20 +22,20 @@ import { RecursivePartial } from '@pkg/utils/typeUtils';
 /**
  * Represents the current or desired state of the backend/main process.
  */
-export type BackendState = {
+export interface BackendState {
   // The state of the VM/backend.
   vmState: State,
   // Whether the backend is locked. If true, changes cannot
   // be made by the user until it is unlocked.
-  locked: boolean,
-};
+  locked:  boolean,
+}
 
-export type ServerState = {
-  user: string;
+export interface ServerState {
+  user:     string;
   password: string;
-  port: number;
-  pid: number;
-};
+  port:     number;
+  pid:      number;
+}
 
 type DispatchFunctionType = (request: express.Request, response: express.Response, context: commandContext) => Promise<void>;
 type HttpMethod = 'get' | 'put' | 'post';
@@ -47,7 +46,6 @@ const SERVER_FILE_BASENAME = 'rd-engine.json';
 const MAX_REQUEST_BODY_LENGTH = 4194304; // 4MiB
 
 export class HttpCommandServer {
-  protected vtun = getVtunnelInstance();
   protected server = http.createServer();
   protected app = express();
   protected readonly externalState: ServerState = {
@@ -81,6 +79,7 @@ export class HttpCommandServer {
       post: { '/v1/diagnostic_checks': [0, this.diagnosticRunChecks] },
       put:  {
         '/v1/factory_reset':      [0, this.factoryReset],
+        '/v1/k8s_reset':          [0, this.k8sReset],
         '/v1/propose_settings':   [0, this.proposeSettings],
         '/v1/settings':           [0, this.updateSettings],
         '/v1/shutdown':           [0, this.wrapShutdown],
@@ -117,19 +116,6 @@ export class HttpCommandServer {
 
   async init() {
     const localHost = '127.0.0.1';
-
-    // The peerPort and upstreamServerAddress port will need to match
-    // this is crucial if we ever pick dynamic ports for upstreamServerAddress
-    if (process.platform === 'win32') {
-      this.vtun.addTunnel({
-        name:                  'CLI Server',
-        handshakePort:         17372,
-        vsockHostPort:         17371,
-        peerAddress:           localHost,
-        peerPort:              SERVER_PORT,
-        upstreamServerAddress: `${ localHost }:${ SERVER_PORT }`,
-      });
-    }
     const statePath = path.join(paths.appHome, SERVER_FILE_BASENAME);
 
     await fs.promises.mkdir(paths.appHome, { recursive: true });
@@ -198,7 +184,7 @@ export class HttpCommandServer {
       this.listEndpoints('', req, resp);
     });
     // Set up catch-all handler for customized HTTP 404 message.
-    this.app.all('*', ({ method, path }, resp) => {
+    this.app.all('*missing', ({ method, path }, resp) => {
       console.log(`404: No handler for URL ${ method } ${ path }.`);
       resp.status(404).type('txt').send(`Unknown command: ${ method } ${ path }`);
     });
@@ -519,7 +505,6 @@ export class HttpCommandServer {
   }
 
   async factoryReset(request: express.Request, response: express.Response, _: commandContext): Promise<void> {
-    let values: Record<string, any> = {};
     const [data, payloadError] = await serverHelper.getRequestBody(request, MAX_REQUEST_BODY_LENGTH);
     let error = '';
     let keepSystemImages = false;
@@ -527,7 +512,7 @@ export class HttpCommandServer {
     if (!payloadError) {
       try {
         console.debug(`Request data: ${ data }`);
-        values = JSON.parse(data);
+        const values: Record<string, any> = JSON.parse(data);
         if ('keepSystemImages' in values) {
           keepSystemImages = values.keepSystemImages;
         }
@@ -552,8 +537,36 @@ export class HttpCommandServer {
     }
   }
 
+  async k8sReset(request: express.Request, response: express.Response, context: commandContext): Promise<void> {
+    const [data, payloadError] = await serverHelper.getRequestBody(request, MAX_REQUEST_BODY_LENGTH);
+    let error = '';
+    let mode: 'fast' | 'wipe' = 'fast';
+
+    if (!payloadError) {
+      try {
+        console.debug(`Request data: ${ data }`);
+        const values: Record<string, any> = JSON.parse(data);
+        if ('mode' in values && typeof values.mode === 'string' && (values.mode === 'fast' || values.mode === 'wipe')) {
+          mode = values.mode;
+        }
+      } catch (err) {
+        console.log(`k8sReset: error processing JSON request block\n${ data }\n`, err);
+        error = 'error processing JSON request block';
+      }
+    } else {
+      error = payloadError;
+    }
+    if (!error) {
+      await this.commandWorker.k8sReset(context, mode);
+      console.debug(`k8sReset: ${ mode } succeeded`);
+      response.status(200).type('txt').send(`Rancher Desktop ${ mode } reset successful`);
+    } else {
+      console.debug(`k8sReset: write back status 400, error: ${ error }`);
+      response.status(400).type('txt').send(error);
+    }
+  }
+
   protected async createPortForwarding(request: express.Request, response: express.Response, _: commandContext): Promise<void> {
-    let values: Record<string, any> = {};
     const [data, payloadError] = await serverHelper.getRequestBody(request, MAX_REQUEST_BODY_LENGTH);
     let error = '';
     let namespace = '';
@@ -564,7 +577,7 @@ export class HttpCommandServer {
     if (!payloadError) {
       try {
         console.debug(`Request data: ${ data }`);
-        values = JSON.parse(data);
+        const values: Record<string, any> = JSON.parse(data);
         if ('namespace' in values && 'service' in values && 'k8sPort' in values && 'hostPort' in values) {
           namespace = values.namespace;
 
@@ -884,43 +897,44 @@ interface commandContext {
  * in order to carry out the business logic for the requests it receives.
  */
 export interface CommandWorkerInterface {
-  factoryReset: (keepSystemImages: boolean) => void;
-  getSettings: (context: commandContext) => string;
-  getLockedSettings: (context: commandContext) => string;
-  updateSettings: (context: commandContext, newSettings: RecursivePartial<Settings>) => Promise<[string, string]>;
-  proposeSettings: (context: commandContext, newSettings: RecursivePartial<Settings>) => Promise<[string, string]>;
-  requestShutdown: (context: commandContext) => void;
-  getDiagnosticCategories: (context: commandContext) => string[]|undefined;
-  getDiagnosticIdsByCategory: (category: string, context: commandContext) => string[]|undefined;
-  getDiagnosticChecks: (category: string|null, checkID: string|null, context: commandContext) => Promise<DiagnosticsResultCollection>;
-  runDiagnosticChecks: (context: commandContext) => Promise<DiagnosticsResultCollection>;
-  getTransientSettings: (context: commandContext) => string;
-  updateTransientSettings: (context: commandContext, newTransientSettings: RecursivePartial<TransientSettings>) => Promise<[string, string]>;
+  factoryReset:               (keepSystemImages: boolean) => void;
+  k8sReset:                   (context: commandContext, mode: 'fast' | 'wipe') => Promise<void>;
+  getSettings:                (context: commandContext) => string;
+  getLockedSettings:          (context: commandContext) => string;
+  updateSettings:             (context: commandContext, newSettings: RecursivePartial<Settings>) => Promise<[string, string]>;
+  proposeSettings:            (context: commandContext, newSettings: RecursivePartial<Settings>) => Promise<[string, string]>;
+  requestShutdown:            (context: commandContext) => void;
+  getDiagnosticCategories:    (context: commandContext) => string[] | undefined;
+  getDiagnosticIdsByCategory: (category: string, context: commandContext) => string[] | undefined;
+  getDiagnosticChecks:        (category: string | null, checkID: string | null, context: commandContext) => Promise<DiagnosticsResultCollection>;
+  runDiagnosticChecks:        (context: commandContext) => Promise<DiagnosticsResultCollection>;
+  getTransientSettings:       (context: commandContext) => string;
+  updateTransientSettings:    (context: commandContext, newTransientSettings: RecursivePartial<TransientSettings>) => Promise<[string, string]>;
   /** Get the state of the backend */
-  getBackendState: () => Promise<BackendState>;
+  getBackendState:            () => Promise<BackendState>;
   /** Set the desired state of the backend */
-  setBackendState: (state: BackendState) => Promise<void>;
+  setBackendState:            (state: BackendState) => Promise<void>;
 
   // #region extensions
   /**
    * List the installed extensions with their versions.
    * If the extension manager is not ready, returns undefined.
    */
-  listExtensions(): Promise<Record<string, {version: string, metadata: ExtensionMetadata, labels: Record<string, string>}> | undefined>;
+  listExtensions(): Promise<Record<string, { version: string, metadata: ExtensionMetadata, labels: Record<string, string> }> | undefined>;
   /**
    * Install or uninstall the given extension, returning an appropriate HTTP status code.
    * @param state Whether to install or uninstall the extension.
    * @returns The HTTP status code, possibly with arbitrary response body data.
    */
-  installExtension(id: string, state: 'install' | 'uninstall'): Promise<{status: number, data?: any}>;
+  installExtension(id: string, state: 'install' | 'uninstall'): Promise<{ status: number, data?: any }>;
   // #endregion
-  listSnapshots: (context: commandContext) => Promise<Snapshot[]>;
-  createSnapshot: (context: commandContext, snapshot: Snapshot) => Promise<void>;
-  deleteSnapshot: (context: commandContext, name: string) => Promise<void>;
+  listSnapshots:   (context: commandContext) => Promise<Snapshot[]>;
+  createSnapshot:  (context: commandContext, snapshot: Snapshot) => Promise<void>;
+  deleteSnapshot:  (context: commandContext, name: string) => Promise<void>;
   restoreSnapshot: (context: commandContext, name: string) => Promise<void>;
-  cancelSnapshot: () => Promise<void>;
+  cancelSnapshot:  () => Promise<void>;
 
-  forwardPort: (namespace: string, service: string, k8sPort: string | number, hostPort: number) => Promise<number | undefined>;
+  forwardPort:   (namespace: string, service: string, k8sPort: string | number, hostPort: number) => Promise<number | undefined>;
   cancelForward: (namespace: string, service: string, k8sPort: string | number) => Promise<void>;
 }
 

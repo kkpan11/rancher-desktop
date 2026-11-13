@@ -1,23 +1,39 @@
 <script lang="ts">
-import Vue, { PropType } from 'vue';
+import { defineComponent } from 'vue';
 import { mapGetters } from 'vuex';
 
 import EmptyState from '@pkg/components/EmptyState.vue';
+import LoadingIndicator from '@pkg/components/LoadingIndicator.vue';
 import NavIconExtension from '@pkg/components/NavIconExtension.vue';
 import SortableTable from '@pkg/components/SortableTable/index.vue';
-import type { ServerState } from '@pkg/main/commandServer/httpCommandServer';
+import useCredentials from '@pkg/hocs/withCredentials';
+import type { ExtensionState } from '@pkg/store/extensions';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
 
-export default Vue.extend({
+type InstalledExtensionRow = ExtensionState & {
+  title:       string;
+  vendor:      string;
+  description: string;
+  moreInfo:    string;
+};
+
+interface ExtensionMetadataSource {
+  id:      string;
+  labels?: Record<string, string>;
+}
+
+const LABEL_TITLE = 'org.opencontainers.image.title';
+const LABEL_VENDOR = 'org.opencontainers.image.vendor';
+const LABEL_DESCRIPTION = 'org.opencontainers.image.description';
+const LABEL_MORE_INFO = 'io.rancherdesktop.extension.more-info';
+
+export default defineComponent({
   name:       'extensions-installed',
   components: {
-    NavIconExtension, SortableTable, EmptyState,
+    LoadingIndicator, NavIconExtension, SortableTable, EmptyState,
   },
-  props: {
-    credentials: {
-      type:     Object as PropType<Omit<ServerState, 'pid'>>,
-      required: true,
-    },
+  setup() {
+    useCredentials();
   },
   data() {
     return {
@@ -28,16 +44,35 @@ export default Vue.extend({
           width: 35,
         },
         {
-          name:  'id',
-          label: 'Name',
+          name:  'title',
+          label: this.t('marketplace.installed.table.header.name'),
+          sort:  ['title', 'id'],
         },
         {
-          name:  'uninstall',
+          name:  'vendor',
+          label: this.t('marketplace.installed.table.header.vendor'),
+          sort:  ['vendor', 'title', 'id'],
+          width: 160,
+        },
+        {
+          name:  'description',
+          label: this.t('marketplace.installed.table.header.description'),
+          sort:  ['description', 'title', 'id'],
+        },
+        {
+          name:  'moreInfo',
+          label: this.t('marketplace.moreInfo'),
+          width: 150,
+        },
+        {
+          name:  'actions',
           label: ' ',
-          width: 76,
+          width: 170,
         },
       ],
       loading: true,
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- gives busy a string index signature for this.busy[id]
+      busy:    {} as Record<string, boolean>,
     };
   },
   computed: {
@@ -48,9 +83,21 @@ export default Vue.extend({
       return this.t('extensions.installed.emptyState.heading');
     },
     emptyStateBody(): string {
-      return this.t('extensions.installed.emptyState.body', { }, true);
+      return this.t('extensions.installed.emptyState.body');
     },
-    ...mapGetters('extensions', { extensionsList: 'list' }),
+    installedExtensionRows(): InstalledExtensionRow[] {
+      return this.installedExtensions.map(extension => ({
+        ...extension,
+        title:       this.extensionTitle(extension),
+        vendor:      this.extensionVendor(extension),
+        description: this.extensionDescription(extension),
+        moreInfo:    this.extensionLink(extension),
+      }));
+    },
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- declares getter return types the build's checker infers as any
+    ...mapGetters('extensions', ['installedExtensions']) as {
+      installedExtensions: () => ExtensionState[],
+    },
   },
   async beforeMount() {
     ipcRenderer.on('extensions/changed', () => {
@@ -60,25 +107,59 @@ export default Vue.extend({
     this.loading = false;
   },
   methods: {
+    extensionLabel(ext: { labels?: Record<string, string> }, label: string, fallback = ''): string {
+      return ext.labels?.[label]?.trim() || fallback;
+    },
+    extensionTitle(ext: ExtensionMetadataSource): string {
+      return this.extensionLabel(ext, LABEL_TITLE, ext.id);
+    },
+    extensionVendor(ext: { labels?: Record<string, string> }): string {
+      return this.extensionLabel(ext, LABEL_VENDOR);
+    },
+    extensionDescription(ext: { labels?: Record<string, string> }): string {
+      return this.extensionLabel(ext, LABEL_DESCRIPTION);
+    },
+    extensionLink(ext: ExtensionMetadataSource): string {
+      const preferredURL = this.extensionLabel(ext, LABEL_MORE_INFO);
+
+      if (preferredURL) {
+        return preferredURL;
+      }
+
+      if (!/^[^./]+\//.test(ext.id)) {
+        return `https://${ ext.id }`;
+      }
+
+      return `https://hub.docker.com/extensions/${ ext.id }`;
+    },
     browseExtensions() {
       this.$emit('click:browse');
     },
-    extensionTitle(ext: {id: string, labels: Record<string, string>}): string {
-      return ext.labels?.['org.opencontainers.image.title'] ?? ext.id;
+    async uninstall(installed: ExtensionState) {
+      this.busy = { ...this.busy, [installed.id]: true };
+      try {
+        await this.$store.dispatch('extensions/uninstall', { id: installed.id });
+      } finally {
+        const { [installed.id]: _, ...rest } = this.busy;
+
+        this.busy = rest;
+      }
     },
-    uninstall(id: string) {
-      fetch(
-        `http://localhost:${ this.credentials?.port }/v1/extensions/uninstall?id=${ id }`,
-        {
-          method:  'POST',
-          headers: new Headers({
-            Authorization: `Basic ${ window.btoa(
-              `${ this.credentials?.user }:${ this.credentials?.password }`,
-            ) }`,
-            'Content-Type': 'application/x-www-form-urlencoded',
-          }),
-        },
-      );
+    async upgrade(installed: ExtensionState) {
+      const id = `${ installed.id }:${ installed.availableVersion }`;
+
+      if (!installed.availableVersion) {
+        // Should not have reached here.
+        return;
+      }
+      this.busy = { ...this.busy, [installed.id]: true };
+      try {
+        await this.$store.dispatch('extensions/install', { id });
+      } finally {
+        const { [installed.id]: _, ...rest } = this.busy;
+
+        this.busy = rest;
+      }
     },
   },
 });
@@ -87,10 +168,11 @@ export default Vue.extend({
 <template>
   <div>
     <sortable-table
-      key-field="description"
+      key-field="id"
       :loading="loading"
       :headers="headers"
-      :rows="extensionsList"
+      :rows="installedExtensionRows"
+      default-sort-by="title"
       :search="false"
       :table-actions="false"
       :row-actions="false"
@@ -113,26 +195,100 @@ export default Vue.extend({
           </empty-state>
         </td>
       </template>
-      <template #col:icon="{row}">
+      <template #col:icon="{ row }">
         <td>
           <nav-icon-extension :extension-id="row.id" />
         </td>
       </template>
-      <template #col:id="{row}">
+      <template #col:title="{ row }">
         <td>
-          {{ extensionTitle(row) }}
+          {{ row.title }}
         </td>
       </template>
-      <template #col:uninstall="{row}">
+      <template #col:vendor="{ row }">
         <td>
-          <button
-            class="btn btn-sm role-danger"
-            @click="uninstall(`${ row.id }:${ row.version }`)"
+          <span v-if="row.vendor">{{ row.vendor }}</span>
+          <span
+            v-else
+            class="empty-cell"
+          >-</span>
+        </td>
+      </template>
+      <template #col:description="{ row }">
+        <td class="description">
+          <span v-if="row.description">{{ row.description }}</span>
+          <span
+            v-else
+            class="empty-cell"
+          >-</span>
+        </td>
+      </template>
+      <template #col:moreInfo="{ row }">
+        <td>
+          <a
+            class="more-info-link"
+            :href="row.moreInfo"
+            :title="row.moreInfo"
+            target="_blank"
+            rel="noopener noreferrer"
           >
-            {{ t('extensions.installed.list.uninstall') }}
-          </button>
+            {{ t('marketplace.moreInfo') }}
+            <i class="icon icon-external-link" />
+          </a>
+        </td>
+      </template>
+      <template #col:actions="{ row }">
+        <td>
+          <div class="actions">
+            <span
+              v-if="busy[row.id]"
+              name="busy"
+              :is-loading="busy"
+            >
+              <loading-indicator />
+            </span>
+            <button
+              v-if="!busy[row.id] && row.canUpgrade"
+              class="btn btn-sm role-primary"
+              @click.stop="upgrade(row)"
+            >
+              {{ t('extensions.installed.list.upgrade') }}
+            </button>
+            <button
+              :disabled="busy[row.id]"
+              class="btn btn-sm role-danger"
+              @click.stop="uninstall(row)"
+            >
+              {{ t('extensions.installed.list.uninstall') }}
+            </button>
+          </div>
         </td>
       </template>
     </sortable-table>
   </div>
 </template>
+
+<style lang="scss" scoped>
+.actions {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: end;
+  & > * {
+    margin-left: 10px;
+  }
+}
+
+.description {
+  line-height: 1.35;
+  white-space: normal;
+}
+
+.empty-cell {
+  color: var(--muted);
+}
+
+.more-info-link {
+  white-space: nowrap;
+}
+</style>

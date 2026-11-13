@@ -2,12 +2,12 @@ import path from 'path';
 
 import { app, dialog } from 'electron';
 
-import { webRoot, createWindow } from '.';
+import { webRoot, createWindow, getWindow } from '.';
 
 import { Help } from '@pkg/config/help';
+import { onLocaleChange, t } from '@pkg/main/i18n';
 import paths from '@pkg/utils/paths';
 import { CommandOrControl, Shortcuts } from '@pkg/utils/shortcuts';
-import { getVersion } from '@pkg/utils/version';
 import { preferencesNavItems } from '@pkg/window/preferenceConstants';
 
 let isDirty = false;
@@ -17,7 +17,7 @@ let isDirty = false;
  */
 export function openPreferences() {
   const window = createWindow('preferences', `${ webRoot }/index.html#preferences`, {
-    title:           'Rancher Desktop - Preferences',
+    title:           t('preferencesWindow.title'),
     width:           768,
     height:          512,
     autoHideMenuBar: true,
@@ -25,6 +25,7 @@ export function openPreferences() {
     minimizable:     false,
     show:            false,
     icon:            path.join(paths.resources, 'icons', 'logo-square-512.png'),
+    parent:          getWindow('main') ?? undefined,
     webPreferences:  {
       devTools:         !app.isPackaged,
       nodeIntegration:  true,
@@ -43,8 +44,8 @@ export function openPreferences() {
         key:      'F1',
         platform: ['win32', 'linux'],
       }],
-      async() => {
-        Help.preferences.openUrl(await getVersion());
+      () => {
+        Help.preferences.openUrl();
       },
       'preferences help',
     );
@@ -89,6 +90,12 @@ export function openPreferences() {
       () => window.webContents.send('route', { direction: 'back' }),
       'switch preferences tabs by cycle [back]',
     );
+
+    const offLocaleChange = onLocaleChange(() => {
+      window.setTitle(t('preferencesWindow.title'));
+    });
+
+    window.on('closed', offLocaleChange);
   }
 
   window.webContents.on('ipc-message', (_event, channel) => {
@@ -98,7 +105,7 @@ export function openPreferences() {
   });
 
   window.on('close', (event) => {
-    if (!isDirty || process.env.RD_TEST === 'e2e') {
+    if (!isDirty || (process.env.RD_TEST ?? '').includes('e2e')) {
       return;
     }
 
@@ -107,14 +114,14 @@ export function openPreferences() {
     const result = dialog.showMessageBoxSync(
       window,
       {
-        title:    'Rancher Desktop - Close Preferences',
+        title:    t('preferencesWindow.close.title'),
         type:     'warning',
-        message:  'Close preferences without applying?',
-        detail:   'There are preferences with changes that have not been applied. All unsaved preferences will be lost.',
+        message:  t('preferencesWindow.close.message'),
+        detail:   t('preferencesWindow.close.detail'),
         cancelId: cancelPosition,
         buttons:  [
-          'Discard changes',
-          'Cancel',
+          t('preferencesWindow.close.discardChanges'),
+          t('generic.cancel'),
         ],
       });
 

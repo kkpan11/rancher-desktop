@@ -1,6 +1,6 @@
 <script lang="ts">
 
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 import { mapGetters } from 'vuex';
 
 import WslIntegration from '@pkg/components/WSLIntegration.vue';
@@ -10,7 +10,7 @@ import { RecursiveTypes } from '@pkg/utils/typeUtils';
 
 import type { PropType } from 'vue';
 
-export default Vue.extend({
+export default defineComponent({
   name:       'preferences-wsl-integrations',
   components: { WslIntegration, RdFieldset },
   props:      {
@@ -35,7 +35,7 @@ export default Vue.extend({
   <div class="wsl-integrations">
     <rd-fieldset
       data-test="wslIntegrations"
-      :legend-text="t('integrations.windows.description', { }, true)"
+      :legend-text="t('integrations.windows.description')"
     >
       <wsl-integration
         data-test-id="wsl-integration-list"

@@ -1,0 +1,165 @@
+/*
+Copyright © 2025 SUSE LLC
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package iptables handles forwarding ports found in iptables DNAT
+package iptables
+
+import (
+	"context"
+	"errors"
+	"net"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Masterminds/log-go"
+	limaiptables "github.com/lima-vm/lima/pkg/guestagent/iptables"
+
+	"github.com/rancher-sandbox/rancher-desktop/src/go/guestagent/pkg/tracker"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/guestagent/pkg/utils"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/ports"
+)
+
+// Iptables manages port forwarding for ports identified in iptables DNAT rules.
+// It is primarily responsible for handling port mappings in Kubernetes environments that
+// are not exposed via the Kubernetes API. The package scans iptables for these port and uses
+// the k8sServiceListenerAddr setting for the hostIP property to create a port mapping and
+// forwards them to both the API tracker and the WSL Proxy for proper routing and handling.
+type Iptables struct {
+	context    context.Context
+	apiTracker tracker.Tracker
+	scanner    Scanner
+	listenerIP net.IP
+	// time, in seconds, to wait between updating.
+	updateInterval time.Duration
+}
+
+func New(ctx context.Context, apiTracker tracker.Tracker, iptablesScanner Scanner, listenerIP net.IP, updateInterval time.Duration) *Iptables {
+	return &Iptables{
+		context:        ctx,
+		apiTracker:     apiTracker,
+		scanner:        iptablesScanner,
+		listenerIP:     listenerIP,
+		updateInterval: updateInterval,
+	}
+}
+
+// ForwardPorts forwards ports found in iptables DNAT. In some environments,
+// like WSL, ports defined using the CNI portmap plugin happen through iptables.
+// These ports are not sent to places like /proc/net/tcp and are not picked up
+// as part of the normal forwarding system. This function detects those ports
+// and binds them to k8sServiceListenerAddr so that they are picked up.
+func (i *Iptables) ForwardPorts() error {
+	var currentPorts []limaiptables.Entry
+
+	ticker := time.NewTicker(i.updateInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-i.context.Done():
+			return nil
+		case <-ticker.C:
+		}
+		// Detect ports for forward
+		newPorts, err := i.scanner.GetPorts()
+		if err != nil {
+			// iptables exiting with an exit status of 4 means there
+			// is a resource problem. For example, something else is
+			// running iptables. In that case, we can skip trying it for
+			// this loop. You can find the exit code in the iptables
+			// source at https://git.netfilter.org/iptables/tree/include/xtables.h
+			if strings.Contains(err.Error(), "exit status 4") {
+				log.Debug("iptables exited with status 4 (resource error). Retrying...")
+				continue // Retry in the next iteration
+			}
+			return err
+		}
+
+		// Diff from existing forwarded ports
+		added, removed := comparePorts(currentPorts, newPorts)
+		currentPorts = newPorts
+
+		// Remove old forwards
+		for _, p := range removed {
+			name := entryToString(p)
+			if err := i.apiTracker.Remove(utils.GenerateID(name)); err != nil {
+				log.Warnf("iptables scanner failed to remove portmap for %s: %w", name, err)
+				continue
+			}
+			log.Infof("iptables scanner removed portmap for %s", name)
+		}
+
+		// Add new forwards
+		for _, p := range added {
+			if !p.TCP {
+				continue
+			}
+			port := strconv.Itoa(p.Port)
+			portMapKey, err := ports.NewPort("tcp", port)
+			if err != nil {
+				log.Errorf("failed to create a corresponding key for the portMap: %s", err)
+				continue
+			}
+			// One map per entry, so each Add exposes only this entry's
+			// port and a Remove by this entry's id unexposes only that
+			// port.
+			portMap := ports.PortMap{portMapKey: []ports.PortBinding{{
+				HostIP:   i.listenerIP.String(),
+				HostPort: port,
+			}}}
+			name := entryToString(p)
+			switch err := i.apiTracker.Add(utils.GenerateID(name), portMap); {
+			case err == nil:
+				log.Infof("iptables scanner forwarded portmap for %s", name)
+			case errors.Is(err, tracker.ErrPortAlreadyExposed):
+				log.Infof("iptables scanner: portmap for %s already exposed elsewhere", name)
+			default:
+				log.Errorf("iptables scanner failed to forward portmap for %s: %s", name, err)
+			}
+		}
+	}
+}
+
+// comparePorts compares the old and new ports to find those added or removed.
+// This function is mostly lifted from lima (github.com/lima-vm/lima) which is
+// licensed under the Apache 2.
+func comparePorts(oldPorts, newPorts []limaiptables.Entry) ([]limaiptables.Entry, []limaiptables.Entry) {
+	var added, removed []limaiptables.Entry
+	oldPortMap := make(map[string]limaiptables.Entry, len(oldPorts))
+	portExistMap := make(map[string]bool, len(oldPorts))
+	for _, oldPort := range oldPorts {
+		key := entryToString(oldPort)
+		oldPortMap[key] = oldPort
+		portExistMap[key] = false
+	}
+	for _, newPort := range newPorts {
+		key := entryToString(newPort)
+		portExistMap[key] = true
+		if _, ok := oldPortMap[key]; !ok {
+			added = append(added, newPort)
+		}
+	}
+	for k, stillExist := range portExistMap {
+		if !stillExist {
+			if entry, ok := oldPortMap[k]; ok {
+				removed = append(removed, entry)
+			}
+		}
+	}
+	return added, removed
+}
+
+func entryToString(ip limaiptables.Entry) string {
+	return net.JoinHostPort(ip.IP.String(), strconv.Itoa(ip.Port))
+}

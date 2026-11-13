@@ -6,6 +6,7 @@ import yaml from 'yaml';
 
 import paths from './paths';
 
+import mainEvents from '@pkg/main/mainEvents';
 import { spawnFile } from '@pkg/utils/childProcess';
 import clone from '@pkg/utils/clone';
 import Logging from '@pkg/utils/logging';
@@ -16,40 +17,40 @@ const console = Logging.background;
 /**
  * Goes under the `auths` key in docker config.json.
  */
-type AuthConfig = {
-  username?: string,
-  password?: string,
-  auth?: string,
-  email?: string,
+interface AuthConfig {
+  username?:      string,
+  password?:      string,
+  auth?:          string,
+  email?:         string,
   serveraddress?: string,
   identitytoken?: string,
   registrytoken?: string,
-};
+}
 
 /**
  * The parts of a docker config.json file that concern Rancher Desktop.
  */
-type PartialDockerConfig = {
-  auths?: Record<string, AuthConfig>,
-  credsStore?: string,
-  credHelpers?: Record<string, string>,
+interface PartialDockerConfig {
+  auths?:          Record<string, AuthConfig>,
+  credsStore?:     string,
+  credHelpers?:    Record<string, string>,
   currentContext?: string,
-};
+}
 
 /**
  * Manages everything under the docker CLI config directory (except, at
  * the time of writing, docker CLI plugins).
  */
-export default class DockerDirManager {
-  protected readonly dockerDirPath: string;
+export class DockerDirManager {
+  protected readonly dockerDirPath:        string;
   protected readonly dockerContextDirPath: string;
   /**
    * Path to the 'rancher-desktop' docker context file.  The parent directory
    * is the SHA256 hash of the docker context name ('rancher-desktop'), per the
    * docker convention.
    */
-  protected readonly dockerContextPath: string;
-  protected readonly dockerConfigPath: string;
+  protected readonly dockerContextPath:    string;
+  protected readonly dockerConfigPath:     string;
   protected readonly defaultDockerSockPath = '/var/run/docker.sock';
   protected readonly contextName = 'rancher-desktop';
 
@@ -73,9 +74,9 @@ export default class DockerDirManager {
       const rawConfig = await fs.promises.readFile(this.dockerConfigPath, { encoding: 'utf-8' });
 
       return JSON.parse(rawConfig);
-    } catch (error: any) {
-      if (error.code !== 'ENOENT') {
-        throw new Error(`Failed to parse Docker config file '${ this.dockerConfigPath }'. Error: ${ error.message }`);
+    } catch (cause: any) {
+      if (cause.code !== 'ENOENT') {
+        throw new Error(`Failed to parse Docker config file '${ this.dockerConfigPath }'. Error: ${ cause.message }`, { cause });
       }
       console.log('No docker config file found');
 
@@ -143,7 +144,7 @@ export default class DockerDirManager {
    * @param currentContext The current context.
    * @returns Undefined for default context; string containing context name for other contexts.
    */
-  protected async getDesiredDockerContext(weOwnDefaultSocket: boolean, currentContext: string | undefined): Promise<string | undefined> {
+  async getDesiredDockerContext(weOwnDefaultSocket: boolean, currentContext: string | undefined): Promise<string | undefined> {
     if (weOwnDefaultSocket) {
       return undefined;
     }
@@ -207,7 +208,7 @@ export default class DockerDirManager {
       const timeoutError = Symbol('timeout');
       const execPromise = this.spawnFileWithExtraPath('pass', ['ls']);
       const timeoutPromise = new Promise(resolve => setTimeout(() => resolve(timeoutError), 1_000));
-      const result = await Promise.any([execPromise, timeoutPromise]);
+      const result = await Promise.race([execPromise, timeoutPromise]);
 
       if (Object.is(result, timeoutError)) {
         console.debug('Timed out waiting for pass');
@@ -271,7 +272,7 @@ export default class DockerDirManager {
     }
     // When running E2E tests in CI, use "none".  Note that we use the default
     // value when running unit tests in CI.
-    const e2eInCI = process.env.CI && process.env.RD_TEST === 'e2e';
+    const e2eInCI = process.env.CI && (process.env.RD_TEST ?? '').includes('e2e');
 
     if (e2eInCI && await this.credHelperWorking('none')) {
       return 'none';
@@ -282,11 +283,12 @@ export default class DockerDirManager {
     } else if (platform === 'darwin') {
       return 'osxkeychain';
     } else if (platform === 'linux') {
-      if (currentCredsStore === 'secretservice') {
-        return 'secretservice';
-      } else {
+      // On Linux, we need to match the logic used by oras-go (used by helm):
+      // If `pass` works, use it; otherwise use secret service.
+      if (await this.credHelperWorking('pass')) {
         return 'pass';
       }
+      return 'secretservice';
     } else {
       throw new Error(`platform "${ platform }" is not supported`);
     }
@@ -315,6 +317,13 @@ export default class DockerDirManager {
 
     await fs.promises.mkdir(path.dirname(this.dockerContextPath), { recursive: true });
     await fs.promises.writeFile(this.dockerContextPath, JSON.stringify(contextContents));
+  }
+
+  /**
+   * Return the current docker context.
+   */
+  get currentDockerContext(): Promise<string | undefined> {
+    return this.readDockerConfig().then(cfg => cfg.currentContext);
   }
 
   /**
@@ -364,6 +373,9 @@ export default class DockerDirManager {
     if (JSON.stringify(newConfig) !== JSON.stringify(currentConfig)) {
       await this.writeDockerConfig(newConfig);
     }
+
+    // Trigger diagnostics, ignoring results.
+    mainEvents.invoke('diagnostics-trigger', 'DOCKER_CONTEXT').catch(e => console.error(e));
   }
 
   /**
@@ -385,3 +397,8 @@ export default class DockerDirManager {
     }
   }
 }
+
+/**
+ * Export a singleton instance of the docker dir manager by default.
+ */
+export default new DockerDirManager(path.join(os.homedir(), '.docker'));

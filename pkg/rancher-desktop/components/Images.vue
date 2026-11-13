@@ -27,10 +27,10 @@
               :value="showAll"
               :label="t('images.manager.table.label')"
               :disabled="!supportsShowAll"
-              @input="handleShowAllCheckbox"
+              @update:value="handleShowAllCheckbox"
             />
             <div v-if="supportsNamespaces">
-              <label>Namespace</label>
+              <label>{{ t('generic.namespace') }}</label>
               <select
                 class="select-namespace"
                 :value="selectedNamespace"
@@ -71,6 +71,7 @@
             :current-command="currentCommand"
             :image-output-culler="imageOutputCuller"
             :show-status="false"
+            :image-to-pull="imageToPull"
             @ok:process-end="resetCurrentCommand"
             @ok:show="toggleOutput"
           />
@@ -88,16 +89,36 @@
   </div>
 </template>
 
-<script>
-import SortableTable from '@pkg/components/SortableTable';
+<script lang="ts">
 import { Card, Checkbox } from '@rancher/components';
 import _ from 'lodash';
-import { mapState, mapMutations } from 'vuex';
+import { PropType } from 'vue';
+import { mapMutations } from 'vuex';
 
 import ImagesOutputWindow from '@pkg/components/ImagesOutputWindow.vue';
-import getImageOutputCuller from '@pkg/utils/imageOutputCuller';
+import SortableTable from '@pkg/components/SortableTable';
+import { mapTypedState } from '@pkg/entry/store';
+import type { IpcRendererEvents } from '@pkg/typings/electron-ipc';
+import getImageOutputCuller, { ImageOutputCuller } from '@pkg/utils/imageOutputCuller';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
 import { parseSi } from '@pkg/utils/units';
+
+type Image = Parameters<IpcRendererEvents['images-changed']>[0][number];
+
+type RowItem = Image & {
+  availableActions: {
+    label:       string;
+    action:      string;
+    enabled:     boolean;
+    icon:        string;
+    bulkable?:   boolean;
+    bulkAction?: string;
+  }[];
+  doPush:       () => void;
+  deleteImage:  () => Promise<void>;
+  deleteImages: () => Promise<void>;
+  scanImage:    () => void;
+};
 
 export default {
   components: {
@@ -108,15 +129,15 @@ export default {
   },
   props: {
     images: {
-      type:     Array,
+      type:     Array as PropType<Image[]>,
       required: true,
     },
     protectedImages: {
-      type:    Array,
+      type:    Array as PropType<string[]>,
       default: () => [],
     },
     imageNamespaces: {
-      type:     Array,
+      type:     Array as PropType<string[]>,
       required: true,
     },
     selectedNamespace: {
@@ -128,9 +149,9 @@ export default {
       default: false,
     },
     state: {
-      type:      String,
+      type:      String as PropType<'IMAGE_MANAGER_UNREADY' | 'READY'>,
       default:   'IMAGE_MANAGER_UNREADY',
-      validator: value => ['IMAGE_MANAGER_UNREADY', 'READY'].includes(value),
+      validator: (value: string) => ['IMAGE_MANAGER_UNREADY', 'READY'].includes(value),
     },
     showAll: {
       type:    Boolean,
@@ -140,7 +161,7 @@ export default {
 
   data() {
     return {
-      currentCommand: null,
+      currentCommand: null as string | null,
       headers:
       [
         {
@@ -165,20 +186,35 @@ export default {
         },
       ],
       keepImageManagerOutputWindowOpen: false,
-      imageOutputCuller:                null,
+      imageOutputCuller:                undefined as ImageOutputCuller | undefined,
       mainWindowScroll:                 -1,
-      selected:                         [],
+      selected:                         [] as RowItem[],
+      imageToPull:                      undefined,
     };
   },
   computed: {
-    ...mapState('action-menu', { menuImages: state => state.resources?.map(i => i.imageName) ?? [] }),
+    ...mapTypedState('action-menu', { menuImages: state => state.resources?.map((i: RowItem) => i.imageName) ?? [] }),
+    main() {
+      return document.getElementsByTagName('main')[0];
+    },
     keyedImages() {
+      const rowsPerImage: Record<string, number> = {};
+
       return this.images
-        .map((image, index) => {
+        .map((image) => {
+          // The key has to name the image rather than its place in the list:
+          // SortableTable matches a selected row to the refreshed table by key,
+          // and a position would hand the selection to whichever image moved in.
+          const identity = `${ image.imageName }:${ image.tag }@${ image.imageID }`;
+
+          rowsPerImage[identity] = (rowsPerImage[identity] ?? 0) + 1;
+
+          const occurrence = rowsPerImage[identity];
+
           return {
             ...image,
             si:   parseSi(image.size),
-            _key: `${ index }-${ image.imageID }-${ this.imageTag(image.tag) }`,
+            _key: occurrence > 1 ? `${ identity }#${ occurrence }` : identity,
           };
         });
     },
@@ -200,16 +236,13 @@ export default {
       return this.imagesToDelete
         .map(this.getTaggedImage);
     },
-    rows() {
-      const filteredImages = _.cloneDeep(this.filteredImages);
-
-      return filteredImages
-        .map((image) => {
+    rows(): RowItem[] {
+      return this.filteredImages
+        .map(image => ({
+          ...image,
           // The `availableActions` property is used by the ActionMenu to fill
-          // out the menu entries.  Note that we need to modify the items
-          // in-place, as SortableTable depends on object identity to manage its
-          // selection state.
-          image.availableActions = [
+          // out the menu entries.
+          availableActions: [
             {
               label:   this.t('images.manager.table.action.push'),
               action:  'doPush',
@@ -230,24 +263,14 @@ export default {
               enabled: true,
               icon:    'icon icon-info-circle',
             },
-          ].filter(x => x.enabled);
+          ].filter(x => x.enabled),
           // ActionMenu callbacks - SortableTable assumes that these methods live
           // on the rows directly.
-          if (!image.doPush) {
-            image.doPush = this.doPush.bind(this, image);
-          }
-          if (!image.deleteImage) {
-            image.deleteImage = this.deleteImage.bind(this, image);
-          }
-          if (!image.deleteImages) {
-            image.deleteImages = this.deleteImages.bind(this, image);
-          }
-          if (!image.scanImage) {
-            image.scanImage = this.scanImage.bind(this, image);
-          }
-
-          return image;
-        });
+          doPush:       this.doPush.bind(this, image),
+          deleteImage:  this.deleteImage.bind(this, image),
+          deleteImages: this.deleteImages.bind(this),
+          scanImage:    this.scanImage.bind(this, image),
+        }));
     },
     showImageManagerOutput() {
       return this.keepImageManagerOutputWindowOpen;
@@ -259,21 +282,18 @@ export default {
 
   watch: {
     rows: {
-      handler(newRows) {
+      handler(newRows: RowItem[]) {
         if (this.menuImages.some(name => newRows.map(r => r.imageName).includes(name))) {
           this.hideMenu();
         }
       },
+      deep: true,
     },
-  },
-
-  mounted() {
-    this.main = document.getElementsByTagName('main')[0];
   },
 
   methods: {
     ...mapMutations('action-menu', { hideMenu: 'hide' }),
-    updateSelection(val) {
+    updateSelection(val: RowItem[]) {
       this.selected = val;
     },
     startImageManagerOutput() {
@@ -281,38 +301,40 @@ export default {
       this.scrollToOutputWindow();
     },
     scrollToOutputWindow() {
-      if (this.main) {
-        // move to the bottom
-        this.$nextTick(() => {
+      this.$nextTick(() => {
+        if (this.main) {
+          // move to the bottom
           this.main.scrollTop = this.main.scrollHeight;
-        });
-      }
+        }
+      });
     },
     scrollToTop() {
       this.$nextTick(() => {
-        try {
-          this.main.scrollTop = this.mainWindowScroll;
-        } catch (e) {
-          console.log(`Trying to reset scroll to ${ this.mainWindowScroll }, got error:`, e);
+        if (this.main) {
+          try {
+            this.main.scrollTop = this.mainWindowScroll;
+          } catch (e) {
+            console.log(`Trying to reset scroll to ${ this.mainWindowScroll }, got error:`, e);
+          }
         }
 
         this.mainWindowScroll = -1;
       });
     },
-    startRunningCommand(command) {
+    startRunningCommand(command: Parameters<typeof getImageOutputCuller>[0]) {
       this.imageOutputCuller = getImageOutputCuller(command);
     },
     async deleteImages() {
-      const message = `Delete ${ this.imagesToDelete.length } ${ this.imagesToDelete.length > 1 ? 'images' : 'image' }?`;
+      const message = this.t('images.confirmDelete.multiple', { count: this.imagesToDelete.length });
       const detail = this.imageIdsToDelete.join('\n');
 
-      const options = {
+      const options: Electron.MessageBoxOptions = {
         message,
         detail,
         type:      'question',
-        buttons:   ['Yes', 'No'],
+        buttons:   [this.t('images.confirmDelete.confirm'), this.t('generic.cancel')],
         defaultId: 1,
-        title:     'Confirming image deletion',
+        title:     this.t('images.confirmDelete.title'),
         cancelId:  1,
       };
 
@@ -328,13 +350,13 @@ export default {
       ipcRenderer.send('do-image-deletion-batch', this.imageIdsToDelete);
       this.startImageManagerOutput();
     },
-    async deleteImage(obj) {
-      const options = {
-        message:   `Delete image ${ obj.imageName }:${ obj.tag }?`,
+    async deleteImage(obj: Image) {
+      const options: Electron.MessageBoxOptions = {
+        message:   this.t('images.confirmDelete.single', { name: obj.imageName, tag: obj.tag }),
         type:      'question',
-        buttons:   ['Yes', 'No'],
+        buttons:   [this.t('images.confirmDelete.confirm'), this.t('generic.cancel')],
         defaultId: 1,
-        title:     'Confirming image deletion',
+        title:     this.t('images.confirmDelete.title'),
         cancelId:  1,
       };
       const result = await ipcRenderer.invoke('show-message-box', options);
@@ -350,51 +372,51 @@ export default {
 
       this.startImageManagerOutput();
     },
-    doPush(obj) {
+    doPush(obj: Image) {
       this.currentCommand = `push ${ obj.imageName }:${ obj.tag }`;
       this.mainWindowScroll = this.main.scrollTop;
       this.startRunningCommand('push');
       ipcRenderer.send('do-image-push', obj.imageName.trim(), obj.imageID.trim(), obj.tag.trim());
     },
-    scanImage(obj) {
+    scanImage(obj: Image) {
       const taggedImageName = `${ obj.imageName.trim() }:${ this.imageTag(obj.tag) }`;
 
-      this.$router.push({ name: 'images-scans-image-name', params: { image: taggedImageName } });
+      this.$router.push({ name: 'images-scans-image-name', params: { image: taggedImageName, namespace: this.selectedNamespace } });
     },
-    imageTag(tag) {
+    imageTag(tag: string) {
       return tag === '<none>' ? 'latest' : `${ tag.trim() }`;
     },
-    isNotNoneImage(row) {
+    isNotNoneImage(row: Image) {
       return row.imageName && row.imageName !== '<none>';
     },
-    isDeletable(row) {
+    isDeletable(row: Image) {
       return !this.protectedImages.includes(row.imageName);
     },
-    isPushable(row) {
+    isPushable(row: Image) {
       // If it doesn't contain a '/', it's certainly not pushable,
       // but having a '/' isn't sufficient, but it's all we have to go on.
       return this.isDeletable(row) && row.imageName.includes('/');
     },
-    hasDropdownActions(row) {
+    hasDropdownActions(row: Image) {
       return this.isDeletable(row);
     },
-    handleShowAllCheckbox(value) {
+    handleShowAllCheckbox(value: boolean) {
       this.$emit('toggledShowAll', value);
     },
-    handleChangeNamespace(event) {
-      this.$emit('switchNamespace', event.target.value);
+    handleChangeNamespace(event: Event) {
+      this.$emit('switchNamespace', (event.target as HTMLSelectElement).value);
     },
     resetCurrentCommand() {
       this.currentCommand = null;
     },
-    toggleOutput(val) {
+    toggleOutput(val: boolean) {
       this.keepImageManagerOutputWindowOpen = val;
 
       if (!val && this.mainWindowScroll >= 0) {
         this.scrollToTop();
       }
     },
-    getTaggedImage(image) {
+    getTaggedImage(image: Image) {
       return image.tag !== '<none>' ? `${ image.imageName }:${ image.tag }` : `${ image.imageName }@${ image.digest }`;
     },
   },
@@ -434,10 +456,10 @@ export default {
     margin-bottom: 12px;
   }
 
-  .imagesTable::v-deep .search-box {
+  .imagesTable :deep(.search-box) {
     align-self: flex-end;
   }
-  .imagesTable::v-deep .bulk {
+  .imagesTable :deep(.bulk) {
     align-self: flex-end;
   }
 </style>

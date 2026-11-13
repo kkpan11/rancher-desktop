@@ -1,10 +1,10 @@
 <script>
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
-import { networkStatus } from '@pkg/utils/networks';
 
-export default Vue.extend({
+export default defineComponent({
+  name:  'network-status',
   props: {
     icon: {
       type:    String,
@@ -20,13 +20,16 @@ export default Vue.extend({
   },
   computed: {
     networkStatusLabel() {
-      return this.networkStatus ? networkStatus.CONNECTED : networkStatus.OFFLINE;
+      const key = this.networkStatus ? 'online' : 'offline';
+
+      return this.t(`product.networkStatusValues.${ key }`);
     },
     getTooltip() {
       return {
-        content:   `<b>${ this.t('product.networkStatus') }</b>: ${ this.networkStatusLabel }`,
-        placement: 'top',
-        classes:   'tooltip-footer',
+        content:     `<b>${ this.t('product.networkStatus') }</b>: ${ this.networkStatusLabel }`,
+        html:        true,
+        placement:   'top',
+        popperClass: 'tooltip-footer',
       };
     },
   },
@@ -79,7 +82,7 @@ export default Vue.extend({
       v-if="isStatusBarItem"
       class="icon icon-dot"
       :class="networkStatus ? 'online' : 'offline'"
-    ></i>
+    />
   </span>
 </template>
 

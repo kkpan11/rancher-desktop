@@ -1,15 +1,32 @@
-module.exports = {
+// @ts-check
+import vm from 'node:vm';
+
+import { TS_EXT_TO_TREAT_AS_ESM, ESM_TS_TRANSFORM_PATTERN } from 'ts-jest';
+
+// Without --experimental-vm-modules the suites compile as CommonJS, and every
+// file using top-level await or import.meta fails with a TypeScript error
+// naming the module option, which reports as a broken tsconfig rather than a
+// missing flag.
+if (!vm.SourceTextModule) {
+  throw new Error('Run the tests with `yarn test:unit:jest`; jest needs --experimental-vm-modules to load these suites as ES modules.');
+}
+
+/** @type {import('jest').Config} */
+export default {
   transform: {
-    '^.+\\.js$':  'babel-jest',
-    '^.+\\.ts$':  'ts-jest',
-    '^.+\\.vue$': 'vue-jest',
+    // tsconfig.jest.json sets isolatedModules, so ts-jest transpiles without
+    // type-checking, and `yarn test:unit:typecheck` runs tsc over the specs.
+    // Jest runs ts-jest's synchronous transform for ES modules, and that
+    // transform throws away the type errors it finds.
+    [ESM_TS_TRANSFORM_PATTERN]: ['ts-jest', { useESM: true, tsconfig: '<rootDir>/tsconfig.jest.json' }],
+    '^.+\\.vue$':               './pkg/rancher-desktop/utils/testUtils/vue-jest.js',
   },
-  transformIgnorePatterns: [
-    '/node_modules/(?!(yaml|jsonpath-plus|@kubernetes/client-node)/)',
-  ],
-  moduleFileExtensions: [
+  transformIgnorePatterns: [],
+  extensionsToTreatAsEsm:  [...TS_EXT_TO_TREAT_AS_ESM, '.vue'],
+  moduleFileExtensions:    [
     'js',
     'json',
+    'node', // For native modules, e.g. @napi-rs/xattr
     'ts',
     'vue',
   ],
@@ -24,10 +41,22 @@ module.exports = {
     '\\.css$':       '<rootDir>/pkg/rancher-desktop/config/emptyStubForJSLinter.js',
     '^@pkg/assets/': '<rootDir>/pkg/rancher-desktop/config/emptyStubForJSLinter.js',
     '^@pkg/(.*)$':   '<rootDir>/pkg/rancher-desktop/$1',
+    '^@/(.*)$':      '<rootDir>/$1',
   },
-  preset:     'ts-jest/presets/js-with-babel',
   setupFiles: [
-    '<rootDir>/pkg/rancher-desktop/utils/testUtils/setupElectron.ts',
+    '<rootDir>/pkg/rancher-desktop/utils/testUtils/setupBrowserApis.ts',
+    '<rootDir>/pkg/rancher-desktop/utils/testUtils/setupVue.ts',
   ],
-  testEnvironment: 'jsdom',
+  testEnvironment:        'jsdom',
+  testEnvironmentOptions: {
+    customExportConditions: [
+      'node',
+      'node-addons',
+    ],
+  },
+  testPathIgnorePatterns: [
+    '<rootDir>/node_modules/',
+    // sudo-prompt's own tests wait for someone to enter a password.
+    '<rootDir>/pkg/rancher-desktop/sudo-prompt/test',
+  ],
 };

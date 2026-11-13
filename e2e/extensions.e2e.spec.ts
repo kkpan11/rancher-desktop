@@ -3,6 +3,7 @@
  * An E2E test is required to have access to the web page context.
  */
 
+import http from 'http';
 import os from 'os';
 import path from 'path';
 
@@ -22,7 +23,7 @@ import { Log } from '@pkg/utils/logging';
 import type { BrowserWindow, WebContentsView } from 'electron';
 
 /** The top level source directory, assuming we're always running from the tree */
-const srcDir = path.dirname(path.dirname(__filename));
+const srcDir = path.dirname(import.meta.dirname);
 const rdctl = getFullPathForTool('rdctl');
 
 // On Windows there's an eval routine that treats backslashes as escape-sequence leaders,
@@ -65,7 +66,7 @@ test.describe.serial('Extensions', () => {
       containerEngine: { name: ContainerEngine.MOBY },
       kubernetes:      { enabled: false },
     });
-    console = new Log(path.basename(__filename, '.ts'), reportAsset(testInfo, 'log'));
+    console = new Log(path.basename(import.meta.filename, '.ts'), reportAsset(testInfo, 'log'));
   });
 
   test.afterAll(({ colorScheme }, testInfo) => teardown(app, testInfo));
@@ -124,8 +125,13 @@ test.describe.serial('Extensions', () => {
   test('build and install testing extension', async() => {
     const dataDir = path.join(srcDir, 'bats', 'tests', 'extensions', 'testdata');
 
-    await ctrctl('build', '--tag', 'rd/extension/everything', '--build-arg', 'variant=everything', dataDir);
-    await spawnFile(rdctl, ['api', '-XPOST', '/v1/extensions/install?id=rd/extension/everything']);
+    try {
+      await ctrctl('build', '--tag', 'rd/extension/everything', '--build-arg', 'variant=everything', dataDir);
+      await spawnFile(rdctl, ['api', '-XPOST', '/v1/extensions/install?id=rd/extension/everything']);
+    } catch (ex) {
+      console.error(ex);
+      throw ex;
+    }
   });
 
   test('use extension protocol handler', async() => {
@@ -161,7 +167,7 @@ test.describe.serial('Extensions', () => {
               }
             }
           }
-        }) as JSHandle<WebContentsView|undefined>;
+        }) as JSHandle<WebContentsView | undefined>;
 
         // Check that the result evaluated to the view, and not undefined.
         if (await (result).evaluate(v => typeof v) === 'undefined') {
@@ -172,20 +178,34 @@ test.describe.serial('Extensions', () => {
       });
 
       await view.evaluate((v, { window }) => {
-        v.webContents.addListener('console-message', (event, level, message, line, source) => {
-          const levelName = (['verbose', 'info', 'warning', 'error'])[level];
-          const outputMessage = `[${ levelName }] ${ message } @${ source }:${ line }`;
+        v.webContents.addListener('console-message', (event) => {
+          const {
+            message, level, lineNumber, sourceId,
+          } = event;
+          const outputMessage = `[${ level }] ${ message } @${ sourceId }:${ lineNumber }`;
 
-          window.webContents.executeJavaScript(`console.log(${ JSON.stringify(outputMessage) })`);
+          window.webContents.executeJavaScript(`console.log(${ JSON.stringify(outputMessage) })`).catch(console.error);
         });
       }, { window });
     });
 
     /** evaluate a short snippet in the extension context. */
-    function evalInView(script: string): Promise<any> {
-      return view.evaluate((v, { script }) => {
-        return v.webContents.executeJavaScript(script);
+    async function evalInView(script: string): Promise<any> {
+      // view.evaluate doesn't pass rejections correctly; instead, we convert it
+      // to a resolved object, and convert it back to a rejection on the other end.
+      const { rejected, result } = await view.evaluate(async(v, { script }) => {
+        try {
+          return { rejected: false, result: await v.webContents.executeJavaScript(script) };
+        } catch (ex) {
+          return { rejected: true, result: ex };
+        }
       }, { script });
+
+      if (rejected) {
+        throw result;
+      }
+
+      return result;
     }
 
     test('exposes API endpoint', async() => {
@@ -260,6 +280,37 @@ test.describe.serial('Extensions', () => {
           exitCodes: [0],
         }));
       });
+
+      test('bypass CORS', async() => {
+        const server = http.createServer((req, res) => {
+          res.writeHead(200, {
+            // We set CORS headers to _reject_ the request, to
+            // check that the extension bypasses CORS.
+            'Access-Control-Allow-Origin': 'http://something.invalid/',
+            'Content-Type':                'text/plain',
+          });
+          res.end('Hello');
+        });
+        try {
+          await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+          const address = server.address();
+          if (typeof address === 'string' || !address) {
+            throw new Error(`Unexpected address type: ${ JSON.stringify(address) }`);
+          }
+          const url = `http://${ address.address }:${ address.port }/`;
+
+          const script = `
+            (async () => {
+              const result = await fetch('${ url }');
+              return Object.fromEntries(result.headers.entries());
+            })()
+          `;
+          const result = await evalInView(script);
+          expect(result).toHaveProperty('content-type');
+        } finally {
+          await new Promise<Error | void>(resolve => server.close(resolve));
+        }
+      });
     });
 
     test.describe('ddClient.docker', () => {
@@ -284,7 +335,7 @@ test.describe.serial('Extensions', () => {
       test('ddClient.docker.listImages', async() => {
         const options = {
           digests:   true,
-          namesapce: isContainerd ? NAMESPACE : undefined,
+          namespace: isContainerd ? NAMESPACE : undefined,
         };
         const script = `ddClient.docker.listImages(${ JSON.stringify(options) })`;
         const result = await evalInView(script);
@@ -336,22 +387,50 @@ test.describe.serial('Extensions', () => {
 
     test.describe('ddClient.extension.vm.cli.exec', () => {
       test('capturing output', async() => {
-        const script = `
+        // `.exec()` returns an object that has methods, which cannot be passed
+        // via `webContents.executeJavaScript`; serialize it as JSON and
+        // deserialize instead.
+        const result = evalInView(`
           ddClient.extension.vm.cli.exec("/bin/echo", ["xyzzy"])
-          .then(v => JSON.stringify(v))
-        `;
-        const result = JSON.parse(await evalInView(script));
+          .then(v => JSON.parse(JSON.stringify(v)))
+        `);
 
-        expect(result).toEqual(expect.objectContaining({
+        await expect(result).resolves.toMatchObject({
           stdout: 'xyzzy\n',
           code:   0,
-        }));
+        });
+      });
+    });
+    test.describe('ddClient.extension.host.cli.exec', () => {
+      test('reject when command is not found', async() => {
+        // Errors cannot be round-tripped correctly.
+        const result = evalInView(`
+          ddClient.extension.host.cli.exec('command-not-found', [])
+          .catch(v => Promise.reject(v instanceof Error ? v.toString() : JSON.stringify(v)))
+        `);
+
+        await expect(result).rejects.toMatch(/ENOENT|The system cannot find the file specified/);
+      });
+      test('reject when command fails', async() => {
+        const command = process.platform === 'win32' ? 'dummy.exe' : 'dummy.sh';
+        // The returned exception has methods, which cannot be cloned across
+        // evalInView; we serialize it as JSON and deserialize again to remove them.
+        const result = evalInView(`
+          ddClient.extension.host.cli.exec("${ command }", ["false"])
+          .then(v => Promise.resolve(JSON.parse(JSON.stringify(v))))
+          .catch(v => Promise.reject(JSON.parse(JSON.stringify(v))))
+        `);
+
+        await expect(result).rejects.toMatchObject({
+          code: 1,
+          cmd:  expect.stringMatching(/dummy.*false/),
+        });
       });
     });
 
     test.describe('ddClient.extension.vm.service', () => {
       test('can fetch from the backend', async() => {
-        const url = '/etc/os-release';
+        const url = '/get/etc/os-release';
 
         await retry(async() => {
           const result = evalInView(`ddClient.extension.vm.service.get("${ url }")`);
@@ -360,12 +439,61 @@ test.describe.serial('Extensions', () => {
         });
       });
       test('can fetch from external sources', async() => {
-        const url = 'http://127.0.0.1:6120/LICENSES'; // dashboard
+        const contents = 'Hello from E2E tests';
+        const server = http.createServer((req, res) => {
+          // This server does not include CORS headers; it would fail without
+          // CORS bypass.
+          res.writeHead(200, { 'Content-Type': 'text/plain' });
+          res.end(contents);
+        });
+        await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+        try {
+          const port = (server.address() as any).port;
+          const url = `http://127.0.0.1:${ port }/`;
 
-        await retry(async() => {
-          const result = evalInView(`ddClient.extension.vm.service.get("${ url }")`);
+          await retry(async() => {
+            const result = evalInView(`ddClient.extension.vm.service.get("${ url }")`);
 
-          await expect(result).resolves.toContain('Copyright');
+            await expect(result).resolves.toContain(contents);
+          });
+        } finally {
+          await new Promise<Error | void>(resolve => server.close(resolve));
+        }
+      });
+      test.describe('can post values', () => {
+        test('with string body', async() => {
+          await retry(async() => {
+            const result = evalInView(`ddClient.extension.vm.service.post("/post", "hello")`);
+
+            await expect(result).resolves.toMatchObject({
+              headers: { 'Content-Type': expect.arrayContaining([expect.stringMatching(/^text\/plain\b/)]) },
+              body:    'hello',
+            });
+          });
+        });
+        test('with JSON body', async() => {
+          await retry(async() => {
+            const result = evalInView(`ddClient.extension.vm.service.post("/post", {foo: 'bar'})`);
+
+            await expect(result).resolves.toMatchObject({
+              headers: { 'Content-Type': expect.arrayContaining([expect.stringMatching(/^application\/json\b/)]) },
+              body:    JSON.stringify({ foo: 'bar' }),
+            });
+          });
+        });
+        test.describe('throws with error status', () => {
+          for (const statusCode of [400, 401, 403, 404, 451, 500, 503, 504]) {
+            for (const method of ['get', 'post']) {
+              test(`${ method } ${ statusCode }`, async() => {
+                const result = evalInView(`ddClient.extension.vm.service.${ method }("/status/${ statusCode }", {})`);
+
+                await expect(result).rejects.toMatchObject({
+                  statusCode,
+                  message: expect.stringContaining(`${ statusCode }`),
+                });
+              });
+            }
+          }
         });
       });
     });

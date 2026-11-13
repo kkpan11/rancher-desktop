@@ -1,17 +1,26 @@
-import { spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import semver from 'semver';
-
 import {
-  download, downloadZip, downloadTarGZ, getResource, DownloadOptions, ArchiveDownloadOptions,
-} from '../lib/download';
-
+  AssetPlatform,
+  DependencyAsset,
+  DownloadContext,
+  downloadAndHash,
+  fetchUpstreamChecksums,
+  GitHubDependency,
+  GlobalDependency,
+  GoArch,
+  hostArch,
+  selectAsset,
+  selectAssets,
+} from '@/scripts/lib/dependencies';
 import {
-  DownloadContext, Dependency, GitHubDependency, getPublishedReleaseTagNames, getPublishedVersions,
-} from 'scripts/lib/dependencies';
+  ArchiveDownloadOptions,
+  download,
+  downloadTarGZ,
+  downloadZip,
+} from '@/scripts/lib/download';
 
 function exeName(context: DownloadContext, name: string) {
   const onWindows = context.platform === 'win32';
@@ -19,104 +28,55 @@ function exeName(context: DownloadContext, name: string) {
   return `${ name }${ onWindows ? '.exe' : '' }`;
 }
 
-/**
- * Download the given checksum file (which contains multiple checksums) and find
- * the correct checksum for the given executable name.
- * @param checksumURL The URL to download the checksum from.
- * @param executableName The name of the executable expected.
- * @returns The checksum.
- */
-async function findChecksum(checksumURL: string, executableName: string): Promise<string> {
-  const allChecksums = await getResource(checksumURL);
-  const desiredChecksums = allChecksums.split(/\r?\n/).filter(line => line.endsWith(executableName));
-
-  if (desiredChecksums.length < 1) {
-    throw new Error(`Couldn't find a matching SHA for [${ executableName }] in [${ allChecksums }]`);
-  }
-  if (desiredChecksums.length === 1) {
-    return desiredChecksums[0].split(/\s+/, 1)[0];
-  }
-  throw new Error(`Matched ${ desiredChecksums.length } hits, not exactly 1, for ${ executableName } in [${ allChecksums }]`);
+/** The file name suffix for executable files. */
+function exeSuffix(platform: AssetPlatform): string {
+  return platform === 'windows' ? '.exe' : '';
 }
 
-export class KuberlrAndKubectl implements Dependency {
-  name = 'kuberlr';
-  githubOwner = 'flavio';
-  githubRepo = 'kuberlr';
+export function cartesian<A extends string, B extends string>(
+  as: readonly A[],
+  bs: readonly B[],
+): [A, B][] {
+  return as.flatMap(a => bs.map<[A, B]>(b => [a, b]));
+}
+
+/** The host platforms most dependencies publish for. */
+const HOST_PLATFORMS: readonly AssetPlatform[] = ['linux', 'darwin', 'windows'];
+const ARCHES: readonly GoArch[] = ['amd64', 'arm64'];
+
+export class KuberlrAndKubectl extends GlobalDependency(GitHubDependency) {
+  readonly name = 'kuberlr';
+  readonly githubOwner = 'flavio';
+  readonly githubRepo = 'kuberlr';
 
   async download(context: DownloadContext): Promise<void> {
-    // We use the x86_64 version even on aarch64 because kubectl binaries before v1.21.0 are unavailable
-    const kuberlrPath = await this.downloadKuberlr(context, context.versions.kuberlr, 'amd64');
-    const arch = context.isM1 ? 'arm64' : 'amd64';
-
-    await this.bindKubectlToKuberlr(kuberlrPath, path.join(context.binDir, exeName(context, 'kubectl')));
-
-    if (context.platform === os.platform()) {
-      // Download Kubectl into kuberlr's directory of versioned kubectl's
-      const kubeVersion = (await getResource('https://dl.k8s.io/release/stable.txt')).trim();
-      const kubectlURL = `https://dl.k8s.io/${ kubeVersion }/bin/${ context.goPlatform }/${ arch }/${ exeName(context, 'kubectl') }`;
-      const kubectlSHA = await getResource(`${ kubectlURL }.sha256`);
-      const homeDir = await this.findHome(context.platform === 'win32');
-      const kuberlrDir = path.join(homeDir, '.kuberlr', `${ context.goPlatform }-${ arch }`);
-      const managedKubectlPath = path.join(kuberlrDir, exeName(context, `kubectl${ kubeVersion.replace(/^v/, '') }`));
-
-      await download(kubectlURL, managedKubectlPath, { expectedChecksum: kubectlSHA });
-    }
-  }
-
-  async downloadKuberlr(context: DownloadContext, version: string, arch: 'amd64' | 'arm64'): Promise<string> {
-    const baseURL = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ version }`;
-    const platformDir = `kuberlr_${ version }_${ context.goPlatform }_${ arch }`;
-    const archiveName = platformDir + (context.goPlatform.startsWith('win') ? '.zip' : '.tar.gz');
-    const expectedChecksum = await findChecksum(`${ baseURL }/checksums.txt`, archiveName);
+    const version = context.dependencies[this.name].version;
+    const asset = selectAsset(context, this.name);
+    const platformDir = `kuberlr_${ version }_${ context.goPlatform }_${ hostArch(context) }`;
     const binName = exeName(context, 'kuberlr');
     const options: ArchiveDownloadOptions = {
-      expectedChecksum,
-      entryName: `${ platformDir }/${ binName }`,
+      expectedChecksum: asset.checksum,
+      entryName:        `${ platformDir }/${ binName }`,
     };
     const downloadFunc = context.platform.startsWith('win') ? downloadZip : downloadTarGZ;
+    const kuberlrPath = await downloadFunc(asset.url, path.join(context.binDir, binName), options);
 
-    return await downloadFunc(`${ baseURL }/${ archiveName }`, path.join(context.binDir, binName), options);
+    await this.bindKubectlToKuberlr(kuberlrPath, path.join(context.binDir, exeName(context, 'kubectl')));
   }
 
-  /**
-   * Find the home directory, in a way that is compatible with kuberlr.
-   *
-   * @param onWindows Whether we're running on Windows.
-   */
-  async findHome(onWindows: boolean): Promise<string> {
-    const tryAccess = async(path: string) => {
-      try {
-        await fs.promises.access(path);
+  async getAssets(version: string): Promise<DependencyAsset[]> {
+    const baseURL = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ version }`;
+    const upstream = await fetchUpstreamChecksums(`${ baseURL }/checksums.txt`, 'sha256');
 
-        return true;
-      } catch {
-        return false;
-      }
-    };
+    return Promise.all(cartesian(HOST_PLATFORMS, ARCHES).map(async([platform, arch]) => {
+      const archiveName = `kuberlr_${ version }_${ platform }_${ arch }${ platform === 'windows' ? '.zip' : '.tar.gz' }`;
+      const url = `${ baseURL }/${ archiveName }`;
+      const checksum = await downloadAndHash(url, {
+        verify: { algorithm: 'sha256', expected: upstream[archiveName] },
+      });
 
-    const osHomeDir = os.homedir();
-
-    if (osHomeDir && await tryAccess(osHomeDir)) {
-      return osHomeDir;
-    }
-    if (process.env.HOME && await tryAccess(process.env.HOME)) {
-      return process.env.HOME;
-    }
-    if (onWindows) {
-      if (process.env.USERPROFILE && await tryAccess(process.env.USERPROFILE)) {
-        return process.env.USERPROFILE;
-      }
-      if (process.env.HOMEDRIVE && process.env.HOMEPATH) {
-        const homePath = path.join(process.env.HOMEDRIVE, process.env.HOMEPATH);
-
-        if (await tryAccess(homePath)) {
-          return homePath;
-        }
-      }
-    }
-
-    throw new Error('Failed to find home directory');
+      return { platform, arch, url, checksum };
+    }));
   }
 
   /**
@@ -148,140 +108,172 @@ export class KuberlrAndKubectl implements Dependency {
     }
     await fs.promises.symlink('kuberlr', binKubectlPath);
   }
-
-  async getAvailableVersions(includePrerelease = false): Promise<string[]> {
-    return await getPublishedVersions(this.githubOwner, this.githubRepo, includePrerelease);
-  }
-
-  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
-    return semver.rcompare(version1, version2);
-  }
 }
 
-export class Helm implements Dependency {
-  name = 'helm';
-  githubOwner = 'helm';
-  githubRepo = 'helm';
+export class Helm extends GlobalDependency(GitHubDependency) {
+  readonly name = 'helm';
+  readonly githubOwner = 'helm';
+  readonly githubRepo = 'helm';
 
   async download(context: DownloadContext): Promise<void> {
     // Download Helm. It is a tar.gz file that needs to be expanded and file moved.
-    const arch = context.isM1 ? 'arm64' : 'amd64';
-    const helmURL = `https://get.helm.sh/helm-v${ context.versions.helm }-${ context.goPlatform }-${ arch }.tar.gz`;
+    const arch = hostArch(context);
+    const asset = selectAsset(context, this.name);
 
-    await downloadTarGZ(helmURL, path.join(context.binDir, exeName(context, 'helm')), {
-      expectedChecksum: (await getResource(`${ helmURL }.sha256sum`)).split(/\s+/, 1)[0],
+    await downloadTarGZ(asset.url, path.join(context.binDir, exeName(context, 'helm')), {
+      expectedChecksum: asset.checksum,
       entryName:        `${ context.goPlatform }-${ arch }/${ exeName(context, 'helm') }`,
     });
   }
 
-  async getAvailableVersions(includePrerelease = false): Promise<string[]> {
-    return await getPublishedVersions(this.githubOwner, this.githubRepo, includePrerelease);
-  }
+  async getAssets(version: string): Promise<DependencyAsset[]> {
+    return Promise.all(cartesian(HOST_PLATFORMS, ARCHES).map(async([platform, arch]) => {
+      const archiveName = `helm-v${ version }-${ platform }-${ arch }.tar.gz`;
+      const url = `https://get.helm.sh/${ archiveName }`;
+      // Helm publishes a sidecar `.sha256sum` per artifact, one line of `<hex>  <filename>`.
+      const sidecar = await fetchUpstreamChecksums(`${ url }.sha256sum`, 'sha256');
+      const checksum = await downloadAndHash(url, {
+        verify: { algorithm: 'sha256', expected: sidecar[archiveName] },
+      });
 
-  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
-    return semver.rcompare(version1, version2);
+      return { platform, arch, url, checksum };
+    }));
   }
 }
 
-export class DockerCLI implements Dependency, GitHubDependency {
-  name = 'dockerCLI';
-  githubOwner = 'rancher-sandbox';
-  githubRepo = 'rancher-desktop-docker-cli';
+export class DockerCLI extends GlobalDependency(GitHubDependency) {
+  readonly name = 'dockerCLI';
+  readonly githubOwner = 'rancher-sandbox';
+  readonly githubRepo = 'rancher-desktop-docker-cli';
 
   async download(context: DownloadContext): Promise<void> {
-    const dockerPlatform = context.dependencyPlatform === 'wsl' ? 'wsl' : context.goPlatform;
-    const arch = context.isM1 ? 'arm64' : 'amd64';
-    const baseURL = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ context.versions.dockerCLI }`;
-    const executableName = exeName(context, `docker-${ dockerPlatform }-${ arch }`);
-    const dockerURL = `${ baseURL }/${ executableName }`;
+    const platform: AssetPlatform = context.dependencyPlatform === 'wsl' ? 'wsl' : context.goPlatform;
+    const asset = selectAsset(context, this.name, { platform, arch: hostArch(context) });
     const destPath = path.join(context.binDir, exeName(context, 'docker'));
-    const expectedChecksum = await findChecksum(`${ baseURL }/sha256sum.txt`, executableName);
     const codesign = process.platform === 'darwin';
 
-    await download(dockerURL, destPath, { expectedChecksum, codesign });
+    await download(asset.url, destPath, { expectedChecksum: asset.checksum, codesign });
   }
 
-  async getAvailableVersions(includePrerelease = false): Promise<string[]> {
-    return await getPublishedVersions(this.githubOwner, this.githubRepo, includePrerelease);
-  }
+  async getAssets(version: string): Promise<DependencyAsset[]> {
+    const baseURL = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ version }`;
+    const upstream = await fetchUpstreamChecksums(`${ baseURL }/sha256sum.txt`, 'sha256');
+    const platforms: readonly AssetPlatform[] = ['linux', 'wsl', 'darwin', 'windows'];
 
-  versionToTagName(version: string): string {
-    return `v${ version }`;
-  }
+    return Promise.all(cartesian(platforms, ARCHES).map(async([platform, arch]) => {
+      const executableName = `docker-${ platform }-${ arch }${ exeSuffix(platform) }`;
+      const url = `${ baseURL }/${ executableName }`;
+      const checksum = await downloadAndHash(url, {
+        verify: { algorithm: 'sha256', expected: upstream[executableName] },
+      });
 
-  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
-    return semver.rcompare(version1, version2);
+      return { platform, arch, url, checksum };
+    }));
   }
 }
 
-export class DockerBuildx implements Dependency, GitHubDependency {
-  name = 'dockerBuildx';
-  githubOwner = 'docker';
-  githubRepo = 'buildx';
+export class DockerBuildx extends GlobalDependency(GitHubDependency) {
+  readonly name = 'dockerBuildx';
+  readonly githubOwner = 'docker';
+  readonly githubRepo = 'buildx';
 
   async download(context: DownloadContext): Promise<void> {
     // Download the Docker-Buildx Plug-In
-    const arch = context.isM1 ? 'arm64' : 'amd64';
-    const baseURL = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ context.versions.dockerBuildx }`;
-    const executableName = exeName(context, `buildx-v${ context.versions.dockerBuildx }.${ context.goPlatform }-${ arch }`);
-    const dockerBuildxURL = `${ baseURL }/${ executableName }`;
-    const dockerBuildxPath = path.join(context.binDir, exeName(context, 'docker-buildx'));
-    const options: DownloadOptions = {};
+    const asset = selectAsset(context, this.name);
+    const dockerBuildxPath = path.join(context.dockerPluginsDir, exeName(context, 'docker-buildx'));
 
-    // No checksums available on the docker/buildx site for darwin builds
-    // https://github.com/docker/buildx/issues/945
-    if (context.goPlatform !== 'darwin') {
-      options.expectedChecksum = await findChecksum(`${ baseURL }/checksums.txt`, executableName);
-    }
-    await download(dockerBuildxURL, dockerBuildxPath, options);
+    await download(asset.url, dockerBuildxPath, { expectedChecksum: asset.checksum });
   }
 
-  async getAvailableVersions(includePrerelease = false): Promise<string[]> {
-    return await getPublishedVersions(this.githubOwner, this.githubRepo, includePrerelease);
-  }
+  async getAssets(version: string): Promise<DependencyAsset[]> {
+    const baseURL = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ version }`;
+    // Docker code-signs the darwin and windows binaries after publishing the
+    // release, so checksums.txt omits them.
+    // https://github.com/docker/buildx/pull/3978
+    const [checksums, signedChecksums] = await Promise.all([
+      fetchUpstreamChecksums(`${ baseURL }/checksums.txt`, 'sha256'),
+      fetchUpstreamChecksums(`${ baseURL }/checksums-signed.txt`, 'sha256'),
+    ]);
 
-  versionToTagName(version: string): string {
-    return `v${ version }`;
-  }
+    return Promise.all(cartesian(HOST_PLATFORMS, ARCHES).map(async([platform, arch]) => {
+      const executableName = `buildx-v${ version }.${ platform }-${ arch }${ exeSuffix(platform) }`;
+      const url = `${ baseURL }/${ executableName }`;
+      const upstream = ['darwin', 'windows'].includes(platform) ? signedChecksums : checksums;
+      const checksum = await downloadAndHash(url, {
+        verify: { algorithm: 'sha256', expected: upstream[executableName] },
+      });
 
-  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
-    return semver.rcompare(version1, version2);
+      return { platform, arch, url, checksum };
+    }));
   }
 }
 
-export class DockerCompose implements Dependency, GitHubDependency {
-  name = 'dockerCompose';
-  githubOwner = 'docker';
-  githubRepo = 'compose';
+export class DockerCompose extends GlobalDependency(GitHubDependency) {
+  readonly name = 'dockerCompose';
+  readonly githubOwner = 'docker';
+  readonly githubRepo = 'compose';
+
+  /** Upstream names compose artifacts with uname-style architectures. */
+  private static readonly upstreamArch: Record<GoArch, string> = { amd64: 'x86_64', arm64: 'aarch64' };
 
   async download(context: DownloadContext): Promise<void> {
-    const baseUrl = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ context.versions.dockerCompose }`;
-    const arch = context.isM1 ? 'aarch64' : 'x86_64';
-    const executableName = exeName(context, `docker-compose-${ context.goPlatform }-${ arch }`);
-    const url = `${ baseUrl }/${ executableName }`;
-    const destPath = path.join(context.binDir, exeName(context, 'docker-compose'));
-    const expectedChecksum = await findChecksum(`${ url }.sha256`, executableName);
+    const asset = selectAsset(context, this.name);
+    const destPath = path.join(context.dockerPluginsDir, exeName(context, 'docker-compose'));
 
-    await download(url, destPath, { expectedChecksum });
+    await download(asset.url, destPath, { expectedChecksum: asset.checksum });
   }
 
-  async getAvailableVersions(includePrerelease = false): Promise<string[]> {
-    return await getPublishedVersions(this.githubOwner, this.githubRepo, includePrerelease);
-  }
+  async getAssets(version: string): Promise<DependencyAsset[]> {
+    const baseUrl = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ version }`;
 
-  versionToTagName(version: string): string {
-    return `v${ version }`;
-  }
+    return Promise.all(cartesian(HOST_PLATFORMS, ARCHES).map(async([platform, arch]) => {
+      const executableName = `docker-compose-${ platform }-${ DockerCompose.upstreamArch[arch] }${ exeSuffix(platform) }`;
+      const url = `${ baseUrl }/${ executableName }`;
+      const sidecar = await fetchUpstreamChecksums(`${ url }.sha256`, 'sha256');
+      const checksum = await downloadAndHash(url, {
+        verify: { algorithm: 'sha256', expected: sidecar[executableName] },
+      });
 
-  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
-    return semver.rcompare(version1, version2);
+      return { platform, arch, url, checksum };
+    }));
   }
 }
 
-export class Trivy implements Dependency, GitHubDependency {
-  name = 'trivy';
-  githubOwner = 'aquasecurity';
-  githubRepo = 'trivy';
+export class GoLangCILint extends GlobalDependency(GitHubDependency) {
+  readonly name = 'golangci-lint';
+  readonly githubOwner = 'golangci';
+  readonly githubRepo = 'golangci-lint';
+
+  download(context: DownloadContext): Promise<void> {
+    // We don't actually download anything; when we invoke the linter, we just
+    // use `go run` with the appropriate package.
+    return Promise.resolve();
+  }
+
+  getAssets(version: string): Promise<DependencyAsset[]> {
+    return Promise.resolve([]);
+  }
+}
+
+export class CheckSpelling extends GlobalDependency(GitHubDependency) {
+  readonly name = 'check-spelling';
+  readonly githubOwner = 'check-spelling';
+  readonly githubRepo = 'check-spelling';
+
+  download(context: DownloadContext): Promise<void> {
+    // We don't download anything there; `scripts/spelling.sh` does the cloning.
+    return Promise.resolve();
+  }
+
+  getAssets(version: string): Promise<DependencyAsset[]> {
+    return Promise.resolve([]);
+  }
+}
+
+export class Trivy extends GlobalDependency(GitHubDependency) {
+  readonly name = 'trivy';
+  readonly githubOwner = 'aquasecurity';
+  readonly githubRepo = 'trivy';
 
   async download(context: DownloadContext): Promise<void> {
     // Download Trivy
@@ -291,391 +283,312 @@ export class Trivy implements Dependency, GitHubDependency {
     // https://github.com/aquasecurity/trivy/releases/download/v0.18.3/trivy_0.18.3_checksums.txt
     // https://github.com/aquasecurity/trivy/releases/download/v0.18.3/trivy_0.18.3_macOS-64bit.tar.gz
 
-    const versionWithV = `v${ context.versions.trivy }`;
-    const trivyURLBase = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases`;
-    const trivyOS = context.isM1 ? 'Linux-ARM64' : 'Linux-64bit';
-    const trivyBasename = `trivy_${ context.versions.trivy }_${ trivyOS }`;
-    const trivyURL = `${ trivyURLBase }/download/${ versionWithV }/${ trivyBasename }.tar.gz`;
-    const checksumURL = `${ trivyURLBase }/download/${ versionWithV }/trivy_${ context.versions.trivy }_checksums.txt`;
-    const trivySHA = await findChecksum(checksumURL, `${ trivyBasename }.tar.gz`);
-    const trivyPath = path.join(context.resourcesDir, 'linux', 'internal', 'trivy');
+    const asset = selectAsset(context, this.name, { platform: 'linux', arch: hostArch(context) });
+    const trivyDir = context.dependencyPlatform === 'wsl' ? 'staging' : 'internal';
+    const trivyPath = path.join(context.resourcesDir, 'linux', trivyDir, 'trivy');
 
     // trivy.tgz files are top-level tarballs - not wrapped in a labelled directory :(
-    await downloadTarGZ(trivyURL, trivyPath, { expectedChecksum: trivySHA });
+    await downloadTarGZ(asset.url, trivyPath, { expectedChecksum: asset.checksum });
   }
 
-  async getAvailableVersions(includePrerelease = false): Promise<string[]> {
-    return await getPublishedVersions(this.githubOwner, this.githubRepo, includePrerelease);
-  }
+  async getAssets(version: string): Promise<DependencyAsset[]> {
+    const releasesBase = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ version }`;
+    const upstream = await fetchUpstreamChecksums(`${ releasesBase }/trivy_${ version }_checksums.txt`, 'sha256');
+    // Trivy runs only in the linux guest; upstream labels its arches Linux-64bit / Linux-ARM64.
+    const archLabels: Record<GoArch, string> = { amd64: 'Linux-64bit', arm64: 'Linux-ARM64' };
 
-  versionToTagName(version: string): string {
-    return `v${ version }`;
-  }
+    return Promise.all(ARCHES.map(async(arch) => {
+      const archiveName = `trivy_${ version }_${ archLabels[arch] }.tar.gz`;
+      const url = `${ releasesBase }/${ archiveName }`;
+      const checksum = await downloadAndHash(url, {
+        verify: { algorithm: 'sha256', expected: upstream[archiveName] },
+      });
 
-  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
-    return semver.rcompare(version1, version2);
+      return { platform: 'linux' as const, arch, url, checksum };
+    }));
   }
 }
 
-export class Steve implements Dependency, GitHubDependency {
-  name = 'steve';
-  githubOwner = 'rancher-sandbox';
-  githubRepo = 'rancher-desktop-steve';
+export class Steve extends GlobalDependency(GitHubDependency) {
+  readonly name = 'steve';
+  readonly githubOwner = 'rancher-sandbox';
+  readonly githubRepo = 'rancher-desktop-steve';
+  readonly releaseFilter = 'published-pre';
 
   async download(context: DownloadContext): Promise<void> {
-    const steveURLBase = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ context.versions.steve }`;
-    const arch = context.isM1 ? 'arm64' : 'amd64';
-    const steveExecutable = `steve-${ context.goPlatform }-${ arch }`;
-    const steveURL = `${ steveURLBase }/${ steveExecutable }.tar.gz`;
+    const asset = selectAsset(context, this.name);
     const stevePath = path.join(context.internalDir, exeName(context, 'steve'));
-    const steveSHA = await findChecksum(`${ steveURL }.sha512sum`, `${ steveExecutable }.tar.gz`);
 
-    await downloadTarGZ(
-      steveURL,
-      stevePath,
-      {
-        expectedChecksum:  steveSHA,
-        checksumAlgorithm: 'sha512',
+    await downloadTarGZ(asset.url, stevePath, { expectedChecksum: asset.checksum });
+  }
+
+  async getAssets(version: string): Promise<DependencyAsset[]> {
+    const steveURLBase = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ version }`;
+    const upstream = await fetchUpstreamChecksums(`${ steveURLBase }/steve.sha512sum`, 'sha512');
+
+    return Promise.all(cartesian(HOST_PLATFORMS, ARCHES).map(async([platform, arch]) => {
+      const archiveName = `steve-${ platform }-${ arch }.tar.gz`;
+      const url = `${ steveURLBase }/${ archiveName }`;
+      const checksum = await downloadAndHash(url, {
+        verify: { algorithm: 'sha512', expected: upstream[archiveName] },
       });
-  }
 
-  // Note that we set includePrerelease to true by default, which is different
-  // from the way other Dependency's work. There is a reason for this:
-  // as of the time of writing, all releases of steve are prerelease versions.
-  // If this changes, the default value of includePrelease should be changed to false.
-  async getAvailableVersions(includePrerelease = true): Promise<string[]> {
-    return await getPublishedVersions(this.githubOwner, this.githubRepo, includePrerelease);
-  }
-
-  versionToTagName(version: string): string {
-    return `v${ version }`;
-  }
-
-  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
-    return semver.rcompare(version1, version2);
+      return { platform, arch, url, checksum };
+    }));
   }
 }
 
-export class GuestAgent implements Dependency, GitHubDependency {
-  name = 'guestAgent';
-  githubOwner = 'rancher-sandbox';
-  githubRepo = 'rancher-desktop-agent';
+export class DockerProvidedCredHelpers extends GlobalDependency(GitHubDependency) {
+  readonly name = 'dockerProvidedCredentialHelpers';
+  readonly githubOwner = 'docker';
+  readonly githubRepo = 'docker-credential-helpers';
+
+  /** The credential helpers published for each platform. */
+  private static readonly helperNames: Record<AssetPlatform, string[]> = {
+    linux:   ['docker-credential-secretservice', 'docker-credential-pass'],
+    darwin:  ['docker-credential-osxkeychain'],
+    windows: ['docker-credential-wincred'],
+    wsl:     [],
+  };
 
   async download(context: DownloadContext): Promise<void> {
-    const baseUrl = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ context.versions.guestAgent }`;
-    const executableName = 'rancher-desktop-guestagent';
-    const url = `${ baseUrl }/${ executableName }-v${ context.versions.guestAgent }.tar.gz`;
-    const destPath = path.join(context.internalDir, executableName);
+    const version = context.dependencies[this.name].version;
+    const arch = hostArch(context);
+    const assets = selectAssets(context, this.name);
+    const expected = DockerProvidedCredHelpers.helperNames[context.goPlatform];
 
-    await downloadTarGZ(url, destPath);
-  }
-
-  async getAvailableVersions(includePrerelease = false): Promise<string[]> {
-    return await getPublishedVersions(this.githubOwner, this.githubRepo, includePrerelease);
-  }
-
-  versionToTagName(version: string): string {
-    return `v${ version }`;
-  }
-
-  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
-    return semver.rcompare(version1, version2);
-  }
-}
-
-export class RancherDashboard implements Dependency, GitHubDependency {
-  name = 'rancherDashboard';
-  githubOwner = 'rancher-sandbox';
-  githubRepo = 'dashboard';
-  versionRegex = /^desktop-v([0-9]+\.[0-9]+\.[0-9]+)\.([0-9a-zA-Z]+(\.[0-9a-zA-Z]+)+)$/;
-
-  async download(context: DownloadContext): Promise<void> {
-    const baseURL = `https://github.com/rancher-sandbox/dashboard/releases/download/${ context.versions.rancherDashboard }`;
-    const executableName = 'rancher-dashboard-desktop-embed';
-    const url = `${ baseURL }/${ executableName }.tar.gz`;
-    const destPath = path.join(context.resourcesDir, 'rancher-dashboard.tgz');
-    const expectedChecksum = await findChecksum(`${ url }.sha512sum`, `${ executableName }.tar.gz`);
-    const rancherDashboardDir = path.join(context.resourcesDir, 'rancher-dashboard');
-
-    if (fs.existsSync(rancherDashboardDir)) {
-      console.log(`${ rancherDashboardDir } already exists, not re-downloading.`);
-
-      return;
+    // selectAssets() returns [] rather than throwing, so we would silently skip
+    // a helper the manifest omits.
+    if (assets.length !== expected.length) {
+      throw new Error(
+        `Expected ${ expected.length } ${ this.name } assets for ` +
+        `${ context.goPlatform }/${ arch }, found ${ assets.length }.`,
+      );
     }
+    // starting with the 0.7.0 the upstream releases have a broken ad-hoc signature
+    const codesign = context.platform === 'darwin';
 
-    await download(
-      url,
-      destPath,
-      {
-        expectedChecksum,
-        checksumAlgorithm: 'sha512',
-        access:            fs.constants.W_OK,
-      });
+    await Promise.all(assets.map((asset) => {
+      const fullBinName = path.basename(new URL(asset.url).pathname);
+      const baseName = fullBinName
+        .replace(`-v${ version }.${ context.goPlatform }-${ arch }`, '')
+        .replace(/\.exe$/, '');
+      const destPath = path.join(context.binDir, exeName(context, baseName));
 
-    await fs.promises.mkdir(rancherDashboardDir, { recursive: true });
-
-    const args = ['tar', '-xf', destPath];
-
-    if (os.platform().startsWith('win')) {
-      // On Windows, force use the bundled bsdtar.
-      // We may find GNU tar on the path, which looks at the Windows-style path
-      // and considers C:\Temp to be a reference to a remote host named `C`.
-      const systemRoot = process.env.SystemRoot;
-
-      if (!systemRoot) {
-        throw new Error('Could not find system root');
-      }
-      args[0] = path.join(systemRoot, 'system32', 'tar.exe');
-    }
-
-    spawnSync(
-      args[0],
-      args.slice(1),
-      {
-        cwd:   rancherDashboardDir,
-        stdio: 'inherit',
-      });
-
-    fs.rmSync(destPath, { maxRetries: 10 });
+      return download(asset.url, destPath, { expectedChecksum: asset.checksum, codesign });
+    }));
   }
 
-  async getAvailableVersions(): Promise<string[]> {
-    const versions = await getPublishedReleaseTagNames(this.githubOwner, this.githubRepo);
-
-    // Versions that contain .plugins. exist solely for testing during
-    // plugins development. For more info please see
-    // https://github.com/rancher-sandbox/rancher-desktop/issues/3757
-    return versions.filter(version => !version.includes('.plugins.'));
-  }
-
-  versionToTagName(version: string): string {
-    return version;
-  }
-
-  versionToSemver(version: string): string {
-    const match = this.versionRegex.exec(version);
-
-    if (match === null) {
-      throw new Error(`${ this.name }: ${ version } does not match version regex ${ this.versionRegex }`);
-    }
-    const [, mainVersion, prereleaseVersion] = match;
-
-    return `${ mainVersion }-${ prereleaseVersion }`;
-  }
-
-  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
-    const semver1 = this.versionToSemver(version1);
-    const semver2 = this.versionToSemver(version2);
-
-    return semver.rcompare(semver1, semver2);
-  }
-}
-
-export class DockerProvidedCredHelpers implements Dependency, GitHubDependency {
-  name = 'dockerProvidedCredentialHelpers';
-  githubOwner = 'docker';
-  githubRepo = 'docker-credential-helpers';
-
-  async download(context: DownloadContext): Promise<void> {
-    const arch = context.isM1 ? 'arm64' : 'amd64';
-    const version = context.versions.dockerProvidedCredentialHelpers;
-    const credHelperNames = {
-      linux:  ['docker-credential-secretservice', 'docker-credential-pass'],
-      darwin: ['docker-credential-osxkeychain'],
-      win32:  ['docker-credential-wincred'],
-    }[context.platform];
-    const promises = [];
+  async getAssets(version: string): Promise<DependencyAsset[]> {
     const baseURL = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ version }`;
+    const upstream = await fetchUpstreamChecksums(`${ baseURL }/checksums.txt`, 'sha256');
+    const matrix: { platform: AssetPlatform, arch: GoArch, baseName: string }[] = [];
 
-    for (const baseName of credHelperNames) {
-      const fullBaseName = `${ baseName }-v${ version }.${ context.goPlatform }-${ arch }`;
-      const fullBinName = context.platform.startsWith('win') ? `${ fullBaseName }.exe` : fullBaseName;
-      const sourceURL = `${ baseURL }/${ fullBinName }`;
-      const expectedChecksum = await findChecksum(`${ baseURL }/checksums.txt`, fullBinName);
-      const binName = context.platform.startsWith('win') ? `${ baseName }.exe` : baseName;
-      const destPath = path.join(context.binDir, binName);
-      // starting with the 0.7.0 the upstream releases have a broken ad-hoc signature
-      const codesign = context.platform === 'darwin';
-
-      promises.push(download(sourceURL, destPath, { expectedChecksum, codesign } ));
+    for (const platform of HOST_PLATFORMS) {
+      for (const [baseName, arch] of cartesian(DockerProvidedCredHelpers.helperNames[platform], ARCHES)) {
+        matrix.push({ platform, arch, baseName });
+      }
     }
 
-    await Promise.all(promises);
-  }
+    return Promise.all(matrix.map(async({ platform, arch, baseName }) => {
+      const fullBinName = `${ baseName }-v${ version }.${ platform }-${ arch }${ exeSuffix(platform) }`;
+      const url = `${ baseURL }/${ fullBinName }`;
+      const checksum = await downloadAndHash(url, {
+        verify: { algorithm: 'sha256', expected: upstream[fullBinName] },
+      });
 
-  async getAvailableVersions(includePrerelease = false): Promise<string[]> {
-    const tagNames = await getPublishedReleaseTagNames(this.githubOwner, this.githubRepo);
-    const allVersions = tagNames.map((tagName: string) => tagName.replace(/^v/, ''));
-
-    if (!includePrerelease) {
-      return allVersions.filter(version => semver.prerelease(version) === null);
-    }
-
-    return allVersions;
-  }
-
-  versionToTagName(version: string): string {
-    return `v${ version }`;
-  }
-
-  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
-    return semver.rcompare(version1, version2);
+      return { platform, arch, url, checksum };
+    }));
   }
 }
 
-export class ECRCredHelper implements Dependency, GitHubDependency {
-  name = 'ECRCredentialHelper';
-  githubOwner = 'awslabs';
-  githubRepo = 'amazon-ecr-credential-helper';
+export class ECRCredHelper extends GlobalDependency(GitHubDependency) {
+  readonly name = 'ECRCredentialHelper';
+  readonly githubOwner = 'awslabs';
+  readonly githubRepo = 'amazon-ecr-credential-helper';
 
   async download(context: DownloadContext): Promise<void> {
-    const arch = context.isM1 ? 'arm64' : 'amd64';
-    const ecrLoginPlatform = context.platform.startsWith('win') ? 'windows' : context.platform;
+    const asset = selectAsset(context, this.name);
+    const destPath = path.join(context.binDir, exeName(context, 'docker-credential-ecr-login'));
+
+    return await download(asset.url, destPath, { expectedChecksum: asset.checksum });
+  }
+
+  async getAssets(version: string): Promise<DependencyAsset[]> {
     const baseName = 'docker-credential-ecr-login';
     const baseUrl = 'https://amazon-ecr-credential-helper-releases.s3.us-east-2.amazonaws.com';
-    const binName = exeName(context, baseName);
-    const sourceUrl = `${ baseUrl }/${ context.versions.ECRCredentialHelper }/${ ecrLoginPlatform }-${ arch }/${ binName }`;
-    const destPath = path.join(context.binDir, binName);
 
-    return await download(sourceUrl, destPath);
-  }
+    return Promise.all(cartesian(HOST_PLATFORMS, ARCHES).map(async([platform, arch]) => {
+      const binName = `${ baseName }${ exeSuffix(platform) }`;
+      const url = `${ baseUrl }/${ version }/${ platform }-${ arch }/${ binName }`;
+      // Upstream publishes a per-binary `<bin>.sha256` sidecar in GNU format,
+      // indexed by the bare binary name without the platform-prefixed path.
+      const sidecar = await fetchUpstreamChecksums(`${ url }.sha256`, 'sha256');
+      const checksum = await downloadAndHash(url, {
+        verify: { algorithm: 'sha256', expected: sidecar[binName] },
+      });
 
-  async getAvailableVersions(includePrerelease = false): Promise<string[]> {
-    const tagNames = await getPublishedReleaseTagNames(this.githubOwner, this.githubRepo);
-    const allVersions = tagNames.map((tagName: string) => tagName.replace(/^v/, ''));
-
-    if (!includePrerelease) {
-      return allVersions.filter(version => semver.prerelease(version) === null);
-    }
-
-    return allVersions;
-  }
-
-  versionToTagName(version: string): string {
-    return `v${ version }`;
-  }
-
-  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
-    return semver.rcompare(version1, version2);
+      return { platform, arch, url, checksum };
+    }));
   }
 }
 
-export class WasmShims implements Dependency, GitHubDependency {
-  name = 'spinShim';
-  githubOwner = 'spinkube';
-  githubRepo = 'containerd-shim-spin';
+export class WasmShims extends GlobalDependency(GitHubDependency) {
+  readonly name = 'spinShim';
+  readonly githubOwner = 'spinframework';
+  readonly githubRepo = 'containerd-shim-spin';
 
   async download(context: DownloadContext): Promise<void> {
-    const arch = context.isM1 ? 'aarch64' : 'x86_64';
-    const base = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ context.versions.spinShim }`;
-    const url = `${ base }/containerd-shim-spin-v2-linux-${ arch }.tar.gz`;
+    const asset = selectAsset(context, this.name, { platform: 'linux', arch: hostArch(context) });
     const destPath = path.join(context.resourcesDir, 'linux', 'internal', 'containerd-shim-spin-v2');
 
-    await downloadTarGZ(url, destPath);
+    await downloadTarGZ(asset.url, destPath, { expectedChecksum: asset.checksum });
   }
 
-  // Up to now (0.11.1 release), **all** containerd-wasm-shims releases are marked as pre-release.
-  async getAvailableVersions(includePrerelease = true): Promise<string[]> {
-    return await getPublishedVersions(this.githubOwner, this.githubRepo, includePrerelease);
-  }
+  async getAssets(version: string): Promise<DependencyAsset[]> {
+    const base = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ version }`;
+    // spinframework labels its linux arches with uname-style names.
+    const unameArch: Record<GoArch, string> = { amd64: 'x86_64', arm64: 'aarch64' };
 
-  versionToTagName(version: string): string {
-    return `v${ version }`;
-  }
+    // Upstream does not publish a checksum file, so we record the sha256 we
+    // observe at bump time.
+    return Promise.all(ARCHES.map(async(arch) => {
+      const url = `${ base }/containerd-shim-spin-v2-linux-${ unameArch[arch] }.tar.gz`;
+      const checksum = await downloadAndHash(url);
 
-  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
-    return semver.rcompare(version1, version2);
-  }
-}
-
-export class CertManager implements Dependency, GitHubDependency {
-  name = 'certManager';
-  githubOwner = 'cert-manager';
-  githubRepo = 'cert-manager';
-
-  async download(context: DownloadContext): Promise<void> {
-    const base = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ context.versions.certManager }`;
-    const filename = 'cert-manager.crds.yaml';
-
-    await download(`${ base }/${ filename }`, path.join(context.resourcesDir, filename));
-
-    const url = `https://charts.jetstack.io/charts/cert-manager-v${ context.versions.certManager }.tgz`;
-
-    await download(url, path.join(context.resourcesDir, 'cert-manager.tgz'));
-  }
-
-  async getAvailableVersions(includePrerelease = false): Promise<string[]> {
-    return await getPublishedVersions(this.githubOwner, this.githubRepo, includePrerelease);
-  }
-
-  versionToTagName(version: string): string {
-    return `v${ version }`;
-  }
-
-  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
-    return semver.rcompare(version1, version2);
+      return { platform: 'linux' as const, arch, url, checksum };
+    }));
   }
 }
 
-export class SpinOperator implements Dependency, GitHubDependency {
-  name = 'spinOperator';
-  githubOwner = 'spinkube';
-  githubRepo = 'spin-operator';
+export class CertManager extends GlobalDependency(GitHubDependency) {
+  readonly name = 'certManager';
+  readonly githubOwner = 'cert-manager';
+  readonly githubRepo = 'cert-manager';
 
   async download(context: DownloadContext): Promise<void> {
-    const base = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ context.versions.spinOperator }`;
-    let filename = 'spin-operator.crds.yaml';
+    const fileNames = {
+      crds:  'cert-manager.crds.yaml',
+      chart: 'cert-manager.tgz',
+    };
 
-    await download(`${ base }/${ filename }`, path.join(context.resourcesDir, filename));
+    await Promise.all(Object.entries(fileNames).map(([variant, fileName]) => {
+      const asset = selectAsset(context, this.name, { platform: 'linux', variant });
 
-    filename = `spin-operator-${ context.versions.spinOperator }.tgz`;
-    await download(`${ base }/${ filename }`, path.join(context.resourcesDir, 'spin-operator.tgz'));
+      return download(asset.url, path.join(context.resourcesDir, fileName), {
+        expectedChecksum: asset.checksum,
+      });
+    }));
   }
 
-  async getAvailableVersions(includePrerelease = false): Promise<string[]> {
-    return await getPublishedVersions(this.githubOwner, this.githubRepo, includePrerelease);
-  }
+  async getAssets(version: string): Promise<DependencyAsset[]> {
+    // The CRDs and chart are platform-independent; they deploy into the linux
+    // guest.  Upstream publishes no checksum file, so we record the sha256 we
+    // observe at bump time.
+    const base = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ version }`;
+    const crdsUrl = `${ base }/cert-manager.crds.yaml`;
+    const chartUrl = `https://charts.jetstack.io/charts/cert-manager-v${ version }.tgz`;
+    const [crdsChecksum, chartChecksum] = await Promise.all([
+      downloadAndHash(crdsUrl),
+      downloadAndHash(chartUrl),
+    ]);
 
-  versionToTagName(version: string): string {
-    return `v${ version }`;
-  }
-
-  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
-    return semver.rcompare(version1, version2);
+    return [
+      { platform: 'linux', variant: 'crds', url: crdsUrl, checksum: crdsChecksum },
+      { platform: 'linux', variant: 'chart', url: chartUrl, checksum: chartChecksum },
+    ];
   }
 }
 
-export class SpinCLI implements Dependency, GitHubDependency {
-  name = 'spinCLI';
-  githubOwner = 'fermyon';
-  githubRepo = 'spin';
+export class SpinOperator extends GlobalDependency(GitHubDependency) {
+  readonly name = 'spinOperator';
+  readonly githubOwner = 'spinframework';
+  readonly githubRepo = 'spin-operator';
 
   async download(context: DownloadContext): Promise<void> {
-    const arch = context.isM1 ? 'aarch64' : 'amd64';
-    const platform = {
-      darwin:  'macos',
-      linux:   'static-linux',
-      windows: 'windows',
-    }[context.goPlatform];
-    const baseURL = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ context.versions.spinCLI }`;
-    const archiveName = `spin-v${ context.versions.spinCLI }-${ platform }-${ arch }${ context.goPlatform.startsWith('win') ? '.zip' : '.tar.gz' }`;
-    const expectedChecksum = await findChecksum(`${ baseURL }/checksums-v${ context.versions.spinCLI }.txt`, archiveName);
+    const fileNames = {
+      crds:  'spin-operator.crds.yaml',
+      chart: 'spin-operator.tgz',
+    };
+
+    await Promise.all(Object.entries(fileNames).map(([variant, fileName]) => {
+      const asset = selectAsset(context, this.name, { platform: 'linux', variant });
+
+      return download(asset.url, path.join(context.resourcesDir, fileName), {
+        expectedChecksum: asset.checksum,
+      });
+    }));
+  }
+
+  async getAssets(version: string): Promise<DependencyAsset[]> {
+    // The CRDs and chart are platform-independent; they deploy into the linux
+    // guest.  Upstream publishes no checksum file, so we record the sha256 we
+    // observe at bump time.
+    const base = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ version }`;
+    const crdsUrl = `${ base }/spin-operator.crds.yaml`;
+    const chartUrl = `${ base }/spin-operator-${ version }.tgz`;
+    const [crdsChecksum, chartChecksum] = await Promise.all([
+      downloadAndHash(crdsUrl),
+      downloadAndHash(chartUrl),
+    ]);
+
+    return [
+      { platform: 'linux', variant: 'crds', url: crdsUrl, checksum: crdsChecksum },
+      { platform: 'linux', variant: 'chart', url: chartUrl, checksum: chartChecksum },
+    ];
+  }
+}
+
+export class SpinCLI extends GlobalDependency(GitHubDependency) {
+  readonly name = 'spinCLI';
+  readonly githubOwner = 'spinframework';
+  readonly githubRepo = 'spin';
+
+  async download(context: DownloadContext): Promise<void> {
+    const asset = selectAsset(context, this.name);
     const entryName = exeName(context, 'spin');
-    const options: ArchiveDownloadOptions = { expectedChecksum, entryName };
+    const options: ArchiveDownloadOptions = { expectedChecksum: asset.checksum, entryName };
     const downloadFunc = context.platform.startsWith('win') ? downloadZip : downloadTarGZ;
 
-    await downloadFunc(`${ baseURL }/${ archiveName }`, path.join(context.binDir, entryName), options);
+    await downloadFunc(asset.url, path.join(context.internalDir, entryName), options);
   }
 
-  async getAvailableVersions(includePrerelease = false): Promise<string[]> {
-    return await getPublishedVersions(this.githubOwner, this.githubRepo, includePrerelease);
+  async getAssets(version: string): Promise<DependencyAsset[]> {
+    const baseURL = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/v${ version }`;
+    const upstream = await fetchUpstreamChecksums(`${ baseURL }/checksums-v${ version }.txt`, 'sha256');
+    // spin labels platforms and arches its own way, and ships no windows/arm64 build.
+    const combos: { platform: AssetPlatform, arch: GoArch, spinPlatform: string, spinArch: string }[] = [
+      { platform: 'darwin', arch: 'amd64', spinPlatform: 'macos', spinArch: 'amd64' },
+      { platform: 'darwin', arch: 'arm64', spinPlatform: 'macos', spinArch: 'aarch64' },
+      { platform: 'linux', arch: 'amd64', spinPlatform: 'static-linux', spinArch: 'amd64' },
+      { platform: 'linux', arch: 'arm64', spinPlatform: 'static-linux', spinArch: 'aarch64' },
+      { platform: 'windows', arch: 'amd64', spinPlatform: 'windows', spinArch: 'amd64' },
+    ];
+
+    return Promise.all(combos.map(async({ platform, arch, spinPlatform, spinArch }) => {
+      const ext = platform === 'windows' ? '.zip' : '.tar.gz';
+      const archiveName = `spin-v${ version }-${ spinPlatform }-${ spinArch }${ ext }`;
+      const url = `${ baseURL }/${ archiveName }`;
+      const checksum = await downloadAndHash(url, {
+        verify: { algorithm: 'sha256', expected: upstream[archiveName] },
+      });
+
+      return { platform, arch, url, checksum };
+    }));
+  }
+}
+
+export class SpinKubePlugin extends GlobalDependency(GitHubDependency) {
+  readonly name = 'spinKubePlugin';
+  readonly githubOwner = 'spinframework';
+  readonly githubRepo = 'spin-plugin-kube';
+
+  download(context: DownloadContext): Promise<void> {
+    // We don't download anything there; `resources/setup-spin` does the installation.
+    return Promise.resolve();
   }
 
-  versionToTagName(version: string): string {
-    return `v${ version }`;
-  }
-
-  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
-    return semver.rcompare(version1, version2);
+  getAssets(version: string): Promise<DependencyAsset[]> {
+    return Promise.resolve([]);
   }
 }

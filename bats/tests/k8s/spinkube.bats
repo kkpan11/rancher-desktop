@@ -20,8 +20,15 @@ local_setup() {
     wait_for_kube_deployment_available --namespace spin-operator spin-operator-controller-manager
 }
 
+@test 'wait for spinkube executor' {
+    try kubectl get SpinAppExecutors.core.spinkube.dev/containerd-shim-spin
+}
+
 @test 'deploy app to kubernetes' {
-    spin kube deploy --from ghcr.io/deislabs/containerd-wasm-shims/examples/spin-rust-hello:v0.10.0
+    # Newer versions of the sample app have moved from "deislabs" to "spinkube":
+    # ghcr.io/spinkube/containerd-shim-spin/examples/spin-rust-hello:v0.13.0
+    spin kube deploy --context rancher-desktop --replicas 1 --from ghcr.io/deislabs/containerd-wasm-shims/examples/spin-rust-hello:v0.10.0
+    wait_for_kube_deployment_available --namespace default spin-rust-hello
 }
 
 # TODO replace ingress with port-forwarding
@@ -86,9 +93,9 @@ EOF
 
 assert_helm_charts_are_deleted() {
     run --separate-stderr kubectl get helmcharts --namespace kube-system
-    assert_success || return
-    refute_line traefik || return
-    refute_line spin-operator || return
+    assert_success
+    refute_line traefik
+    refute_line spin-operator
     refute_line cert-manager
 }
 

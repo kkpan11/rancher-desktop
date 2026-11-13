@@ -13,14 +13,22 @@ import util from 'util';
 import Electron from 'electron';
 import merge from 'lodash/merge';
 import omit from 'lodash/omit';
-import zip from 'lodash/zip';
 import semver from 'semver';
-import sudo from 'sudo-prompt';
 import tar from 'tar-stream';
 import yaml from 'yaml';
 
 import {
-  Architecture, BackendError, BackendEvents, BackendProgress, BackendSettings, execOptions, FailureDetails, RestartReasons, State, VMBackend, VMExecutor,
+  Architecture,
+  BackendError,
+  BackendEvents,
+  BackendProgress,
+  BackendSettings,
+  execOptions,
+  FailureDetails,
+  RestartReasons,
+  State,
+  VMBackend,
+  VMExecutor,
 } from './backend';
 import BackendHelper from './backendHelper';
 import { ContainerEngineClient, MobyClient, NerdctlClient } from './containerClient';
@@ -40,14 +48,17 @@ import NERDCTL from '@pkg/assets/scripts/nerdctl';
 import NGINX_CONF from '@pkg/assets/scripts/nginx.conf';
 import { ContainerEngine, MountType, VMType } from '@pkg/config/settings';
 import { getServerCredentialsPath, ServerState } from '@pkg/main/credentialServer/httpCredentialHelperServer';
+import { t } from '@pkg/main/i18n';
 import mainEvents from '@pkg/main/mainEvents';
+import { exec as sudo } from '@pkg/sudo-prompt';
 import * as childProcess from '@pkg/utils/childProcess';
 import clone from '@pkg/utils/clone';
-import DockerDirManager from '@pkg/utils/dockerDirManager';
+import dockerDirManager from '@pkg/utils/dockerDirManager';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
 import { executable } from '@pkg/utils/resources';
 import { jsonStringifyWithWhiteSpace } from '@pkg/utils/stringify';
+import { tarStreamFinished } from '@pkg/utils/tarStream';
 import { defined, RecursivePartial } from '@pkg/utils/typeUtils';
 import { openSudoPrompt } from '@pkg/window';
 
@@ -74,39 +85,43 @@ enum SLIRP {
 /**
  * Lima mount
  */
-export type LimaMount = {
-  location: string;
+export interface LimaMount {
+  location:  string;
   writable?: boolean;
   '9p'?: {
-    securityModel: string;
+    securityModel:   string;
     protocolVersion: string;
-    msize: string;
-    cache: string;
+    msize:           string;
+    cache:           string;
   }
-};
+}
 
 /**
  * Lima configuration
  */
-export type LimaConfiguration = {
+export interface LimaConfiguration {
   vmType?: 'qemu' | 'vz';
-  rosetta?: {
-    enabled?: boolean;
-    binfmt?: boolean;
+  vmOpts?: {
+    vz?: {
+      rosetta?: {
+        enabled?: boolean;
+        binfmt?:  boolean;
+      },
+    },
   },
-  arch?: 'x86_64' | 'aarch64';
+  arch?:  'x86_64' | 'aarch64';
   images: {
     location: string;
-    arch?: 'x86_64' | 'aarch64';
-    digest?: string;
+    arch?:    'x86_64' | 'aarch64';
+    digest?:  string;
   }[];
-  cpus?: number;
-  memory?: number;
-  disk?: number;
-  mounts?: LimaMount[];
+  cpus?:     number;
+  memory?:   number;
+  disk?:     string;
+  mounts?:   LimaMount[];
   mountType: 'reverse-sshfs' | '9p' | 'virtiofs';
   ssh: {
-    localPort: number;
+    localPort:          number;
     loadDotSSHPubKeys?: boolean;
   }
   firmware?: {
@@ -116,26 +131,26 @@ export type LimaConfiguration = {
     display?: string;
   }
   provision?: {
-    mode: 'system' | 'user';
+    mode:   'system' | 'user';
     script: string;
   }[]
   containerd?: {
     system?: boolean;
-    user?: boolean;
+    user?:   boolean;
   }
   probes?: {
-    mode: 'readiness';
+    mode:        'readiness';
     description: string;
-    script: string;
-    hint: string;
+    script:      string;
+    hint:        string;
   }[];
   hostResolver?: {
     hosts?: Record<string, string>;
   }
-  portForwards?: Array<Record<string, any>>;
-  networks?: Array<Record<string, string | boolean>>;
-  env?: Record<string, string>;
-};
+  portForwards?: Record<string, any>[];
+  networks?:     Record<string, string | boolean>[];
+  env?:          Record<string, string>;
+}
 
 /**
  * QEMU Image formats
@@ -148,18 +163,18 @@ enum ImageFormat {
 /**
  * QEMU Image Information as returned by `qemu-img info --output=json ...`
  */
-type QEMUImageInfo = {
+interface QEMUImageInfo {
   format: string;
-};
+}
 
 /**
  * Options passed to spawnWithCapture method
  */
-type SpawnOptions = {
+interface SpawnOptions {
   expectFailure?: boolean,
-  stderr?: boolean,
-  env?: NodeJS.ProcessEnv,
-};
+  stderr?:        boolean,
+  env?:           NodeJS.ProcessEnv,
+}
 
 /**
  * Lima networking configuration.
@@ -168,41 +183,57 @@ type SpawnOptions = {
 interface LimaNetworkConfiguration {
   paths: {
     socketVMNet: string;
-    varRun: string;
-    sudoers?: string;
+    varRun:      string;
+    sudoers?:    string;
   }
-  group?: string;
+  group?:   string;
   networks: Record<string, {
-    mode: 'host' | 'shared';
+    mode:    'host' | 'shared';
     gateway: string;
     dhcpEnd: string;
     netmask: string;
   } | {
-    mode: 'bridged';
+    mode:      'bridged';
     interface: string;
   }>;
+}
+
+/**
+ * Check that every host and shared network has IPv4 addresses.  These values
+ * end up in a sudoers file installed as root, so anything else could inject
+ * sudoers rules.  Lima parses them as IP addresses, and socket_vmnet takes
+ * only IPv4 for them.
+ */
+function hasValidNetworkAddresses(config: LimaNetworkConfiguration): boolean {
+  return Object.values(config.networks ?? {}).every((network) => {
+    if (network.mode !== 'host' && network.mode !== 'shared') {
+      return true;
+    }
+
+    return [network.gateway, network.dhcpEnd, network.netmask].every(addr => typeof addr === 'string' && net.isIPv4(addr));
+  });
 }
 
 /**
  * One entry from `limactl list --json`
  */
 interface LimaListResult {
-  name: string;
-  status: 'Broken' | 'Stopped' | 'Running';
-  dir: string;
-  arch: 'x86_64' | 'aarch64';
-  vmType?: 'qemu' | 'vz';
+  name:          string;
+  status:        'Broken' | 'Stopped' | 'Running';
+  dir:           string;
+  arch:          'x86_64' | 'aarch64';
+  vmType?:       'qemu' | 'vz';
   sshLocalPort?: number;
   hostAgentPID?: number;
-  qemuPID?: number;
-  errors?: string[];
+  qemuPID?:      number;
+  errors?:       string[];
 }
 
 /** SPNetworkDataType is output from /usr/sbin/system_profiler on darwin. */
 interface SPNetworkDataType {
-  _name: string;
+  _name:     string;
   interface: string;
-  dhcp?: unknown;
+  dhcp?:     unknown;
   IPv4?: {
     Addresses?: string[];
   };
@@ -211,26 +242,44 @@ interface SPNetworkDataType {
 type SudoReason = 'networking' | 'docker-socket';
 
 /**
+ * Double-quote a path for the shell command that runs as root.  The path comes
+ * from the environment (TMPDIR, HOME), so refuse the characters that the shell
+ * still interprets inside double quotes, and the single quote that delimits
+ * the whole command.
+ */
+export function quotePathForShell(fsPath: string): string {
+  if (/["$`\\']/.test(fsPath)) {
+    throw new Error(`Refusing to use path ${ fsPath } in a privileged command because it contains a shell special character.`);
+  }
+
+  return `"${ fsPath }"`;
+}
+
+/**
  * SudoCommand describes an operation that will be run under sudo.  This is
  * returned from various methods that need to determine what commands we need to
  * run under sudo to have all functionality.
  */
 interface SudoCommand {
   /** Reason why we want sudo access, */
-  reason: SudoReason;
+  reason:   SudoReason;
   /** Commands that will need to be executed. */
   commands: string[];
   /** Paths that will be affected by this command. */
-  paths: string[];
+  paths:    string[];
 }
 
 const console = Logging.lima;
 const DEFAULT_DOCKER_SOCK_LOCATION = '/var/run/docker.sock';
 
 export const MACHINE_NAME = '0';
-const IMAGE_VERSION = DEPENDENCY_VERSIONS.alpineLimaISO.isoVersion;
+/** Lima version shipped with Rancher Desktop 1.13, the last release that created
+ *  instances without a recorded version.
+ */
+const LEGACY_LIMA_VERSION = 'v0.19.0';
+const IMAGE_VERSION = DEPENDENCY_VERSIONS.alpineLimaISO.version.isoVersion;
 const ALPINE_EDITION = 'rd';
-const ALPINE_VERSION = DEPENDENCY_VERSIONS.alpineLimaISO.alpineVersion;
+const ALPINE_VERSION = DEPENDENCY_VERSIONS.alpineLimaISO.version.alpineVersion;
 
 const ETC_RANCHER_DESKTOP_DIR = '/etc/rancher/desktop';
 const CREDENTIAL_FORWARDER_SETTINGS_PATH = path.join(ETC_RANCHER_DESKTOP_DIR, 'credfwd');
@@ -250,29 +299,6 @@ const LIMA_SUDOERS_LOCATION = '/private/etc/sudoers.d/zzzzz-rancher-desktop-lima
 // Filename used in versions 1.0.0 and earlier:
 const PREVIOUS_LIMA_SUDOERS_LOCATION = '/private/etc/sudoers.d/rancher-desktop-lima';
 
-/** Forward compatible limactl binary allows for support of lima built for newer
- * versions of Darwin/macOS.
- *
- * When the xcode version used to build the forward compatible limactl binary
- * changes, update fwdCompatLimactlDarwinVer with the Darwin version
- * that xcode version is usually installed on.
- *
- * Xcode version used to build forward compatible limactl can be found here:
- * https://github.com/rancher-sandbox/lima-and-qemu/blob/main/.github/workflows/release.yml#L105
- *
- * Find which macOS the xcode version is installed on by default in the Xcode table:
- * https://en.wikipedia.org/wiki/Xcode#Xcode_11.0_-_14.x_(since_SwiftUI_framework)
- *
- * Then match the macOS version to the Darwin version.
- *
- * For Ventura see the Release History table:
- * https://en.wikipedia.org/wiki/MacOS_Ventura#Release_history
- */
-// Name of the forward compatible limactl binary installed by the lima dependencies script.
-const fwdCompatLimactlBin = 'limactl.ventura';
-// Version of Darwin the forward compatible limactl binary was built for.
-const fwdCompatLimactlDarwinVer = '22.1.0';
-
 /**
  * LimaBackend implements all the Lima-specific functionality for Rancher
  * Desktop.  This is used on macOS and Linux.
@@ -286,10 +312,9 @@ const fwdCompatLimactlDarwinVer = '22.1.0';
 // [1]: https://www.typescriptlang.org/docs/handbook/2/classes.html#this-parameters
 // [2]: https://github.com/microsoft/TypeScript/issues/46802
 export default class LimaBackend extends events.EventEmitter implements VMBackend, VMExecutor {
-  constructor(arch: Architecture, dockerDirManager: DockerDirManager, kubeFactory: (backend: LimaBackend) => K8s.KubernetesBackend) {
+  constructor(arch: Architecture, kubeFactory: (backend: LimaBackend) => K8s.KubernetesBackend) {
     super();
     this.arch = arch;
-    this.dockerDirManager = dockerDirManager;
     this.kubeBackend = kubeFactory(this);
 
     this.progressTracker = new ProgressTracker((progress) => {
@@ -305,7 +330,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
     }
   }
 
-  readonly kubeBackend: K8s.KubernetesBackend;
+  readonly kubeBackend:   K8s.KubernetesBackend;
   readonly executor = this;
   #containerEngineClient: ContainerEngineClient | undefined;
 
@@ -324,9 +349,6 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
 
   /** The current architecture. */
   protected readonly arch: Architecture;
-
-  /** Used to manage the docker CLI config directory. */
-  protected readonly dockerDirManager: DockerDirManager;
 
   /** The version of Kubernetes currently running. */
   protected activeVersion: semver.SemVer | null = null;
@@ -386,7 +408,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
 
   debug = false;
 
-  emit: VMBackend['emit'] = this.emit;
+  emit: VMBackend['emit'] = events.EventEmitter.prototype.emit;
 
   get backend(): 'lima' {
     return 'lima';
@@ -420,9 +442,11 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
     if (os.platform().startsWith('linux')) {
       const cpuInfo = await fs.promises.readFile('/proc/cpuinfo', 'utf-8');
 
-      if (!/flags.*(vmx|svm)/g.test(cpuInfo)) {
-        console.log(`Virtualization support error: got ${ cpuInfo }`);
-        throw new Error('Virtualization does not appear to be supported on your machine.');
+      if (this.arch === 'x86_64') {
+        if (!/flags.*(vmx|svm)/g.test(cpuInfo)) {
+          console.log(`Virtualization support error: got ${ cpuInfo }`);
+          throw new Error('Virtualization does not appear to be supported on your machine.');
+        }
       }
     } else if (os.platform().startsWith('darwin')) {
       const { stdout } = await childProcess.spawnFile(
@@ -543,9 +567,9 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
       await this.lima('stop', MACHINE_NAME);
     }
 
-    const diskPath = path.join(paths.lima, MACHINE_NAME, 'basedisk');
+    const imagePath = await this.instanceDiskPath('iso', 'basedisk');
 
-    await fs.promises.copyFile(this.baseDiskImage, diskPath);
+    await fs.promises.copyFile(this.baseDiskImage, imagePath);
     // The config file will be updated in updateConfig() instead; no need to do it here.
     console.log(`Base image successfully updated.`);
   }
@@ -610,7 +634,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
     for (const location of locations) {
       const mount: LimaMount = { location, writable: true };
 
-      if (this.cfg?.experimental.virtualMachine.mount.type === MountType.NINEP) {
+      if (this.cfg?.virtualMachine.mount.type === MountType.NINEP) {
         const nineP = this.cfg.experimental.virtualMachine.mount['9p'];
 
         mount['9p'] = {
@@ -636,10 +660,14 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
     // We use {} as the first argument because merge() modifies
     // it, and it would be less safe to modify baseConfig.
     const config: LimaConfiguration = merge({}, baseConfig, DEFAULT_CONFIG as LimaConfiguration, {
-      vmType:  this.cfg?.experimental.virtualMachine.type,
-      rosetta: {
-        enabled: this.cfg?.experimental.virtualMachine.useRosetta,
-        binfmt:  this.cfg?.experimental.virtualMachine.useRosetta,
+      vmType:  this.cfg?.virtualMachine.type,
+      vmOpts: {
+        vz: {
+          rosetta: {
+            enabled: this.cfg?.virtualMachine.useRosetta,
+            binfmt:  this.cfg?.virtualMachine.useRosetta,
+          },
+        },
       },
       images: [{
         location: this.baseDiskImage,
@@ -647,8 +675,9 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
       }],
       cpus:         this.cfg?.virtualMachine.numberCPUs || 4,
       memory:       (this.cfg?.virtualMachine.memoryInGB || 4) * 1024 * 1024 * 1024,
+      disk:         this.cfg?.experimental.virtualMachine.diskSize ?? '100GiB',
       mounts:       this.getMounts(),
-      mountType:    this.cfg?.experimental.virtualMachine.mount.type,
+      mountType:    this.cfg?.virtualMachine.mount.type,
       ssh:          { localPort: await this.sshPort },
       hostResolver: {
         hosts: {
@@ -661,22 +690,6 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
       },
     });
 
-    // k3s supports cgroup v2 starting with 1.20.4
-    config.env ||= {};
-    config.env['RC_CGROUP_MODE'] = 'unified';
-    if (this.cfg?.kubernetes?.enabled && this.cfg.kubernetes.version) {
-      try {
-        if (semver.lt(this.cfg.kubernetes.version, '1.20.4')) {
-          config.env['RC_CGROUP_MODE'] = 'hybrid';
-        }
-      } catch {
-        // If we have an invalid version configured, ignore the error; we'll
-        // report the error later when trying to download the version.  In that
-        // case we will fall back to the latest stable version, which should be
-        // new enough to support cgroups v2.
-      }
-    }
-
     // Alpine can boot via UEFI now
     if (config.firmware) {
       config.firmware.legacyBIOS = false;
@@ -684,8 +697,14 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
 
     // RD used to store additional keys in lima.yaml that are not supported by lima (and no longer used by RD).
     // They must be removed because lima intends to switch to strict YAML parsing, so typos can be detected.
-    delete (config as Record<string, unknown>).k3s;
-    delete (config as Record<string, unknown>).paths;
+    delete (config as unknown as Record<string, unknown>).k3s;
+    delete (config as unknown as Record<string, unknown>).paths;
+
+    // The top-level cpuType field is deprecated in favour of vmOpts.qemu.cpuType.
+    // Drop it so an upgraded VM's lima.yaml doesn't keep triggering lima's deprecation warning.
+    delete (config as unknown as Record<string, unknown>).cpuType;
+    // Same for rosetta settings
+    delete (config as unknown as Record<string, unknown>).rosetta;
 
     if (os.platform() === 'darwin') {
       if (allowRoot) {
@@ -706,7 +725,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
         } else {
           console.log('Could not find any acceptable host networks for bridging.');
         }
-      } else if (this.cfg?.experimental.virtualMachine.type === VMType.VZ) {
+      } else if (this.cfg?.virtualMachine.type === VMType.VZ) {
         console.log('Using vzNAT networking stack');
         config.networks = [{
           interface: 'vznat',
@@ -724,7 +743,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
       const configPath = path.join(paths.lima, MACHINE_NAME, 'lima.yaml');
 
       await this.progressTracker.action(
-        'Updating outdated virtual machine',
+        t('progress.updatingOutdatedVm'),
         100,
         this.updateBaseDisk(currentConfig),
       );
@@ -744,7 +763,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
   }
 
   protected updateConfigPortForwards(config: LimaConfiguration) {
-    let allPortForwards: Array<Record<string, any>> | undefined = config.portForwards;
+    let allPortForwards: Record<string, any>[] | undefined = config.portForwards;
 
     if (!allPortForwards) {
       // This shouldn't happen, but fix it anyway
@@ -779,13 +798,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
   }
 
   protected static get limactl() {
-    let limactlBin = 'limactl';
-
-    if (os.platform() === 'darwin' && semver.gte(os.release(), fwdCompatLimactlDarwinVer)) {
-      limactlBin = fwdCompatLimactlBin;
-    }
-
-    return path.join(paths.resources, os.platform(), 'lima', 'bin', limactlBin);
+    return path.join(paths.resources, os.platform(), 'lima', 'bin', 'limactl');
   }
 
   protected static get qemuImg() {
@@ -794,23 +807,51 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
 
   protected static get limaEnv() {
     const binDir = path.join(paths.resources, os.platform(), 'lima', 'bin');
+    const libDir = path.join(paths.resources, os.platform(), 'lima', 'lib');
     const VMNETDir = path.join(VMNET_DIR, 'bin');
     const pathList = (process.env.PATH || '').split(path.delimiter);
     const newPath = [binDir, VMNETDir].concat(...pathList).filter(x => x);
+    const env = structuredClone(process.env);
 
-    return {
-      ...process.env, LIMA_HOME: paths.lima, PATH: newPath.join(path.delimiter),
-    };
+    env.LIMA_HOME = paths.lima;
+    env.PATH = newPath.join(path.delimiter);
+
+    // Override LD_LIBRARY_PATH to pick up the QEMU libraries.
+    // - on macOS, this is not used. The macOS dynamic linker uses DYLD_ prefixed variables.
+    // - on packaged (rpm/deb) builds, we do not ship this directory, so it does nothing.
+    // - for AppImage this has no effect because the libs are moved to a dir that is already on LD_LIBRARY_PATH
+    // - this only has an effect on builds extracted from a Linux zip file (which includes a bundled
+    //   QEMU) to make sure QEMU dependencies are loaded from the bundled lib directory.
+    if (env.LD_LIBRARY_PATH) {
+      env.LD_LIBRARY_PATH = libDir + path.delimiter + env.LD_LIBRARY_PATH;
+    } else {
+      env.LD_LIBRARY_PATH = libDir;
+    }
+
+    return env;
+  }
+
+  protected static get qemuImgEnv() {
+    return { ...process.env, LD_LIBRARY_PATH: path.join(paths.resources, os.platform(), 'lima', 'lib') };
   }
 
   /**
    * Run `limactl` with the given arguments.
    */
-  async lima(this: Readonly<this>, ...args: string[]): Promise<void> {
+  async lima(this: Readonly<this>, env: NodeJS.ProcessEnv, ...args: string[]): Promise<void>;
+  async lima(this: Readonly<this>, ...args: string[]): Promise<void>;
+  async lima(this: Readonly<this>, envOrArg: NodeJS.ProcessEnv | string, ...args: string[]): Promise<void> {
+    const env = LimaBackend.limaEnv;
+
+    if (typeof envOrArg === 'string') {
+      args = [envOrArg].concat(args);
+    } else {
+      Object.assign(env, envOrArg);
+    }
     args = this.debug ? ['--debug'].concat(args) : args;
     try {
       const { stdout, stderr } = await childProcess.spawnFile(LimaBackend.limactl, args,
-        { env: LimaBackend.limaEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+        { env, stdio: ['ignore', 'pipe', 'pipe'] });
       const formatBreak = stderr || stdout ? '\n' : '';
 
       console.log(`> limactl ${ args.join(' ') }${ formatBreak }${ stderr }${ stdout }`);
@@ -823,9 +864,9 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
   /**
    * Run `limactl` with the given arguments, and return stdout.
    */
-  protected async limaWithCapture(this: Readonly<this>, ...args: string[]): Promise<{stdout: string, stderr: string}>;
-  protected async limaWithCapture(this: Readonly<this>, options: SpawnOptions, ...args: string[]): Promise<{stdout: string, stderr: string}>;
-  protected async limaWithCapture(this: Readonly<this>, argOrOptions: string | SpawnOptions, ...args: string[]): Promise<{stdout: string, stderr: string}> {
+  protected async limaWithCapture(this: Readonly<this>, ...args: string[]): Promise<{ stdout: string, stderr: string }>;
+  protected async limaWithCapture(this: Readonly<this>, options: SpawnOptions, ...args: string[]): Promise<{ stdout: string, stderr: string }>;
+  protected async limaWithCapture(this: Readonly<this>, argOrOptions: string | SpawnOptions, ...args: string[]): Promise<{ stdout: string, stderr: string }> {
     let options: SpawnOptions = {};
 
     if (typeof argOrOptions === 'string') {
@@ -841,7 +882,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
     return await this.spawnWithCapture(LimaBackend.limactl, options, ...args);
   }
 
-  async spawnWithCapture(this: Readonly<this>, cmd: string, argOrOptions: string | SpawnOptions = {}, ...args: string[]): Promise<{stdout: string, stderr: string}> {
+  async spawnWithCapture(this: Readonly<this>, cmd: string, argOrOptions: string | SpawnOptions = {}, ...args: string[]): Promise<{ stdout: string, stderr: string }> {
     let options: SpawnOptions = {};
 
     if (typeof argOrOptions === 'string') {
@@ -968,20 +1009,47 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
     })();
   }
 
+  /**
+   * Resolve a Lima instance disk file, returning the first of `names` that
+   * exists, or the first name when none do. Lima renamed basedisk→iso and
+   * diffdisk→disk and migrates existing instances on start; passing the new
+   * name first uses it when present and falls back to the legacy name on an
+   * instance Lima has not migrated yet.
+   */
+  protected async instanceDiskPath(...names: string[]): Promise<string> {
+    const instanceDir = path.join(paths.lima, MACHINE_NAME);
+
+    for (const name of names) {
+      const candidate = path.join(instanceDir, name);
+
+      try {
+        await fs.promises.access(candidate);
+
+        return candidate;
+      } catch {
+        // Not this name; try the next one.
+      }
+    }
+
+    return path.join(instanceDir, names[0]);
+  }
+
   protected async imageInfo(fileName: string): Promise<QEMUImageInfo> {
     try {
-      const { stdout } = await this.spawnWithCapture(LimaBackend.qemuImg, 'info', '--output=json', '--force-share', fileName);
+      const { stdout } = await this.spawnWithCapture(LimaBackend.qemuImg, { env: LimaBackend.qemuImgEnv },
+        'info', '--output=json', '--force-share', fileName);
 
       return JSON.parse(stdout) as QEMUImageInfo;
     } catch {
-      return { format: 'unknown' } as QEMUImageInfo;
+      return { format: 'unknown' };
     }
   }
 
   protected async convertToRaw(fileName: string): Promise<void> {
     const rawFileName = `${ fileName }.raw`;
 
-    await this.spawnWithCapture(LimaBackend.qemuImg, 'convert', fileName, rawFileName);
+    await this.spawnWithCapture(LimaBackend.qemuImg, { env: LimaBackend.qemuImgEnv },
+      'convert', fileName, rawFileName);
     await fs.promises.unlink(fileName);
     await fs.promises.rename(rawFileName, fileName);
   }
@@ -1026,7 +1094,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
    */
   protected async installToolsWithSudo(): Promise<boolean> {
     const randomTag = LimaBackend.calcRandomTag(8);
-    const commands: Array<string> = [];
+    const commands: string[] = [];
     const explanations: Partial<Record<SudoReason, string[]>> = {};
 
     const processCommand = (cmd: SudoCommand | undefined) => {
@@ -1037,15 +1105,15 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
     };
 
     if (os.platform() === 'darwin') {
-      await this.progressTracker.action('Setting up virtual ethernet', 10, async() => {
+      await this.progressTracker.action(t('progress.settingUpVirtualEthernet'), 10, async() => {
         processCommand(await this.installVMNETTools());
       });
-      await this.progressTracker.action('Setting Lima permissions', 10, async() => {
+      await this.progressTracker.action(t('progress.settingLimaPermissions'), 10, async() => {
         processCommand(await this.ensureRunLimaLocation());
         processCommand(await this.createLimaSudoersFile(randomTag));
       });
     }
-    await this.progressTracker.action('Setting up Docker socket', 10, async() => {
+    await this.progressTracker.action(t('progress.settingUpDockerSocket'), 10, async() => {
       processCommand(await this.configureDockerSocket());
     });
 
@@ -1058,7 +1126,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
 
     if (requirePassword) {
       allowed = await this.progressTracker.action(
-        'Expecting user permission to continue',
+        t('progress.expectingPermission'),
         10,
         this.showSudoReason(explanations));
     }
@@ -1154,6 +1222,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
     }
 
     const workdir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'rd-vmnet-install-'));
+    const quotedWorkdir = quotePathForShell(workdir);
     const tarPath = path.join(workdir, 'vmnet.tar');
     const commands: string[] = [];
 
@@ -1162,9 +1231,9 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
       // outdated ones, since we're going to need a prompt anyway.
       const tarStream = fs.createWriteStream(tarPath);
       const archive = tar.pack();
-      const archiveFinished = util.promisify(stream.finished)(archive);
+      const archiveFinished = tarStreamFinished(archive);
       const newEntry = util.promisify(archive.entry.bind(archive));
-      const baseHeader: Partial<tar.Headers> = {
+      const baseHeader: Partial<tar.Header> = {
         mode:  0o755,
         uid:   0,
         uname: 'root',
@@ -1190,7 +1259,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
       for (const relPath of files) {
         const source = path.join(sourcePath, relPath);
         const info = await fs.promises.lstat(source);
-        const header: tar.Headers = {
+        const header: Partial<tar.Header> & { name: string } = {
           ...baseHeader,
           name:  path.normalize(path.join(path.basename(installedPath), relPath)),
           mode:  info.mode,
@@ -1215,12 +1284,12 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
 
       archive.finalize();
       await archiveFinished;
-      const command = `tar -xf "${ tarPath }" -C "${ path.dirname(installedPath) }"`;
+      const command = `tar -xf ${ quotePathForShell(tarPath) } -C "${ path.dirname(installedPath) }"`;
 
       console.log(`VMNET tools install required: ${ command }`);
       commands.push(command);
     } finally {
-      commands.push(`rm -fr ${ workdir }`);
+      commands.push(`rm -fr ${ quotedWorkdir }`);
     }
 
     return {
@@ -1228,6 +1297,62 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
       commands,
       paths:  [VMNET_DIR],
     };
+  }
+
+  /**
+   * Create a sudoers file that has to be byte-for-byte identical to what `limactl sudoers` would create.
+   * We can't use `limactl sudoers` because it will fail when socket_vmnet has not yet been installed at
+   * the secure path. We don't want to ask the user twice for a password: once to install socket_vmnet,
+   * and once more to update the sudoers file. So we try to predict what `limactl sudoers` would write.
+   */
+  protected sudoersFile(config: LimaNetworkConfiguration): string {
+    const host = config.networks['host'];
+    const shared = config.networks['rancher-desktop-shared'];
+
+    if (host.mode !== 'host') {
+      throw new Error('host network has wrong type');
+    }
+    if (shared.mode !== 'shared') {
+      throw new Error('shared network has wrong type');
+    }
+
+    let name = 'host';
+    let sudoers = `%everyone ALL=(root:wheel) NOPASSWD:NOSETENV: /bin/mkdir -m 775 -p /private/var/run
+
+# Manage "${ name }" network daemons
+
+%everyone ALL=(root:wheel) NOPASSWD:NOSETENV: \\
+    /opt/rancher-desktop/bin/socket_vmnet --pidfile=/private/var/run/${ name }_socket_vmnet.pid --socket-group=everyone --vmnet-mode=host --vmnet-gateway=${ host.gateway } --vmnet-dhcp-end=${ host.dhcpEnd } --vmnet-mask=${ host.netmask } /private/var/run/socket_vmnet.${ name }, \\
+    /usr/bin/pkill -F /private/var/run/${ name }_socket_vmnet.pid
+
+`;
+
+    const networks = Object.keys(config.networks).sort();
+
+    for (const name of networks) {
+      const prefix = 'rancher-desktop-bridged_';
+
+      if (!name.startsWith(prefix)) {
+        continue;
+      }
+      sudoers += `# Manage "${ name }" network daemons
+
+%everyone ALL=(root:wheel) NOPASSWD:NOSETENV: \\
+    /opt/rancher-desktop/bin/socket_vmnet --pidfile=/private/var/run/${ name }_socket_vmnet.pid --socket-group=everyone --vmnet-mode=bridged --vmnet-interface=${ name.slice(prefix.length) } /private/var/run/socket_vmnet.${ name }, \\
+    /usr/bin/pkill -F /private/var/run/${ name }_socket_vmnet.pid
+
+`;
+    }
+
+    name = 'rancher-desktop-shared';
+    sudoers += `# Manage "${ name }" network daemons
+
+%everyone ALL=(root:wheel) NOPASSWD:NOSETENV: \\
+    /opt/rancher-desktop/bin/socket_vmnet --pidfile=/private/var/run/${ name }_socket_vmnet.pid --socket-group=everyone --vmnet-mode=shared --vmnet-gateway=${ shared.gateway } --vmnet-dhcp-end=${ shared.dhcpEnd } --vmnet-mask=${ shared.netmask } /private/var/run/socket_vmnet.${ name }, \\
+    /usr/bin/pkill -F /private/var/run/${ name }_socket_vmnet.pid
+`;
+
+    return sudoers;
   }
 
   protected async createLimaSudoersFile(this: Readonly<this> & this, randomTag: string): Promise<SudoCommand | undefined> {
@@ -1245,38 +1370,15 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
       }
     }
 
-    // We want to generate the file via `limactl sudoers`. However, there are
-    // some limitations:
-    // - The vmnet executables may not be installed yet (because we try to make
-    //   sure the user is only prompted for credentials once).
-    // - `limactl sudoers --check` complains in situations that would be fine:
-    //   - The executable names wouldn't match the installed one.
-    //   - The application directory ("Rancher Desktop.app") contains spaces.
-    // As a workaround, we instead:
-    // 1. Run `limactl sudoers` to generate the desired output, but using the
-    //    executables in the application directory instead of `/opt/...`.
-    // 2. Do a text replace to determine the final sudoers file contents.
-    // 3. Compare the contents with the existing file, and request a write if
-    //    it's not the same.
-
-    // Rewrite the network configuration to use application directory executables.
-    await this.installCustomLimaNetworkConfig(true, true);
-    const { stdout: unsafeSudoers } = await this.limaWithCapture('sudoers');
-    const sudoers = unsafeSudoers.replaceAll(this.unsafeVMNetExecutable, this.safeVMNetExecutable);
+    const networkConfig = await this.installCustomLimaNetworkConfig(true);
+    const sudoers = this.sudoersFile(networkConfig);
     let updateSudoers = false;
 
     try {
-      const existing = await fs.promises.readFile(LIMA_SUDOERS_LOCATION, { encoding: 'utf-8' });
+      const existingSudoers = await fs.promises.readFile(LIMA_SUDOERS_LOCATION, { encoding: 'utf-8' });
 
-      const expectedLines = sudoers.split(/(?:\r?\n)+/).map(line => line.trim());
-      const actualLines = existing.split(/(?:\r?\n)+/).map(line => line.trim());
-
-      for (const [index, [expected, actual]] of Object.entries(zip(expectedLines, actualLines))) {
-        if (expected !== actual) {
-          console.log(`${ LIMA_SUDOERS_LOCATION } mismatch on line ${ index + 1 }:\nexpected ${ expected } \n but got ${ actual }`);
-          updateSudoers = true;
-          break;
-        }
+      if (sudoers !== existingSudoers) {
+        updateSudoers = true;
       }
     } catch (ex: any) {
       if (ex?.code !== 'ENOENT') {
@@ -1288,15 +1390,13 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
 
     if (updateSudoers) {
       const tmpFile = path.join(os.tmpdir(), `rd-sudoers${ randomTag }.txt`);
+      const quotedTmpFile = quotePathForShell(tmpFile);
 
       await fs.promises.writeFile(tmpFile, sudoers, { mode: 0o644 });
-      commands.push(`mkdir -p "${ path.dirname(LIMA_SUDOERS_LOCATION) }" && cp "${ tmpFile }" ${ LIMA_SUDOERS_LOCATION } && rm -f "${ tmpFile }"`);
+      commands.push(`mkdir -p "${ path.dirname(LIMA_SUDOERS_LOCATION) }" && cp ${ quotedTmpFile } ${ LIMA_SUDOERS_LOCATION } && rm -f ${ quotedTmpFile }`);
       paths.push(LIMA_SUDOERS_LOCATION);
       console.debug(`Sudoers file ${ LIMA_SUDOERS_LOCATION } needs to be updated.`);
     }
-
-    // Rewrite network config again to use the proper executables
-    await this.installCustomLimaNetworkConfig(true, false);
 
     if (commands.length > 0) {
       return {
@@ -1351,7 +1451,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
 
     return {
       reason:   'docker-socket',
-      commands: [`ln -sf "${ targetPath }" "${ DEFAULT_DOCKER_SOCK_LOCATION }"`],
+      commands: [`ln -sf ${ quotePathForShell(targetPath) } "${ DEFAULT_DOCKER_SOCK_LOCATION }"`],
       paths:    [DEFAULT_DOCKER_SOCK_LOCATION],
     };
   }
@@ -1397,9 +1497,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
    */
   protected async sudoExec(this: unknown, command: string) {
     await new Promise<void>((resolve, reject) => {
-      const iconPath = path.join(paths.resources, 'icons', 'logo-square-512.png');
-
-      sudo.exec(command, { name: 'Rancher Desktop', icns: iconPath }, (error, stdout, stderr) => {
+      sudo(command, { name: 'Rancher Desktop' }, (error, stdout, stderr) => {
         if (stdout) {
           console.log(`Prompt for sudo: stdout: ${ stdout }`);
         }
@@ -1415,30 +1513,21 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
     });
   }
 
-  /** Path for the socket_vmnet executable, in the root-owned directory. */
-  protected safeVMNetExecutable = NETWORKS_CONFIG.paths.socketVMNet as string;
-
-  /**
-   * Path for the socket_vmnet executable, from the (user-writeable) application
-   * directory.  We use this temporarily for limactl to generate the sudoers
-   * file, but it is not actually executed from here.
-   */
-  protected unsafeVMNetExecutable = path.join(paths.resources, 'darwin/lima/socket_vmnet/bin/socket_vmnet');
-
   /**
    * Provide a default network config file with rancher-desktop specific settings.
    *
    * If there's an existing file, replace it if it doesn't contain a
-   * paths.varRun setting for rancher-desktop
+   * paths.varRun setting for rancher-desktop, or if a host or shared network
+   * has an address that is not IPv4.
    */
-  protected async installCustomLimaNetworkConfig(allowRoot = true, useUnsafeExecutables = false) {
+  protected async installCustomLimaNetworkConfig(allowRoot = true): Promise<LimaNetworkConfiguration> {
     const networkPath = path.join(paths.lima, '_config', 'networks.yaml');
 
     let config: LimaNetworkConfiguration;
 
     try {
       config = yaml.parse(await fs.promises.readFile(networkPath, 'utf8'));
-      if (config?.paths?.varRun !== NETWORKS_CONFIG.paths.varRun) {
+      if (config?.paths?.varRun !== NETWORKS_CONFIG.paths.varRun || !hasValidNetworkAddresses(config)) {
         const backupName = networkPath.replace(/\.yaml$/, '.orig.yaml');
 
         await fs.promises.rename(networkPath, backupName);
@@ -1452,15 +1541,14 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
       config = clone(NETWORKS_CONFIG);
     }
 
-    const key = 'socketVMNet';
+    config.paths['socketVMNet'] = '/opt/rancher-desktop/bin/socket_vmnet';
 
-    if (useUnsafeExecutables) {
-      if (!config.paths[key] || config.paths[key] === this.safeVMNetExecutable) {
-        config.paths[key] = this.unsafeVMNetExecutable;
-      }
-    } else if (!config.paths[key] || config.paths[key] === this.unsafeVMNetExecutable) {
-      config.paths[key] = this.safeVMNetExecutable;
-    }
+    // Clean up deprecated keys in config.paths, if present.
+    // These keys are no longer used and may cause errors
+    // during rdctl shutdown when upgrading to version
+    // 1.20.x or later.
+    delete (config.paths as any)['vdeSwitch'];
+    delete (config.paths as any)['vdeVMNet'];
 
     if (config.group === 'staff') {
       config.group = 'everyone';
@@ -1494,6 +1582,8 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
     }
 
     await fs.promises.writeFile(networkPath, yaml.stringify(config), { encoding: 'utf-8' });
+
+    return config;
   }
 
   /**
@@ -1510,6 +1600,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
   protected async configureContainerEngine(): Promise<void> {
     try {
       const configureWASM = !!this.cfg?.experimental?.containerEngine?.webAssembly?.enabled;
+      const mobyStorageDriver = this.cfg?.containerEngine?.mobyStorageDriver ?? 'auto';
 
       await this.writeFile('/usr/local/bin/nerdctl', NERDCTL, 0o755);
 
@@ -1520,9 +1611,16 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
 
       const promises: Promise<unknown>[] = [];
 
-      promises.push(BackendHelper.configureContainerEngine(this, configureWASM));
+      promises.push(BackendHelper.configureContainerEngine(this, configureWASM, mobyStorageDriver));
       if (configureWASM) {
-        promises.push(this.spawnWithCapture(executable('setup-spin')));
+        const version = semver.parse(DEPENDENCY_VERSIONS.spinCLI.version);
+        const env = {
+          ...process.env,
+          KUBE_PLUGIN_VERSION: DEPENDENCY_VERSIONS.spinKubePlugin.version,
+          SPIN_TEMPLATES_TAG:  (version ? `spin/templates/v${ version.major }.${ version.minor }` : 'unknown'),
+        };
+
+        promises.push(this.spawnWithCapture(executable('setup-spin'), { env }));
       }
       await Promise.all(promises);
     } catch (err) {
@@ -1545,10 +1643,10 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
 
       await new Promise<void>((resolve, reject) => {
         proc.stdout?.on('data', (chunk: Buffer | string) => {
-          stdout.push(Buffer.from(chunk));
+          stdout.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
         });
         proc.stderr?.on('data', (chunk: Buffer | string) => {
-          stderr.push(Buffer.from(chunk));
+          stderr.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
         });
         proc.on('error', reject);
         proc.on('exit', (code, signal) => {
@@ -1622,7 +1720,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
     try {
       const ipAddr = await this.execCommand({ capture: true },
         'ip', '--family', 'inet', 'addr', 'show', iface);
-      const match = ipAddr.match(' inet ([0-9.]+)');
+      const match = / inet ([0-9.]+)/.exec(ipAddr);
 
       return match ? match[1] : '';
     } catch (ex: any) {
@@ -1657,7 +1755,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
       }
       console.log(`Neither bridged network rd0 nor shared network rd1 have an IPv4 address`);
     }
-    if (this.cfg?.experimental.virtualMachine.type === VMType.VZ) {
+    if (this.cfg?.virtualMachine.type === VMType.VZ) {
       const vznatIP = await this.getInterfaceAddr('vznat');
 
       if (vznatIP) {
@@ -1676,13 +1774,13 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
    */
   protected noBridgedNetworkDialog(sharedIP: string) {
     const options: Electron.NotificationConstructorOptions = {
-      title: 'Bridged network did not get an IP address.',
-      body:  `Using shared network address ${ sharedIP }`,
+      title: t('dialog.bridgedNetwork.title'),
+      body:  t('dialog.bridgedNetwork.sharedFallback', { ip: sharedIP }),
       icon:  'info',
     };
 
     if (!sharedIP) {
-      options.body = "Shared network isn't available either. Only network access is via port forwarding to the host.";
+      options.body = t('dialog.bridgedNetwork.noNetwork');
     }
 
     this.emit('show-notification', options);
@@ -1699,7 +1797,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
     try {
       const limaEnv = await this.execCommand({ capture: true, root: true },
         'grep', 'LIMA_CIDATA_SLIRP_DNS', '/mnt/lima-cidata/lima.env');
-      const match = limaEnv.match('LIMA_CIDATA_SLIRP_DNS=([0-9.]+)');
+      const match = /LIMA_CIDATA_SLIRP_DNS=([0-9.]+)/.exec(limaEnv);
 
       return match ? match[1] : SLIRP.DNS;
     } catch (ex: any) {
@@ -1748,6 +1846,32 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
   }
 
   /**
+   * Instances created before Lima 0.20 lack a recorded Lima version. Lima treats an
+   * instance without the version file as newly created, and since 2.1.0 that moves the
+   * guest home directory from `/home/<user>.linux` to `/home/<user>.guest`. The persistent
+   * data volume keeps the old home directory, so provisioning fails and the VM never
+   * finishes booting.
+   * https://github.com/rancher-sandbox/rancher-desktop/issues/10610
+   */
+  protected async recordLegacyLimaVersion() {
+    const versionPath = path.join(paths.lima, MACHINE_NAME, 'lima-version');
+
+    try {
+      // `wx` writes only when the instance directory exists without a version file:
+      // EEXIST means the version is already recorded, and ENOENT that Lima has yet to
+      // create the instance, recording its own version when it does.
+      await fs.promises.writeFile(versionPath, LEGACY_LIMA_VERSION, { flag: 'wx', mode: 0o444 });
+      console.log(`Recorded Lima version ${ LEGACY_LIMA_VERSION } for pre-existing instance.`);
+    } catch (ex) {
+      const { code } = ex as NodeJS.ErrnoException;
+
+      if (code !== 'EEXIST' && code !== 'ENOENT') {
+        console.error(`Failed to write ${ versionPath }:`, ex);
+      }
+    }
+  }
+
+  /**
    * Start the VM.  If the machine is already started, this does nothing.
    * Note that this does not start k3s.
    * @precondition The VM configuration is correct.
@@ -1757,19 +1881,23 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
 
     // We need both the lima config + the lima network config to correctly check if we need sudo
     // access; but if it's denied, we need to regenerate both again to account for the change.
-    allowRoot &&= await this.progressTracker.action('Asking for permission to run tasks as administrator', 100, this.installToolsWithSudo());
+    allowRoot &&= await this.progressTracker.action(t('progress.askingPermission'), 100, this.installToolsWithSudo());
 
     if (!allowRoot) {
       // sudo access was denied; re-generate the config.
-      await this.progressTracker.action('Regenerating configuration to account for lack of permissions', 100, Promise.all([
+      await this.progressTracker.action(t('progress.regeneratingConfiguration'), 100, Promise.all([
         this.updateConfig(false),
         this.installCustomLimaNetworkConfig(false),
       ]));
     }
 
-    await this.progressTracker.action('Starting virtual machine', 100, async() => {
+    await this.progressTracker.action(t('progress.startingVirtualMachine'), 100, async() => {
       try {
-        await this.lima('start', '--tty=false', await this.isRegistered ? MACHINE_NAME : this.CONFIG_PATH);
+        const env: NodeJS.ProcessEnv = {};
+
+        env.LIMA_SSH_PORT_FORWARDER = this.cfg?.experimental.virtualMachine.sshPortForwarder ? 'true' : 'false';
+        await this.recordLegacyLimaVersion();
+        await this.lima(env, 'start', '--tty=false', await this.isRegistered ? MACHINE_NAME : this.CONFIG_PATH);
       } finally {
         // Symlink the logs (especially if start failed) so the users can find them
         const machineDir = path.join(paths.lima, MACHINE_NAME);
@@ -1799,12 +1927,12 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
     this.currentAction = Action.STARTING;
     this.#adminAccess = config_.application.adminAccess ?? true;
     this.#containerEngineClient = undefined;
-    await this.progressTracker.action('Starting Backend', 10, async() => {
+    await this.progressTracker.action(t('progress.startingBackend'), 10, async() => {
       try {
         this.ensureArchitectureMatch();
         await Promise.all([
-          this.progressTracker.action('Ensuring virtualization is supported', 50, this.ensureVirtualizationSupported()),
-          this.progressTracker.action('Updating cluster configuration', 50, this.updateConfig(this.#adminAccess)),
+          this.progressTracker.action(t('progress.ensuringVirtualizationSupported'), 50, this.ensureVirtualizationSupported()),
+          this.progressTracker.action(t('progress.updatingClusterConfiguration'), 50, this.updateConfig(this.#adminAccess)),
         ]);
 
         if (this.currentAction !== Action.STARTING) {
@@ -1812,33 +1940,56 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
           return;
         }
 
-        const vmStatus = await this.status;
+        let vmStatus = await this.status;
+
+        // Recover from an orphaned driver or host agent after an unclean
+        // shutdown; otherwise `limactl start` would fail.
+        // https://github.com/rancher-sandbox/rancher-desktop/issues/7760
+        if (vmStatus?.status === 'Broken') {
+          const orphanError = vmStatus.errors?.find(e => /(driver|host agent) is running but/.test(e));
+
+          if (orphanError) {
+            console.log(`Lima instance is broken (${ orphanError }); cleaning up before restart.`);
+            await this.progressTracker.action(t('progress.recoveringBrokenVirtualMachine'), 100,
+              this.lima('stop', '--force', MACHINE_NAME));
+            vmStatus = await this.status;
+          }
+        }
         let isVMAlreadyRunning = vmStatus?.status === 'Running';
 
         // Virtualization Framework only supports RAW disks
-        if (vmStatus && config.experimental.virtualMachine.type === VMType.VZ) {
-          const diffdisk = path.join(paths.lima, MACHINE_NAME, 'diffdisk');
-          const { format } = await this.imageInfo(diffdisk);
+        if (vmStatus && config.virtualMachine.type === VMType.VZ) {
+          const diskPath = await this.instanceDiskPath('disk', 'diffdisk');
+          const { format } = await this.imageInfo(diskPath);
 
           if (format === ImageFormat.QCOW2) {
             if (isVMAlreadyRunning) {
               await this.lima('stop', MACHINE_NAME);
               isVMAlreadyRunning = false;
             }
-            await this.convertToRaw(diffdisk);
+            await this.convertToRaw(diskPath);
           }
         }
         // Start the VM; if it's already running, this does nothing.
         await this.startVM();
 
+        // Clear the diagnostic about not having Kubernetes versions
+        mainEvents.emit('diagnostics-event', { id: 'kube-versions-available', available: true });
+
         if (config.kubernetes.enabled) {
           [kubernetesVersion, isDowngrade] = await this.kubeBackend.download(config);
 
-          if (typeof (kubernetesVersion) === 'undefined') {
-            // The desired version was unavailable, and the user declined a downgrade.
-            await this.setState(State.ERROR);
+          if (kubernetesVersion === undefined) {
+            if (isDowngrade) {
+              // The desired version was unavailable, and the user declined a downgrade.
+              await this.setState(State.ERROR);
 
-            return;
+              return;
+            }
+            // The desired version was unavailable, and we couldn't find a fallback.
+            // Notify the user, and turn off Kubernetes.
+            mainEvents.emit('diagnostics-event', { id: 'kube-versions-available', available: false });
+            this.writeSetting({ kubernetes: { enabled: false } });
           }
         }
 
@@ -1848,7 +1999,7 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
         }
 
         if ((await this.status)?.status === 'Running') {
-          await this.progressTracker.action('Stopping existing instance', 100, async() => {
+          await this.progressTracker.action(t('progress.stoppingExistingInstance'), 100, async() => {
             await this.kubeBackend.stop();
             if (isDowngrade && isVMAlreadyRunning) {
               // If we're downgrading, stop the VM (and start it again immediately),
@@ -1869,10 +2020,10 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
         }
 
         await Promise.all([
-          this.progressTracker.action('Installing CA certificates', 50, this.installCACerts()),
-          this.progressTracker.action('Configuring image proxy', 50, this.configureOpenResty(config)),
-          this.progressTracker.action('Configuring container engine', 50, this.configureContainerEngine()),
-          this.progressTracker.action('Configuring logrotate', 50, this.configureLogrotate()),
+          this.progressTracker.action(t('progress.installingCaCertificates'), 50, this.installCACerts()),
+          this.progressTracker.action(t('progress.configuringImageProxy'), 50, this.configureOpenResty(config)),
+          this.progressTracker.action(t('progress.configuringContainerEngine'), 50, this.configureContainerEngine()),
+          this.progressTracker.action(t('progress.configuringLogrotate'), 50, this.configureLogrotate()),
         ]);
 
         if (config.containerEngine.allowedImages.enabled) {
@@ -1892,20 +2043,25 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
           }
           break;
         case ContainerEngine.MOBY:
+          // The string is for shell expansion, not a JS template string.
+          // eslint-disable-next-line no-template-curly-in-string
+          await this.writeConf('docker', { DOCKER_OPTS: '--host=unix:///var/run/docker.sock --host=unix:///var/run/docker.sock.raw ${DOCKER_OPTS:-}' });
           await this.startService('docker');
           break;
         case ContainerEngine.NONE:
           throw new Error('No container engine is set');
         }
+
+        const tasks = [
+          this.progressTracker.action(t('progress.installingBuildkit'), 50, this.writeBuildkitScripts()),
+          this.progressTracker.action(t('progress.installingImageScanner'), 50, this.installTrivy()),
+          this.progressTracker.action(t('progress.installingCredentialHelper'), 50, this.installCredentialHelper()),
+        ];
         if (kubernetesVersion) {
-          await this.kubeBackend.install(config, kubernetesVersion, this.#adminAccess);
+          tasks.push(this.kubeBackend.install(config, kubernetesVersion, this.#adminAccess));
         }
 
-        await this.progressTracker.action('Installing Buildkit', 50, this.writeBuildkitScripts());
-        await Promise.all([
-          this.progressTracker.action('Installing image scanner', 50, this.installTrivy()),
-          this.progressTracker.action('Installing credential helper', 50, this.installCredentialHelper()),
-        ]);
+        await Promise.all(tasks);
 
         if (this.currentAction !== Action.STARTING) {
           // User aborted
@@ -1915,9 +2071,10 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
         switch (config.containerEngine.name) {
         case ContainerEngine.MOBY:
           this.#containerEngineClient = new MobyClient(this, `unix://${ path.join(paths.altAppHome, 'docker.sock') }`);
-          await this.dockerDirManager.ensureDockerContextConfigured(
-            this.#adminAccess,
-            path.join(paths.altAppHome, 'docker.sock'));
+          await this.progressTracker.action(t('progress.settingDockerContext'), 50,
+            dockerDirManager.ensureDockerContextConfigured(
+              this.#adminAccess,
+              path.join(paths.altAppHome, 'docker.sock')));
           break;
         case ContainerEngine.CONTAINERD:
           await this.execCommand({ root: true }, '/sbin/rc-service', '--ifnotstarted', 'buildkitd', 'start');
@@ -1925,23 +2082,21 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
           break;
         }
 
-        await this.#containerEngineClient.waitForReady();
+        const actions = [
+          this.progressTracker.action(t('progress.waitingForContainerEngine'), 50,
+            this.#containerEngineClient.waitForReady()),
+        ];
 
         if (kubernetesVersion) {
-          await this.kubeBackend.start(config, kubernetesVersion);
+          actions.push(this.kubeBackend.start(config, kubernetesVersion));
         }
-        if (config.containerEngine.name === ContainerEngine.MOBY) {
-        }
+
+        await Promise.all(actions);
 
         await this.setState(config.kubernetes.enabled ? State.STARTED : State.DISABLED);
       } catch (err) {
         console.error('Error starting lima:', err);
         await this.setState(State.ERROR);
-        if (err instanceof BackendError) {
-          if (!err.fatal) {
-            return;
-          }
-        }
         throw err;
       } finally {
         this.currentAction = Action.NONE;
@@ -1950,47 +2105,54 @@ export default class LimaBackend extends events.EventEmitter implements VMBacken
   }
 
   protected async startService(serviceName: string) {
-    await this.progressTracker.action(`Starting ${ serviceName }`, 50, async() => {
+    await this.progressTracker.action(t('progress.startingService', { service: serviceName }), 50, async() => {
       await this.execCommand({ root: true }, '/sbin/rc-service', '--ifnotstarted', serviceName, 'start');
     });
   }
 
   protected async installCACerts(): Promise<void> {
-    const certs: (string | Buffer)[] = await new Promise((resolve) => {
-      mainEvents.once('cert-ca-certificates', resolve);
-      mainEvents.emit('cert-get-ca-certificates');
-    });
+    const certs = await this.progressTracker.action(t('progress.fetchingCertificates'), 56,
+      new Promise<(string | Buffer)[]>((resolve) => {
+        mainEvents.once('cert-ca-certificates', resolve);
+        mainEvents.emit('cert-get-ca-certificates');
+      }));
 
     const workdir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'rd-ca-'));
 
     try {
-      await this.execCommand({ root: true }, '/bin/sh', '-c', 'rm -f /usr/local/share/ca-certificates/rd-*.crt');
+      await this.progressTracker.action(t('progress.removingExistingCertificates'), 50,
+        this.execCommand({ root: true }, '/bin/sh', '-c', 'rm -f /usr/local/share/ca-certificates/rd-*.crt'));
 
       if (certs && certs.length > 0) {
-        const writeStream = fs.createWriteStream(path.join(workdir, 'certs.tar'));
-        const archive = tar.pack();
-        const archiveFinished = util.promisify(stream.finished)(archive);
+        await this.progressTracker.action(t('progress.bundlingCertificates'), 50, async function() {
+          const writeStream = fs.createWriteStream(path.join(workdir, 'certs.tar'));
+          const archive = tar.pack();
+          const archiveFinished = tarStreamFinished(archive);
 
-        archive.pipe(writeStream);
+          archive.pipe(writeStream);
 
-        for (const [index, cert] of certs.entries()) {
-          const curried = archive.entry.bind(archive, {
-            name: `rd-${ index }.crt`,
-            mode: 0o600,
-          }, cert);
+          for (const [index, cert] of certs.entries()) {
+            const curried = archive.entry.bind(archive, {
+              name: `rd-${ index }.crt`,
+              mode: 0o600,
+            }, cert);
 
-          await util.promisify(curried)();
-        }
-        archive.finalize();
-        await archiveFinished;
+            await util.promisify(curried)();
+          }
+          archive.finalize();
+          await archiveFinished;
+        });
 
-        await this.lima('copy', path.join(workdir, 'certs.tar'), `${ MACHINE_NAME }:/tmp/certs.tar`);
-        await this.execCommand({ root: true }, 'tar', 'xf', '/tmp/certs.tar', '-C', '/usr/local/share/ca-certificates/');
+        await this.progressTracker.action(t('progress.copyingCertificates'), 50,
+          this.lima('copy', path.join(workdir, 'certs.tar'), `${ MACHINE_NAME }:/tmp/certs.tar`));
+        await this.progressTracker.action(t('progress.extractingCertificates'), 50,
+          this.execCommand({ root: true }, 'tar', 'xf', '/tmp/certs.tar', '-C', '/usr/local/share/ca-certificates/'));
       }
     } finally {
       await fs.promises.rm(workdir, { recursive: true, force: true });
     }
-    await this.execCommand({ root: true }, 'update-ca-certificates');
+    await this.progressTracker.action(t('progress.runningUpdateCaCertificates'), 50,
+      this.execCommand({ root: true }, 'update-ca-certificates'));
   }
 
   protected async installCredentialHelper() {
@@ -2040,7 +2202,7 @@ CREDFWD_URL='http://${ SLIRP.HOST_GATEWAY }:${ stateInfo.port }'
     this.currentAction = Action.STOPPING;
     this.#containerEngineClient = undefined;
 
-    await this.progressTracker.action('Stopping services', 10, async() => {
+    await this.progressTracker.action(t('progress.stoppingServices'), 10, async() => {
       try {
         await this.setState(State.STOPPING);
 
@@ -2071,7 +2233,7 @@ CREDFWD_URL='http://${ SLIRP.HOST_GATEWAY }:${ stateInfo.port }'
               throw ex;
             }
           }
-          await this.dockerDirManager.clearDockerContext();
+          await dockerDirManager.clearDockerContext();
         }
         await this.setState(State.STOPPED);
       } catch (ex) {
@@ -2087,7 +2249,7 @@ CREDFWD_URL='http://${ SLIRP.HOST_GATEWAY }:${ stateInfo.port }'
     try {
       if (await this.isRegistered) {
         await this.progressTracker.action(
-          'Deleting virtual machine',
+          t('progress.deletingVirtualMachine'),
           10,
           this.lima('delete', '--force', MACHINE_NAME));
       }
@@ -2100,7 +2262,7 @@ CREDFWD_URL='http://${ SLIRP.HOST_GATEWAY }:${ stateInfo.port }'
   }
 
   async reset(config: BackendSettings): Promise<void> {
-    await this.progressTracker.action('Resetting Kubernetes', 5, async() => {
+    await this.progressTracker.action(t('progress.resettingKubernetes'), 5, async() => {
       await this.stop();
       // Start the VM, so that we can delete files.
       await this.startVM();
@@ -2124,14 +2286,16 @@ CREDFWD_URL='http://${ SLIRP.HOST_GATEWAY }:${ stateInfo.port }'
       'experimental.virtualMachine.mount.9p.msizeInKib':      undefined,
       'experimental.virtualMachine.mount.9p.protocolVersion': undefined,
       'experimental.virtualMachine.mount.9p.securityModel':   undefined,
-      'experimental.virtualMachine.mount.type':               undefined,
-      'experimental.virtualMachine.useRosetta':               undefined,
-      'experimental.virtualMachine.type':                     undefined,
+      'experimental.virtualMachine.sshPortForwarder':         undefined,
+      'virtualMachine.mount.type':                            undefined,
+      'virtualMachine.type':                                  undefined,
+      'virtualMachine.useRosetta':                            undefined,
     }));
     if (limaConfig) {
       Object.assign(reasons, await this.kubeBackend.requiresRestartReasons(this.cfg, cfg, {
-        'virtualMachine.memoryInGB': { current: (limaConfig.memory ?? 4 * GiB) / GiB },
-        'virtualMachine.numberCPUs': { current: limaConfig.cpus ?? 2 },
+        'experimental.virtualMachine.diskSize': { current: limaConfig.disk ?? '100GiB' },
+        'virtualMachine.memoryInGB':            { current: (limaConfig.memory ?? 4 * GiB) / GiB },
+        'virtualMachine.numberCPUs':            { current: limaConfig.cpus ?? 2 },
       }));
     }
 
@@ -2150,8 +2314,8 @@ CREDFWD_URL='http://${ SLIRP.HOST_GATEWAY }:${ stateInfo.port }'
   }
 
   // #region Events
-  eventNames(): Array<keyof BackendEvents> {
-    return super.eventNames() as Array<keyof BackendEvents>;
+  eventNames(): (keyof BackendEvents)[] {
+    return super.eventNames() as (keyof BackendEvents)[];
   }
 
   listeners<eventName extends keyof BackendEvents>(

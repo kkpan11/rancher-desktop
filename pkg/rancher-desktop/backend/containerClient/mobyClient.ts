@@ -8,7 +8,7 @@ import _ from 'lodash';
 import tar from 'tar-stream';
 
 import {
-  ContainerComposeExecOptions, ReadableProcess, ContainerComposeOptions,
+  ContainerComposeExecOptions, ReadableProcess, WritableReadableProcess, ContainerComposeOptions,
   ContainerEngineClient, ContainerRunOptions, ContainerStopOptions,
   ContainerRunClientOptions, ContainerComposePortOptions, ContainerBasicOptions,
 } from './types';
@@ -20,6 +20,7 @@ import { parseImageReference } from '@pkg/utils/dockerUtils';
 import Logging, { Log } from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
 import { executable } from '@pkg/utils/resources';
+import { tarStreamFinished } from '@pkg/utils/tarStream';
 import { defined } from '@pkg/utils/typeUtils';
 
 const console = Logging.moby;
@@ -35,7 +36,7 @@ export class MobyClient implements ContainerEngineClient {
     this.endpoint = endpoint;
   }
 
-  readonly vm: VMExecutor;
+  readonly vm:       VMExecutor;
   readonly executable = executable('docker');
   readonly endpoint: string;
 
@@ -66,20 +67,39 @@ export class MobyClient implements ContainerEngineClient {
 
   async waitForReady(): Promise<void> {
     let successCount = 0;
+    let failureCount = 0;
+    let lastOutput = { stdout: '', stderr: '' };
 
     // Wait for ten consecutive successes, clearing out successCount whenever we
-    // hit an error.  In the ideal case this is a ten-second delay in startup
+    // hit an error.  In the ideal case this is a five-second delay in startup
     // time.  We use `docker system info` because that needs to talk to the
     // socket to fetch data about the engine (and it returns an error if it
     // fails to do so).
     while (successCount < 10) {
       try {
-        await this.runClient(['system', 'info'], 'ignore');
+        await this.runClient(['system', 'info'], 'pipe');
         successCount++;
+        failureCount = 0;
       } catch (ex) {
         successCount = 0;
+        failureCount++;
+        // If we've been erroring for a while, log the output.
+        if (failureCount > 10 && ex && typeof ex === 'object') {
+          const output = { stdout: '', stderr: '' };
+
+          if ('stdout' in ex && typeof ex.stdout === 'string') {
+            output.stdout = ex.stdout;
+          }
+          if ('stderr' in ex && typeof ex.stderr === 'string') {
+            output.stderr = ex.stderr;
+          }
+          if (output.stdout !== lastOutput.stdout || output.stderr !== lastOutput.stderr) {
+            console.error(`Failed to run docker system info after ${ failureCount } failures (will retry):`, output);
+            lastOutput = output;
+          }
+        }
       }
-      await util.promisify(setTimeout)(1_000);
+      await util.promisify(setTimeout)(500);
     }
   }
 
@@ -208,7 +228,7 @@ export class MobyClient implements ContainerEngineClient {
         } else {
           links[linkName] = path.posix.join(path.posix.dirname(entry.header.name), realName);
         }
-        await stream.promises.finished(entry.resume());
+        await tarStreamFinished(entry.resume());
         break;
       }
       case 'directory': {
@@ -219,7 +239,7 @@ export class MobyClient implements ContainerEngineClient {
           continue;
         }
         await fs.promises.mkdir(dirName, { recursive: true });
-        await stream.promises.finished(entry.resume());
+        await tarStreamFinished(entry.resume());
         console.debug(`Created directory ${ dirName }`);
 
         break;
@@ -267,7 +287,7 @@ export class MobyClient implements ContainerEngineClient {
 
       if (linkNames.length === 0) {
         // This entry isn't a link target
-        await stream.promises.finished(entry.resume());
+        await tarStreamFinished(entry.resume());
         continue;
       }
       switch (entry.header.type) {
@@ -334,7 +354,7 @@ export class MobyClient implements ContainerEngineClient {
       default:
         console.info(`Ignoring unsupported file type ${ entry.header.name } (${ entry.header.type })`);
       }
-      await stream.promises.finished(entry.resume());
+      await tarStreamFinished(entry.resume());
     }
 
     // Handle symlinks that were not found
@@ -469,13 +489,25 @@ export class MobyClient implements ContainerEngineClient {
   runClient(args: string[], stdio: Log, options?: runClientOptions): Promise<Record<string, never>>;
   runClient(args: string[], stdio: 'pipe', options?: runClientOptions): Promise<{ stdout: string; stderr: string; }>;
   runClient(args: string[], stdio: 'stream', options?: runClientOptions): ReadableProcess;
-  runClient(args: string[], stdio?: 'ignore' | 'pipe' | 'stream' | Log, options?: runClientOptions) {
-    const binDir = path.join(paths.resources, process.platform, 'bin');
-    const executable = path.resolve(binDir, options?.executable ?? this.executable);
-    const opts = _.merge({}, options ?? {}, {
+  runClient(args: string[], stdio: 'interactive', options?: runClientOptions): WritableReadableProcess;
+  runClient(args: string[], stdio?: 'ignore' | 'pipe' | 'stream' | 'interactive' | Log, options?: runClientOptions) {
+    // Always add the `bin` directory, as docker CLI plugins may need them too.
+    const dirsToAdd = [path.join(paths.resources, process.platform, 'bin')];
+    const executableName = options?.executable ?? this.executable;
+    const isCLIPlugin = /^docker-(?!credential-)/.test(executableName);
+
+    const binType = isCLIPlugin ? 'docker-cli-plugins' : 'bin';
+    const executableDir = path.join(paths.resources, process.platform, binType);
+    const executable = path.resolve(executableDir, executableName);
+
+    if (isCLIPlugin) {
+      dirsToAdd.push(executableDir);
+    }
+
+    const opts = _.merge({ env: _.merge({}, process.env) }, options ?? {}, {
       env: {
         DOCKER_HOST: this.endpoint,
-        PATH:        `${ process.env.PATH }${ path.delimiter }${ binDir }`,
+        PATH:        `${ process.env.PATH }${ path.delimiter }${ dirsToAdd.join(path.delimiter) }`,
       },
     });
 
@@ -486,6 +518,8 @@ export class MobyClient implements ContainerEngineClient {
       return spawnFile(executable, args, { ...opts, stdio: 'ignore' });
     case 'stream':
       return spawn(executable, args, { ...opts, stdio: ['ignore', 'pipe', 'pipe'] });
+    case 'interactive':
+      return spawn(executable, args, { ...opts, stdio: 'pipe' });
     case 'pipe':
       return spawnFile(executable, args, { ...opts, stdio: 'pipe' });
     }

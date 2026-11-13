@@ -61,9 +61,6 @@ class E2ETestRunner extends events.EventEmitter {
     const args = processArgsForPlaywright(process.argv);
     const spawnArgs = ['node_modules/@playwright/test/cli.js', 'test', '--config=e2e/config/playwright-config.ts'];
 
-    if (process.env.CI) {
-      spawnArgs.push('--retries=2');
-    }
     this.#testProcess = this.spawn('Test process', 'node', ...spawnArgs, ...args);
 
     return new Promise((resolve, reject) => {
@@ -87,14 +84,23 @@ class E2ETestRunner extends events.EventEmitter {
   /**
    * Start the renderer process.
    */
-  buildRenderer(): Promise<void> {
-    process.env.VUE_CLI_SERVICE_CONFIG_PATH = 'pkg/rancher-desktop/vue.config.js';
+  async buildRenderer(): Promise<void> {
+    process.env.VUE_CLI_SERVICE_CONFIG_PATH = 'pkg/rancher-desktop/vue.config.mjs';
 
     return buildUtils.spawn(
-      'node_modules/.bin/vue-cli-service',
+      process.execPath,
+      '--stack-size=16384',
+      'node_modules/@vue/cli-service/bin/vue-cli-service.js',
       'build',
       '--skip-plugins',
       'eslint',
+      {
+        env: {
+          ...process.env,
+          RD_DOCS_URL: await buildUtils.docsUrl,
+          RD_VERSION:  await buildUtils.version,
+        },
+      },
     );
   }
 
@@ -112,10 +118,7 @@ class E2ETestRunner extends events.EventEmitter {
           ].join('\n'));
         }
       }
-      process.env.RD_TEST = 'e2e';
-
-      // Set feature flags
-      process.env.RD_ENV_EXTENSIONS = '1';
+      process.env.RD_TEST = process.env.npm_lifecycle_event || 'e2e'; // May include "screenshots"
 
       // Start the renderer process and wait for it to complete the build.
       await this.buildRenderer();
@@ -184,6 +187,6 @@ function processArgsForPlaywright(args: string[]): string[] {
   }
 
   return args.map((s) => {
-    return s[0] === '-' ? s : escapeUnescapedBackslashes(s);
+    return s.startsWith('-') ? s : escapeUnescapedBackslashes(s);
   });
 }

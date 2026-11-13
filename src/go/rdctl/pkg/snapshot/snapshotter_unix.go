@@ -19,6 +19,9 @@ type snapshotFile struct {
 	WorkingPath string
 	// The path that the file is put at in a snapshot.
 	SnapshotPath string
+	// Fallback path for restoring snapshots written by older versions of
+	// Rancher Desktop, which used different filenames. Empty if unchanged.
+	LegacySnapshotPath string
 	// Whether clonefile (macOS) or ioctl_ficlone (Linux) should be used
 	// when copying the file around.
 	CopyOnWrite bool
@@ -28,7 +31,15 @@ type snapshotFile struct {
 	FileMode os.FileMode
 }
 
-func (snapshotter SnapshotterImpl) Files(appPaths paths.Paths, snapshotDir string) []snapshotFile {
+// SnapshotterImpl also works as a *Manager receiver
+type SnapshotterImpl struct {
+}
+
+func NewSnapshotterImpl() Snapshotter {
+	return SnapshotterImpl{}
+}
+
+func (snapshotter SnapshotterImpl) Files(appPaths *paths.Paths, snapshotDir string) []snapshotFile {
 	files := []snapshotFile{
 		{
 			WorkingPath:  filepath.Join(appPaths.Config, "settings.json"),
@@ -45,18 +56,20 @@ func (snapshotter SnapshotterImpl) Files(appPaths paths.Paths, snapshotDir strin
 			FileMode:     0o644,
 		},
 		{
-			WorkingPath:  filepath.Join(appPaths.Lima, "0", "basedisk"),
-			SnapshotPath: filepath.Join(snapshotDir, "basedisk"),
-			CopyOnWrite:  true,
-			MissingOk:    false,
-			FileMode:     0o644,
+			WorkingPath:        filepath.Join(appPaths.Lima, "0", "iso"),
+			SnapshotPath:       filepath.Join(snapshotDir, "iso"),
+			LegacySnapshotPath: filepath.Join(snapshotDir, "basedisk"),
+			CopyOnWrite:        true,
+			MissingOk:          false,
+			FileMode:           0o644,
 		},
 		{
-			WorkingPath:  filepath.Join(appPaths.Lima, "0", "diffdisk"),
-			SnapshotPath: filepath.Join(snapshotDir, "diffdisk"),
-			CopyOnWrite:  true,
-			MissingOk:    false,
-			FileMode:     0o644,
+			WorkingPath:        filepath.Join(appPaths.Lima, "0", "disk"),
+			SnapshotPath:       filepath.Join(snapshotDir, "disk"),
+			LegacySnapshotPath: filepath.Join(snapshotDir, "diffdisk"),
+			CopyOnWrite:        true,
+			MissingOk:          false,
+			FileMode:           0o644,
 		},
 		{
 			WorkingPath:  filepath.Join(appPaths.Lima, "_config", "user"),
@@ -83,19 +96,10 @@ func (snapshotter SnapshotterImpl) Files(appPaths paths.Paths, snapshotDir strin
 	return files
 }
 
-// SnapshotterImpl also works as a *Manager receiver
-type SnapshotterImpl struct {
-}
-
-func NewSnapshotterImpl() Snapshotter {
-	return SnapshotterImpl{}
-}
-
-func (snapshotter SnapshotterImpl) CreateFiles(ctx context.Context, appPaths paths.Paths, snapshotDir string) error {
+func (snapshotter SnapshotterImpl) CreateFiles(ctx context.Context, appPaths *paths.Paths, snapshotDir string) error {
 	taskRunner := runner.NewTaskRunner(ctx)
 	files := snapshotter.Files(appPaths, snapshotDir)
 	for _, file := range files {
-		file := file
 		taskRunner.Add(func() error {
 			err := copyFile(file.SnapshotPath, file.WorkingPath, file.CopyOnWrite, file.FileMode)
 			if errors.Is(err, os.ErrNotExist) && file.MissingOk {
@@ -122,14 +126,21 @@ func (snapshotter SnapshotterImpl) CreateFiles(ctx context.Context, appPaths pat
 
 // Restores the files from their location in a snapshot directory
 // to their working location.
-func (snapshotter SnapshotterImpl) RestoreFiles(ctx context.Context, appPaths paths.Paths, snapshotDir string) error {
+func (snapshotter SnapshotterImpl) RestoreFiles(ctx context.Context, appPaths *paths.Paths, snapshotDir string) error {
 	taskRunner := runner.NewTaskRunner(ctx)
 	files := snapshotter.Files(appPaths, snapshotDir)
 	for _, file := range files {
-		file := file
 		taskRunner.Add(func() error {
 			filename := filepath.Base(file.WorkingPath)
-			err := copyFile(file.WorkingPath, file.SnapshotPath, file.CopyOnWrite, file.FileMode)
+			snapshotPath := file.SnapshotPath
+			// Older snapshots stored the VM disk under Lima's legacy filenames;
+			// fall back to them so those snapshots stay restorable.
+			if file.LegacySnapshotPath != "" {
+				if _, statErr := os.Stat(snapshotPath); errors.Is(statErr, os.ErrNotExist) {
+					snapshotPath = file.LegacySnapshotPath
+				}
+			}
+			err := copyFile(file.WorkingPath, snapshotPath, file.CopyOnWrite, file.FileMode)
 			if errors.Is(err, os.ErrNotExist) && file.MissingOk {
 				if err := os.RemoveAll(file.WorkingPath); err != nil {
 					return fmt.Errorf("failed to remove %q: %w", filename, err)

@@ -1,6 +1,6 @@
 <template>
   <div>
-    <nuxt-child />
+    <RouterView />
     <Images
       class="content"
       data-test="imagesTable"
@@ -11,55 +11,64 @@
       :selected-namespace="settings.images.namespace"
       :supports-namespaces="supportsNamespaces"
       :protected-images="protectedImages"
-      @toggledShowAll="onShowAllImagesChanged"
-      @switchNamespace="onChangeNamespace"
+      @toggled-show-all="onShowAllImagesChanged"
+      @switch-namespace="onChangeNamespace"
     />
   </div>
 </template>
 
-<script>
+<script lang="ts">
 
 import _ from 'lodash';
-import { mapGetters } from 'vuex';
+import { defineComponent } from 'vue';
 
 import { State as K8sState } from '@pkg/backend/backend';
 import Images from '@pkg/components/Images.vue';
 import { defaultSettings } from '@pkg/config/settings';
+import { mapTypedActions, mapTypedGetters, mapTypedMutations, mapTypedState } from '@pkg/entry/store';
+import { IpcRendererEvents } from '@pkg/typings/electron-ipc';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
 
-const ImageMangerStates = Object.freeze({
-  UNREADY: 'IMAGE_MANAGER_UNREADY',
-  READY:   'READY',
-});
+type Image = Parameters<IpcRendererEvents['images-changed']>[0][number];
 
-export default {
+enum ImageManagerStates {
+  UNREADY = 'IMAGE_MANAGER_UNREADY',
+  READY = 'READY',
+}
+
+export default defineComponent({
   components: { Images },
   data() {
     return {
       settings:           defaultSettings,
-      images:             [],
-      imageNamespaces:    [],
+      images:             [] as Image[],
+      imageNamespaces:    [] as string[],
       supportsNamespaces: true,
     };
   },
 
   computed: {
     state() {
-      if (![K8sState.STARTED, K8sState.DISABLED].includes(this.k8sState)) {
-        return ImageMangerStates.UNREADY;
+      if ((window as any).imagesListMock) {
+        // Override for screenshots
+        return ImageManagerStates.READY;
       }
 
-      return this.imageManagerState ? ImageMangerStates.READY : ImageMangerStates.UNREADY;
+      if (![K8sState.STARTED, K8sState.DISABLED].includes(this.k8sState)) {
+        return ImageManagerStates.UNREADY;
+      }
+
+      return this.imageManagerState ? ImageManagerStates.READY : ImageManagerStates.UNREADY;
     },
-    rancherImages() {
+    rancherImages(): string[] {
       return this.images
-        .filter(image => image.imageName.startsWith('rancher/'))
-        .map(image => image.imageName);
+        .map(image => image.imageName)
+        .filter(name => name.startsWith('rancher/'));
     },
-    installedExtensionImages() {
-      return this.extensions.map(image => image.id);
+    installedExtensionImages(): string[] {
+      return this.installedExtensions.map(image => image.id);
     },
-    protectedImages() {
+    protectedImages(): string[] {
       return [
         'moby/buildkit',
         'ghcr.io/rancher-sandbox/rancher-desktop/rdx-proxy',
@@ -67,34 +76,32 @@ export default {
         ...this.installedExtensionImages,
       ];
     },
-    ...mapGetters('k8sManager', { k8sState: 'getK8sState' }),
-    ...mapGetters('imageManager', { imageManagerState: 'getImageManagerState' }),
-    ...mapGetters('extensions', { extensions: 'list' }),
+    ...mapTypedState('imageManager', ['imageManagerState']),
+    ...mapTypedGetters('k8sManager', { k8sState: 'getK8sState' }),
+    ...mapTypedGetters('extensions', ['installedExtensions']),
   },
 
   watch: {
     state: {
-      handler(state) {
-        this.$store.dispatch(
-          'page/setHeader',
-          { title: this.t('images.title') },
-        );
+      handler(state: string) {
+        this.setHeader({ titleKey: 'images.title' });
 
-        if (!state || state === ImageMangerStates.UNREADY) {
+        if (!state || state === ImageManagerStates.UNREADY) {
           return;
         }
 
-        this.$store.dispatch(
-          'page/setAction',
-          { action: 'ImagesButtonAdd' },
-        );
+        this.setAction({ action: 'ImagesButtonAdd' });
       },
       immediate: true,
     },
   },
 
   mounted() {
-    ipcRenderer.on('images-changed', (event, images) => {
+    ipcRenderer.on('images-changed', async(event, images) => {
+      if ((window as any).imagesListMock) {
+        // Override for screenshots
+        images = await (window as any).imagesListMock();
+      }
       if (_.isEqual(images, this.images)) {
         return;
       }
@@ -110,11 +117,11 @@ export default {
     });
 
     ipcRenderer.on('images-check-state', (event, state) => {
-      this.$store.dispatch('imageManager/setImageManagerState', state);
+      this.setImageManagerState(state);
     });
 
     ipcRenderer.invoke('images-check-state').then((state) => {
-      this.$store.dispatch('imageManager/setImageManagerState', state);
+      this.setImageManagerState(state);
     });
 
     ipcRenderer.on('settings-update', (event, settings) => {
@@ -124,32 +131,34 @@ export default {
     });
 
     (async() => {
-      this.$data.images = await ipcRenderer.invoke('images-mounted', true);
+      this.images = await ipcRenderer.invoke('images-mounted', true);
     })();
 
     ipcRenderer.on('images-namespaces', (event, namespaces) => {
-      // TODO: Use a specific message to indicate whether messages are supported or not.
-      this.$data.imageNamespaces = namespaces;
-      this.$data.supportsNamespaces = namespaces.length > 0;
+      // TODO: Use a specific message to indicate whether or not messages are supported.
+      this.imageNamespaces = namespaces;
+      this.supportsNamespaces = namespaces.length > 0;
       this.checkSelectedNamespace();
     });
     ipcRenderer.send('images-namespaces-read');
     ipcRenderer.on('settings-read', (event, settings) => {
-      this.$data.settings = settings;
+      this.settings = settings;
     });
     ipcRenderer.send('settings-read');
 
     ipcRenderer.on('extensions/changed', this.fetchExtensions);
-    this.$store.dispatch('extensions/fetch');
+    this.fetchExtensions();
   },
-  beforeDestroy() {
+  beforeUnmount() {
     ipcRenderer.invoke('images-mounted', false);
-    ipcRenderer.removeAllListeners('images-mounted');
     ipcRenderer.removeAllListeners('images-changed');
     ipcRenderer.removeListener('extensions/changed', this.fetchExtensions);
   },
 
   methods: {
+    ...mapTypedActions('extensions', { fetchExtensions: 'fetch' }),
+    ...mapTypedActions('page', ['setAction', 'setHeader']),
+    ...mapTypedMutations('imageManager', { setImageManagerState: 'SET_IMAGE_MANAGER_STATE' }),
     checkSelectedNamespace() {
       if (!this.supportsNamespaces || this.imageNamespaces.length === 0) {
         // Nothing to verify yet
@@ -162,21 +171,18 @@ export default {
           { images: { namespace: defaultNamespace } } );
       }
     },
-    onShowAllImagesChanged(value) {
+    onShowAllImagesChanged(value: boolean) {
       if (value !== this.settings.images.showAll) {
         ipcRenderer.invoke('settings-write',
           { images: { showAll: value } } );
       }
     },
-    onChangeNamespace(value) {
+    onChangeNamespace(value: string) {
       if (value !== this.settings.images.namespace) {
         ipcRenderer.invoke('settings-write',
           { images: { namespace: value } } );
       }
     },
-    fetchExtensions() {
-      this.$store.dispatch('extensions/fetch');
-    },
   },
-};
+});
 </script>

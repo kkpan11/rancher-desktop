@@ -70,18 +70,6 @@ class Run {
   }
   /** The column for this run. */
   get column() { return `${ this.os } ${ this.engine }` }
-
-  /**
-   * Compare two runs for sorting.
-   * @param {Run} left
-   * @param {Run} right
-   * @returns {number} -1, 0, or 1 for left {<|==|>} right.
-   */
-  static compare(left, right) {
-    return left.name.localeCompare(right.name) ||
-      left.os.localeCompare(right.os) ||
-      left.engine.localeCompare(right.engine);
-  }
 }
 
 /**
@@ -123,7 +111,7 @@ async function readRuns() {
           run.skipped++;
         } else if (line.startsWith('ok ')) {
           run.passed++;
-        } else if (line.startsWith('no ok ')) {
+        } else if (line.startsWith('not ok ')) {
           run.failed++;
         }
       }
@@ -197,19 +185,35 @@ async function getRunMetadata(infoType) {
       return;
     }
   }
-  const url = `${ env.GITHUB_API_URL }/repos/${ env.GITHUB_REPOSITORY }/actions/runs/${ env.GITHUB_RUN_ID }/${ infoType }?per_page=100`;
+  // For a re-run, GitHub can take so long to list a page of 100 jobs that it
+  // answers 502. Smaller pages finish in time.
+  const url = `${ env.GITHUB_API_URL }/repos/${ env.GITHUB_REPOSITORY }/actions/runs/${ env.GITHUB_RUN_ID }/${ infoType }?per_page=20`;
   /** @type Record<string, string> */
   const headers = {};
 
   if ('GITHUB_TOKEN' in env) {
     headers.Authorization = `Bearer ${ env.GITHUB_TOKEN }`;
   }
-  const response = await fetch(url, { headers })
+  /** @type any[] */
+  const items = [];
 
-  if (!response.ok) {
-    throw new Error(`Failed to get GitHub ${ infoType } info:` + await response.text());
+  try {
+    for (let page = 1; ; page++) {
+      const response = await fetch(`${ url }&page=${ page }`, { headers });
+
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const data = await response.json();
+
+      items.push(...data[infoType]);
+      if (data[infoType].length === 0 || items.length >= data.total_count) {
+        return { ...data, [infoType]: items };
+      }
+    }
+  } catch (ex) {
+    console.error(`Failed to get GitHub ${ infoType } info:`, ex);
   }
-  return await response.json();
 }
 
 /**
@@ -257,67 +261,55 @@ async function updateRunInfo(runs) {
  * @param {OutputMethod} output Function to output a line
  */
 async function printResults(runs, output) {
-  const osList = new Set(runs.map(r => r.os));
-  const engineList = new Set(runs.map(r => r.engine));
-  /**
-   * Columns to be printed, excluding the leftmost heading column.
-   * Note that the format must match `Run.prototype.column`.
-   * @type string[]
-   */
-  const columns = [];
-  for (const os of Array.from(osList).sort()) {
-    for (const engine of Array.from(engineList).sort()) {
-      columns.push(`${ os } ${ engine }`);
-    }
+  if (!process.env.EXPECTED_TESTS) {
+    throw new Error('EXPECTED_TESTS was not set');
   }
-  // Column 0 is the name, so the map starts with 1.
-  const columnMap = Object.fromEntries(columns.map((k, v) => [k, v + 1]));
-  output(['Name', ...columns].join(' | '));
-  output(['', ...columns].map(() => '---').join(' | '));
+  /** @type {{name: string, host: string, engine: string}[]} */
+  const expectedTests = JSON.parse(process.env.EXPECTED_TESTS);
+  const expectedNames = Array.from(new Set(expectedTests.map(t => t.name))).sort();
+  const expectedHosts = Array.from(new Set(expectedTests.map(t => t.host))).sort();
+  const expectedColumns = expectedHosts.map(host => {
+    const engines = new Set(expectedTests.filter(t => t.host === host).map(t => t.engine));
+    return Array.from(engines).sort().map(engine => [host, engine]);
+  }).flat(1);
 
-  runs.sort(Run.compare);
-  /** @type Run[][] */
-  const initial = [];
-  // Group runs by the name (for each row).
-  const groups = runs.reduce((accumulator, current) => {
-    if (accumulator.length === 0) {
-      accumulator.push([current]);
-    } else {
-      const last = accumulator[accumulator.length - 1];
-      if (current.name === last[0].name) {
-        last.push(current);
+  output(['Name', ...expectedColumns.map(parts => parts.join(' '))].join(' | '));
+  output(['', ...expectedColumns].map(() => '---').join(' | '));
+
+  for (const name of expectedNames) {
+    const row = [name];
+    for (const [host, engine] of expectedColumns) {
+      const run = runs.find(r => r.name === name && r.os === host && r.engine === engine);
+      const expected = expectedTests.find(t => t.name === name && t.host === host && t.engine === engine);
+
+      if (run) {
+        const emoji = run.succeeded ? ':white_check_mark:' : ':x:';
+        const count  = run.succeeded ? '' : `${ run.ok }/${ run.total }`;
+        let tooltip = '';
+        tooltip += run.passed ? `${ run.passed } passed ` : '';
+        tooltip += run.failed ? `${ run.failed } failed ` : '';
+        tooltip += run.skipped ? `${ run.skipped } skipped ` : '';
+        tooltip += `out of ${ run.total }`;
+        const { env } = process;
+        let result = '';
+        if (run.logId) {
+          const url = `${ env.GITHUB_SERVER_URL }/${ env.GITHUB_REPOSITORY }/actions/runs/${ env.GITHUB_RUN_ID}/artifacts/${ run.logId }`;
+          result += `<a href="${ url }" title="Download logs">:file_folder:</a> `;
+        }
+        result += `<a title="${ tooltip }"`;
+        if (run.id) {
+          const url = `${ env.GITHUB_SERVER_URL }/${ env.GITHUB_REPOSITORY }/actions/runs/${ env.GITHUB_RUN_ID }/job/${ run.id }`;
+          result += ` href="${ url }"`;
+        }
+        result += `>${ emoji } ${ count }</a>`;
+        row.push(result);
+      } else if (expected) {
+        // The test result is missing for this run.
+        row.push('<a title="run results missing">:x: ??</a>');
       } else {
-        accumulator.push([current]);
+        // This combination is not run.
+        row.push('');
       }
-    }
-    return accumulator;
-  }, initial);
-  for (const group of groups) {
-    const row = [group[0].name];
-    for (const run of group) {
-      const emoji = run.succeeded ? ':white_check_mark:' : ':x:';
-      const count  = run.succeeded ? '' : `${ run.ok }/${ run.total }`;
-      let tooltip = '';
-      tooltip += run.passed ? `${ run.passed } passed ` : '';
-      tooltip += run.failed ? `${ run.failed } failed ` : '';
-      tooltip += run.skipped ? `${ run.skipped } skipped ` : '';
-      tooltip += `out of ${ run.total }`;
-      const { env } = process;
-      let result = '';
-      if (run.logId) {
-        const url = `${ env.GITHUB_SERVER_URL }/${ env.GITHUB_REPOSITORY }/actions/runs/${ env.GITHUB_RUN_ID}/artifacts/${ run.logId }`;
-        result += `<a href="${ url }" title="Download logs">:file_folder:</a> `;
-      }
-      result += `<a title="${ tooltip }"`;
-      if (run.id) {
-        const url = `${ env.GITHUB_SERVER_URL }/${ env.GITHUB_REPOSITORY }/actions/runs/${ env.GITHUB_RUN_ID }/job/${ run.id }`;
-        result += ` href="${ url }"`;
-      }
-      result += `>${ emoji } ${ count }</a>`;
-      // Because we may have missing jobs (where it failed so completely there
-      // was no uploaded logs), we need to use the column map rather than just
-      // append to the row.
-      row[columnMap[run.column]] = result;
     }
     output(row.join(' | '));
   }

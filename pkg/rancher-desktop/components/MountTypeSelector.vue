@@ -3,7 +3,7 @@ import os from 'os';
 
 import { RadioButton, RadioGroup } from '@rancher/components';
 import semver from 'semver';
-import Vue, { VueConstructor } from 'vue';
+import { defineComponent } from 'vue';
 import { mapGetters, mapState } from 'vuex';
 
 import IncompatiblePreferencesAlert, { CompatiblePrefs } from '@pkg/components/IncompatiblePreferencesAlert.vue';
@@ -18,12 +18,7 @@ import { RecursiveTypes } from '@pkg/utils/typeUtils';
 
 import type { PropType } from 'vue';
 
-interface VuexBindings {
-  macOsVersion: semver.SemVer;
-  isArm: boolean;
-}
-
-export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
+export default defineComponent({
   components: {
     TooltipIcon,
     IncompatiblePreferencesAlert,
@@ -42,8 +37,14 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
   computed: {
     ...mapGetters('preferences', ['isPreferenceLocked']),
     ...mapState('transientSettings', ['macOsVersion', 'isArm']),
-    options(): { label: string, value: MountType, description: string, experimental: boolean, disabled: boolean,
-      compatiblePrefs: CompatiblePrefs | [] }[] {
+    options(): {
+      label:           string,
+      value:           MountType,
+      description:     string,
+      experimental:    boolean,
+      disabled:        boolean,
+      compatiblePrefs: CompatiblePrefs | []
+    }[] {
       const defaultOption = MountType.REVERSE_SSHFS;
 
       return Object.values(MountType)
@@ -54,8 +55,8 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
           return {
             label:           this.t(`virtualMachine.mount.type.options.${ x }.label`),
             value:           x,
-            description:     this.t(`virtualMachine.mount.type.options.${ x }.description`, {}, true),
-            experimental:    x !== defaultOption, // Mark experimental options
+            description:     this.t(`virtualMachine.mount.type.options.${ x }.description`),
+            experimental:    x === MountType.NINEP,
             disabled:        x === MountType.VIRTIOFS && this.virtIoFsDisabled,
             compatiblePrefs: this.getCompatiblePrefs(x),
           };
@@ -65,12 +66,13 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
       return 'mountType';
     },
     ninePSelected(): boolean {
-      return this.preferences.experimental.virtualMachine.mount.type === MountType.NINEP;
+      return this.preferences.virtualMachine.mount.type === MountType.NINEP;
     },
     virtIoFsDisabled(): boolean {
       // virtiofs should only be disabled on macOS WITHOUT the possibility to select the VM type VZ. VZ doesn't need to
       // be selected, yet. We're going to show a warning banner in that case.
       return os.platform() === 'darwin' &&
+        this.macOsVersion &&
         (semver.lt(this.macOsVersion.version, '13.0.0') || (this.isArm && semver.lt(this.macOsVersion.version, '13.3.0')));
     },
     arch(): string {
@@ -124,14 +126,14 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
       if (os.platform() === 'darwin') {
         switch (mountType) {
         case MountType.NINEP:
-          if (this.preferences.experimental.virtualMachine.type === VMType.VZ) {
+          if (this.preferences.virtualMachine.type === VMType.VZ) {
             compatiblePrefs.push( {
               title: VMType.QEMU, navItemName: 'Virtual Machine', tabName: 'emulation',
             } );
           }
           break;
         case MountType.VIRTIOFS:
-          if (this.preferences.experimental.virtualMachine.type === VMType.QEMU) {
+          if (this.preferences.virtualMachine.type === VMType.QEMU) {
             compatiblePrefs.push( {
               title: VMType.VZ, navItemName: 'Virtual Machine', tabName: 'emulation',
             } );
@@ -153,28 +155,28 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
         <rd-fieldset
           data-test="mountType"
           :legend-text="t('virtualMachine.mount.type.legend')"
-          :is-locked="isPreferenceLocked('experimental.virtualMachine.mount.type')"
+          :is-locked="isPreferenceLocked('virtualMachine.mount.type')"
         >
           <template #default="{ isLocked }">
             <radio-group
               :name="groupName"
               :options="options"
               :disabled="isLocked"
-              :class="{ 'locked-radio' : isLocked }"
+              :class="{ 'locked-radio': isLocked }"
             >
               <template
                 v-for="(option, index) in options"
                 #[index]="{ isDisabled }"
               >
                 <radio-button
-                  :key="groupName+'-'+index"
+                  :key="groupName + '-' + index"
                   v-tooltip="disabledVirtIoFsTooltip(option.disabled)"
                   :name="groupName"
-                  :value="preferences.experimental.virtualMachine.mount.type"
+                  :value="preferences.virtualMachine.mount.type"
                   :val="option.value"
                   :disabled="option.disabled || isDisabled"
                   :data-test="option.label"
-                  @input="updateValue('experimental.virtualMachine.mount.type', $event)"
+                  @update:value="updateValue('virtualMachine.mount.type', $event)"
                 >
                   <template #label>
                     {{ option.label }}
@@ -185,7 +187,7 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
                   <template #description>
                     {{ option.description }}
                     <incompatible-preferences-alert
-                      v-if="option.value === preferences.experimental.virtualMachine.mount.type"
+                      v-if="option.value === preferences.virtualMachine.mount.type"
                       :compatible-prefs="option.compatiblePrefs"
                     />
                   </template>
@@ -205,7 +207,7 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
           :legend-tooltip="t('virtualMachine.mount.type.options.9p.options.cacheMode.tooltip')"
         >
           <rd-select
-            :value="preferences.experimental.virtualMachine.mount['9p'].cacheMode"
+            :model-value="preferences.experimental.virtualMachine.mount['9p'].cacheMode"
             :is-locked="isPreferenceLocked('experimental.virtualMachine.mount.9p.cacheMode')"
             @change="updateValue('experimental.virtualMachine.mount.9p.cacheMode', $event.target.value)"
           >
@@ -238,7 +240,7 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
           :legend-tooltip="t('virtualMachine.mount.type.options.9p.options.protocolVersion.tooltip')"
         >
           <rd-select
-            :value="preferences.experimental.virtualMachine.mount['9p'].protocolVersion"
+            :model-value="preferences.experimental.virtualMachine.mount['9p'].protocolVersion"
             :is-locked="isPreferenceLocked('experimental.virtualMachine.mount.9p.protocolVersion')"
             @change="updateValue('experimental.virtualMachine.mount.9p.protocolVersion', $event.target.value)"
           >
@@ -258,7 +260,7 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
           :legend-tooltip="t('virtualMachine.mount.type.options.9p.options.securityModel.tooltip')"
         >
           <rd-select
-            :value="preferences.experimental.virtualMachine.mount['9p'].securityModel"
+            :model-value="preferences.experimental.virtualMachine.mount['9p'].securityModel"
             :is-locked="isPreferenceLocked('experimental.virtualMachine.mount.9p.securityModel')"
             @change="updateValue('experimental.virtualMachine.mount.9p.securityModel', $event.target.value)"
           >

@@ -1,5 +1,8 @@
 set -o errexit -o nounset -o pipefail
 
+# Make sure run() will execute all functions with errexit enabled
+export BATS_RUN_ERREXIT=1
+
 # RD_HELPERS_LOADED is set when bats/helpers/load.bash has been loaded
 RD_HELPERS_LOADED=1
 
@@ -71,7 +74,8 @@ source "$PATH_BATS_HELPERS/profile.bash"
 # rdctl from commands.bash, and jq_output from utils.bash
 source "$PATH_BATS_HELPERS/vm.bash"
 
-# Use Linux utilities (like jq) on WSL
+# Add BATS helper executables to $PATH.  On Windows, we use the Linux version
+# from WSL.
 export PATH="$PATH_BATS_ROOT/bin/${OS/windows/linux}:$PATH"
 
 # If called from foo() this function will call local_foo() if it exist.
@@ -84,10 +88,10 @@ call_local_function() {
 }
 
 setup_file() {
-    # We require bash 5; bash 3.2 (as shipped by macOS) seems to have
+    # We require bash 4; bash 3.2 (as shipped by macOS) seems to have
     # compatibility issues.
-    if semver_gt 5.0.0 "$(semver "$BASH_VERSION")"; then
-        fail "Bash 5.0.0 is required; you have $BASH_VERSION"
+    if semver_gt 4.0.0 "$(semver "$BASH_VERSION")"; then
+        fail "Bash 4.0.0 is required; you have $BASH_VERSION"
     fi
     # We currently use a submodule that provides BATS 1.10; we do not test
     # against any other copy of BATS (and therefore only support the version in

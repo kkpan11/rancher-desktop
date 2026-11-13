@@ -8,12 +8,12 @@ import { spawnFile } from '@pkg/utils/childProcess';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
 
-type credHelperInfo = {
+interface credHelperInfo {
   /** The name of the credential helper to use (a suffix of `docker-credential-`) */
-  credsStore: string;
+  credsStore:  string;
   /** hash of URLs to credential-helper-name */
   credHelpers: Record<string, string>
-};
+}
 
 const console = Logging.server;
 
@@ -31,7 +31,7 @@ export default async function runCommand(command: string, input?: string): Promi
   const { credsStore } = await getCredentialHelperInfo(command, input ?? '');
 
   try {
-    return runCredHelper(credsStore, command, input);
+    return await runCredHelper(credsStore, command, input);
   } catch (ex: any) {
     ex.helper = credsStore;
     throw ex;

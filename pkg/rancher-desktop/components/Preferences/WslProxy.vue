@@ -1,7 +1,7 @@
 <script lang="ts">
 
 import { StringList } from '@rancher/components';
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 import { mapGetters } from 'vuex';
 
 import RdInput from '@pkg/components/RdInput.vue';
@@ -12,7 +12,7 @@ import { RecursiveTypes } from '@pkg/utils/typeUtils';
 
 import type { PropType } from 'vue';
 
-export default Vue.extend({
+export default defineComponent({
   name:       'preferences-wsl-proxy',
   components: {
     RdCheckbox, RdFieldset, RdInput, StringList,
@@ -27,14 +27,6 @@ export default Vue.extend({
     ...mapGetters('preferences', ['isPreferenceLocked']),
     isFieldDisabled() {
       return !(this.preferences.experimental.virtualMachine.proxy.enabled);
-    },
-    noProxyText: {
-      get() {
-        return this.preferences.experimental.virtualMachine.proxy.noproxy.join('\n');
-      },
-      set(value: string) {
-        this.$store.dispatch('preferences/updatePreferencesData', { property: 'experimental.virtualMachine.proxy.noproxy', value: value.trim().split('\n') });
-      },
     },
     noproxyErrorMessages(): { duplicate: string } {
       return { duplicate: this.t('virtualMachine.proxy.noproxy.errors.duplicate') };
@@ -68,10 +60,10 @@ export default Vue.extend({
       :is-experimental="true"
     >
       <rd-checkbox
-        :label="t('virtualMachine.proxy.label', { }, true)"
+        :label="t('virtualMachine.proxy.label')"
         :value="preferences.experimental.virtualMachine.proxy.enabled"
         :is-locked="isPreferenceLocked('experimental.virtualMachine.proxy.enabled')"
-        @input="onChange('experimental.virtualMachine.proxy.enabled', $event)"
+        @update:value="onChange('experimental.virtualMachine.proxy.enabled', $event)"
       />
     </rd-fieldset>
     <hr>
@@ -80,10 +72,10 @@ export default Vue.extend({
         <rd-fieldset
           data-test="addressTitle"
           class="wsl-proxy-fieldset"
-          :legend-text="t('virtualMachine.proxy.addressTitle', { }, true)"
+          :legend-text="t('virtualMachine.proxy.addressTitle')"
         >
           <rd-input
-            :placeholder="t('virtualMachine.proxy.address', { }, true)"
+            :placeholder="t('virtualMachine.proxy.address')"
             :disabled="isFieldDisabled"
             :value="preferences.experimental.virtualMachine.proxy.address"
             :is-locked="isPreferenceLocked('experimental.virtualMachine.proxy.address')"
@@ -91,7 +83,7 @@ export default Vue.extend({
           />
           <rd-input
             type="number"
-            :placeholder="t('virtualMachine.proxy.port', { }, true)"
+            :placeholder="t('virtualMachine.proxy.port')"
             :disabled="isFieldDisabled"
             :value="preferences.experimental.virtualMachine.proxy.port"
             :is-locked="isPreferenceLocked('experimental.virtualMachine.proxy.port')"
@@ -100,10 +92,10 @@ export default Vue.extend({
         </rd-fieldset>
         <rd-fieldset
           class="wsl-proxy-fieldset"
-          :legend-text="t('virtualMachine.proxy.authTitle', { }, true)"
+          :legend-text="t('virtualMachine.proxy.authTitle')"
         >
           <rd-input
-            :placeholder="t('virtualMachine.proxy.username', { }, true)"
+            :placeholder="t('virtualMachine.proxy.username')"
             :disabled="isFieldDisabled"
             :value="preferences.experimental.virtualMachine.proxy.username"
             :is-locked="isPreferenceLocked('experimental.virtualMachine.proxy.username')"
@@ -111,7 +103,7 @@ export default Vue.extend({
           />
           <rd-input
             type="password"
-            :placeholder="t('virtualMachine.proxy.password', { }, true)"
+            :placeholder="t('virtualMachine.proxy.password')"
             :disabled="isFieldDisabled"
             :value="preferences.experimental.virtualMachine.proxy.password"
             :is-locked="isPreferenceLocked('experimental.virtualMachine.proxy.password')"
@@ -121,17 +113,17 @@ export default Vue.extend({
       </div>
       <div class="proxy-col">
         <rd-fieldset
-          :legend-text="t('virtualMachine.proxy.noproxy.legend', { }, true)"
+          :legend-text="t('virtualMachine.proxy.noproxy.legend')"
           :is-locked="isPreferenceLocked('experimental.virtualMachine.proxy.noproxy')"
         >
           <string-list
-            :placeholder="t('virtualMachine.proxy.noproxy.placeholder', { }, true)"
+            :placeholder="t('virtualMachine.proxy.noproxy.placeholder')"
             :readonly="isNoProxyFieldReadOnly"
             :actions-position="'left'"
             :items="preferences.experimental.virtualMachine.proxy.noproxy"
             :error-messages="noproxyErrorMessages"
             bulk-addition-delimiter=","
-            @change="onChange('experimental.virtualMachine.proxy.noproxy', $event)"
+            @change="Array.isArray($event) && onChange('experimental.virtualMachine.proxy.noproxy', $event)"
             @type:item="onType($event)"
             @errors="onDuplicate($event.duplicate)"
           />
@@ -153,17 +145,17 @@ export default Vue.extend({
     gap: 1rem;
     width: 50%;
 
-    .string-list::v-deep {
-      .string-list-box {
+    .string-list {
+      :deep(.string-list-box) {
         min-height: unset;
         height: 195px;
       }
 
-      .string-list-footer {
+      :deep(.string-list-footer) {
         padding-right: 2rem;
       }
 
-      &.readonly {
+      :deep(.readonly) {
         background-color: var(--input-disabled-bg);
         color: var(--input-disabled-text);
         opacity: 1;

@@ -17,18 +17,25 @@ limitations under the License.
 package shutdown
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
-	"regexp"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/hashicorp/go-multierror"
+	"github.com/sirupsen/logrus"
 
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/directories"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/factoryreset"
 	p "github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/paths"
-	"github.com/sirupsen/logrus"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/process"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/utils"
 )
 
 type shutdownData struct {
@@ -40,6 +47,10 @@ type InitiatingCommand string
 const (
 	Shutdown     InitiatingCommand = "shutdown"
 	FactoryReset InitiatingCommand = "factory-reset"
+	// When killing an application, the number of times to retry.
+	appKillRetryCount = 15
+	// When killing an application, time interval between retries.
+	appKillWaitInterval = 2 * time.Second
 )
 
 var limaCtlPath string
@@ -51,12 +62,11 @@ func newShutdownData(waitForShutdown bool) *shutdownData {
 // FinishShutdown - ensures that none of the Rancher Desktop related processes are around
 // after a graceful shutdown command has been sent as part of either `rdctl shutdown` or
 // `rdctl factory-reset`.
-func FinishShutdown(waitForShutdown bool, initiatingCommand InitiatingCommand) error {
+func FinishShutdown(ctx context.Context, waitForShutdown bool, initiatingCommand InitiatingCommand) error {
 	s := newShutdownData(waitForShutdown)
 	if runtime.GOOS == "windows" {
-		return s.waitForAppToDieOrKillIt(factoryreset.CheckProcessWindows, factoryreset.KillRancherDesktop, 15, 2, "the app")
+		return s.waitForAppToDieOrKillIt(ctx, factoryreset.CheckProcessWindows, factoryreset.KillRancherDesktop, false, "the app")
 	}
-	var err error
 	paths, err := p.GetPaths()
 	if err != nil {
 		logrus.Errorf("Ignoring error trying to get application paths: %s", err)
@@ -69,17 +79,17 @@ func FinishShutdown(waitForShutdown bool, initiatingCommand InitiatingCommand) e
 		} else {
 			switch initiatingCommand {
 			case Shutdown:
-				err = s.waitForAppToDieOrKillIt(checkLima, stopLima, 15, 2, "lima")
+				err = s.waitForAppToDieOrKillIt(ctx, checkLima, stopLima, false, "lima")
 				if err != nil {
 					logrus.Errorf("Ignoring error trying to stop lima: %s", err)
 				}
 				// Check once more to see if lima is still running, and if so, run `limactl stop --force 0`
-				err = s.waitForAppToDieOrKillIt(checkLima, stopLimaWithForce, 1, 0, "lima")
+				err = s.waitForAppToDieOrKillIt(ctx, checkLima, stopLimaWithForce, true, "lima")
 				if err != nil {
 					logrus.Errorf("Ignoring error trying to force-stop lima: %s", err)
 				}
 			case FactoryReset:
-				err = s.waitForAppToDieOrKillIt(checkLima, deleteLima, 15, 2, "lima")
+				err = s.waitForAppToDieOrKillIt(ctx, checkLima, deleteLima, false, "lima")
 				if err != nil {
 					logrus.Errorf("Ignoring error trying to delete lima subtree: %s", err)
 				}
@@ -88,99 +98,124 @@ func FinishShutdown(waitForShutdown bool, initiatingCommand InitiatingCommand) e
 			}
 		}
 	}
-	err = s.waitForAppToDieOrKillIt(checkProcessQemu, pkillQemu, 15, 2, "qemu")
+	qemuExecutable, err := getQemuExecutable()
+	if err != nil {
+		return fmt.Errorf("failed to find qemu executable: %w", err)
+	}
+	err = s.waitForAppToDieOrKillIt(
+		ctx,
+		isExecutableRunningFunc(qemuExecutable),
+		terminateExecutableFunc(qemuExecutable),
+		false,
+		"qemu")
 	if err != nil {
 		logrus.Errorf("Ignoring error trying to kill qemu: %s", err)
 	}
-	switch runtime.GOOS {
-	case "darwin":
-		return s.waitForAppToDieOrKillIt(checkProcessDarwin, pkillDarwin, 5, 1, "the app")
-	case "linux":
-		return s.waitForAppToDieOrKillIt(checkProcessLinux, pkillLinux, 5, 1, "the app")
-	default:
-		return fmt.Errorf("unhandled runtime: %q", runtime.GOOS)
+	appDir, err := directories.GetApplicationDirectory(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to find application directory: %w", err)
 	}
+	mainExecutablePath, err := p.GetMainExecutable(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get Rancher Desktop executable: %w", err)
+	}
+	return s.waitForAppToDieOrKillIt(
+		ctx,
+		isExecutableRunningFunc(mainExecutablePath),
+		terminateRancherDesktopFunc(appDir),
+		false,
+		"the app")
 }
 
-func (s *shutdownData) waitForAppToDieOrKillIt(checkFunc func() (bool, error), killFunc func() error, retryCount int, retryWait int, operation string) error {
-	for iter := 0; s.waitForShutdown && iter < retryCount; iter++ {
+// Run the given check function to detect if an application has exited, every
+// appKillWaitInterval for appKillRetryCount times.  After all the checks have
+// expired, run killFunc to terminate the application forcefully.  If skipRetry
+// is true, do not wait at all and just kill immediately.
+func (s *shutdownData) waitForAppToDieOrKillIt(ctx context.Context, checkFunc func(context.Context) (bool, error), killFunc func(context.Context) error, skipRetry bool, description string) error {
+	for iter := 0; s.waitForShutdown && iter < appKillRetryCount; iter++ {
 		if iter > 0 {
-			logrus.Debugf("checking %s showed it's still running; sleeping %d seconds\n", operation, retryWait)
-			time.Sleep(time.Duration(retryWait) * time.Second)
+			logrus.Debugf("checking %s showed it's still running; sleeping for %s\n", description, appKillWaitInterval)
+			time.Sleep(appKillWaitInterval)
 		}
-		status, err := checkFunc()
+		status, err := checkFunc(ctx)
 		if err != nil {
-			return fmt.Errorf("while checking %s, found error: %w", operation, err)
+			return fmt.Errorf("while checking %s, found error: %w", description, err)
 		}
 		if !status {
-			logrus.Debugf("%s is no longer running\n", operation)
+			logrus.Debugf("%s is no longer running\n", description)
 			return nil
 		}
-	}
-	logrus.Debugf("About to force-kill %s\n", operation)
-	return killFunc()
-}
-
-/**
- * checkProcessX function returns [true, nil] if it detects the app is still running, [false, X] otherwise
- * The Linux/macOS functions never return a non-nil error and that field can be ignored.
- * If the Windows function returns a non-nil error, we can't conclude whether the specified process is running
- */
-
-func checkProcessDarwin() (bool, error) {
-	return checkProcessLinuxLike("-f", "Contents/MacOS/Rancher Desktop"), nil
-}
-
-func checkProcessLinux() (bool, error) {
-	return checkProcessLinuxLike("rancher-desktop"), nil
-}
-
-func checkProcessLinuxLike(commandPattern ...string) bool {
-	result, err := exec.Command("pgrep", commandPattern...).CombinedOutput()
-	if err != nil {
-		return false
-	}
-	return regexp.MustCompile(`\A[0-9\s]+\z`).Match(result)
-}
-
-// RancherDesktopQemuCommand - be specific to avoid killing other VM-based processes running qemu
-const RancherDesktopQemuCommand = "lima/bin/qemu-system.*rancher-desktop/lima/[0-9]/diffdisk"
-
-func checkProcessQemu() (bool, error) {
-	return checkProcessLinuxLike("-f", RancherDesktopQemuCommand), nil
-}
-
-func pkill(args ...string) error {
-	pkillBinary := "pkill"
-	if runtime.GOOS == "darwin" {
-		pkillBinary = "/usr/bin/pkill"
-	}
-	cmd := exec.Command(pkillBinary, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err := cmd.Run()
-	if err != nil {
-		if exitError, ok := err.(*exec.ExitError); ok {
-			// don't throw an error if the process we are killing has already exited
-			if exitCode := exitError.ExitCode(); exitCode == 0 || exitCode == 1 {
-				return nil
-			}
+		if skipRetry {
+			break
 		}
-		return fmt.Errorf("error running pkill: %w", err)
 	}
-	return nil
+	logrus.Debugf("About to force-kill %s\n", description)
+	return killFunc(ctx)
 }
 
-func pkillQemu() error {
-	err := pkill("-9", "-f", RancherDesktopQemuCommand)
+func getQemuExecutable() (string, error) {
+	if runtime.GOOS == "windows" {
+		return "", fmt.Errorf("qemu not installed on Windows")
+	}
+	resourcesDir, err := p.GetResourcesPath()
 	if err != nil {
-		return fmt.Errorf("failed to kill qemu: %w", err)
+		return "", fmt.Errorf("failed to get resources directory: %w", err)
 	}
-	return nil
+	var arch string
+	switch runtime.GOARCH {
+	case "amd64":
+		arch = "x86_64"
+	case "arm64":
+		arch = "aarch64"
+	default:
+		arch = runtime.GOARCH
+	}
+	qemuName := fmt.Sprintf("qemu-system-%s", arch)
+	candidates := []string{
+		filepath.Join(resourcesDir, runtime.GOOS, "lima", "bin", qemuName),
+	}
+	if runtime.GOOS == "linux" {
+		// On Linux, we may be running in AppImage; in that case, we need to check
+		// the bundled qemu.
+		candidates = append(
+			candidates,
+			filepath.Join(utils.GetParentDir(resourcesDir, 4), "usr", "bin", qemuName),
+		)
+	}
+	return p.FindFirstExecutable(candidates...)
 }
 
-func checkLima() (bool, error) {
-	cmd := exec.Command(limaCtlPath, "ls", "--format", "{{.Status}}", "0")
+func isExecutableRunningFunc(executablePath string) func(context.Context) (bool, error) {
+	return func(ctx context.Context) (bool, error) {
+		pid, err := process.FindPidOfProcess(executablePath)
+		if err != nil {
+			return false, err
+		}
+		return pid != 0, nil
+	}
+}
+
+func terminateExecutableFunc(executablePath string) func(context.Context) error {
+	return func(ctx context.Context) error {
+		pid, err := process.FindPidOfProcess(executablePath)
+		if err != nil || pid == 0 {
+			return err
+		}
+		proc, err := os.FindProcess(pid)
+		if err != nil {
+			return fmt.Errorf("failed to find process for pid %d: %w", pid, err)
+		}
+		// The pid might not exist even if we did not receive an error.
+		err = proc.Signal(syscall.SIGTERM)
+		if err != nil && !errors.Is(err, os.ErrProcessDone) {
+			return fmt.Errorf("failed to terminate process %d: %w", pid, err)
+		}
+		return nil
+	}
+}
+
+func checkLima(ctx context.Context) (bool, error) {
+	cmd := exec.CommandContext(ctx, limaCtlPath, "ls", "--format", "{{.Status}}", "0")
 	cmd.Stderr = os.Stderr
 	result, err := cmd.Output()
 	if err != nil {
@@ -196,30 +231,36 @@ func runCommandIgnoreOutput(cmd *exec.Cmd) error {
 	return cmd.Run()
 }
 
-func stopLima() error {
-	return runCommandIgnoreOutput(exec.Command(limaCtlPath, "stop", "0"))
+func stopLima(ctx context.Context) error {
+	return runCommandIgnoreOutput(exec.CommandContext(ctx, limaCtlPath, "stop", "0"))
 }
 
-func stopLimaWithForce() error {
-	return runCommandIgnoreOutput(exec.Command(limaCtlPath, "stop", "--force", "0"))
+func stopLimaWithForce(ctx context.Context) error {
+	return runCommandIgnoreOutput(exec.CommandContext(ctx, limaCtlPath, "stop", "--force", "0"))
 }
 
-func deleteLima() error {
-	return runCommandIgnoreOutput(exec.Command(limaCtlPath, "delete", "--force", "0"))
+func deleteLima(ctx context.Context) error {
+	return runCommandIgnoreOutput(exec.CommandContext(ctx, limaCtlPath, "delete", "--force", "0"))
 }
 
-func pkillDarwin() error {
-	err := pkill("-9", "-a", "-l", "-f", "Contents/MacOS/Rancher Desktop")
-	if err != nil {
-		return fmt.Errorf("failed to kill Rancher Desktop: %w", err)
+func terminateRancherDesktopFunc(appDir string) func(context.Context) error {
+	return func(ctx context.Context) error {
+		var errs *multierror.Error
+
+		errs = multierror.Append(errs, (func() error {
+			mainExe, err := p.GetMainExecutable(ctx)
+			if err != nil {
+				return err
+			}
+			pid, err := process.FindPidOfProcess(mainExe)
+			if err != nil {
+				return err
+			}
+			return process.KillProcessGroup(pid, false)
+		})())
+
+		errs = multierror.Append(errs, process.TerminateProcessInDirectory(appDir, true))
+
+		return errs.ErrorOrNil()
 	}
-	return nil
-}
-
-func pkillLinux() error {
-	err := pkill("-9", "rancher-desktop")
-	if err != nil {
-		return fmt.Errorf("failed to kill Rancher Desktop: %w", err)
-	}
-	return nil
 }

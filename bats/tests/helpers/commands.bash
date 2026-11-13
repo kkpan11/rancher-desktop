@@ -17,7 +17,11 @@ fi
 if is_macos; then
     CRED_HELPER="$PATH_RESOURCES/$PLATFORM/bin/docker-credential-osxkeychain"
 elif is_linux; then
-    CRED_HELPER="$PATH_RESOURCES/$PLATFORM/bin/docker-credential-pass"
+    if command -v pass; then
+        CRED_HELPER="$PATH_RESOURCES/$PLATFORM/bin/docker-credential-pass"
+    else
+        CRED_HELPER="$PATH_RESOURCES/$PLATFORM/bin/docker-credential-secretservice"
+    fi
 elif is_windows; then
     # Our docker-cli for WSL defaults to "wincred.exe" as well
     CRED_HELPER="$PATH_RESOURCES/win32/bin/docker-credential-wincred.exe"
@@ -49,11 +53,16 @@ docker() {
     docker_exe --context $RD_DOCKER_CONTEXT "$@"
 }
 docker_exe() {
-    # Add path to bundled credential helpers to the front of the PATH
-    PATH="$PATH_RESOURCES/$PLATFORM/bin:$PATH" "$PATH_RESOURCES/$PLATFORM/bin/docker$EXE" "$@" | no_cr
+    # Add path to bundled credential helpers to the front of the PATH; also
+    # ensure that on Windows, it gets exported.
+    PATH="$PATH_RESOURCES/$PLATFORM/bin:$PATH" WSLENV="PATH/l:${WSLENV:-}" \
+        "$PATH_RESOURCES/$PLATFORM/bin/docker$EXE" "$@" | no_cr
 }
 helm() {
-    "$PATH_RESOURCES/$PLATFORM/bin/helm$EXE" "$@" | no_cr
+    # Add path to bundled credential helpers to the front of the PATH; also
+    # ensure that on Windows, it gets exported.
+    PATH="$PATH_RESOURCES/$PLATFORM/bin:$PATH" WSLENV="PATH/l:${WSLENV:-}" \
+        "$PATH_RESOURCES/$PLATFORM/bin/helm$EXE" --kube-context rancher-desktop "$@" | no_cr
 }
 kubectl() {
     kubectl_exe --context rancher-desktop "$@"
@@ -66,7 +75,10 @@ limactl() {
     LIMA_HOME="$LIMA_HOME" "$PATH_RESOURCES/$PLATFORM/lima/bin/limactl" "$@"
 }
 nerdctl() {
-    "$PATH_RESOURCES/$PLATFORM/bin/nerdctl$EXE" --namespace "$CONTAINERD_NAMESPACE" "$@" | no_cr
+    # Add path to bundled credential helpers to the front of the PATH; also
+    # ensure that on Windows, it gets exported.
+    PATH="$PATH_RESOURCES/$PLATFORM/bin:$PATH" WSLENV="PATH/l:${WSLENV:-}" \
+        "$PATH_RESOURCES/$PLATFORM/bin/nerdctl$EXE" --namespace "$CONTAINERD_NAMESPACE" "$@" | no_cr
 }
 # Run `rdctl`; if $RD_TIMEOUT is set, the value is used as the first argument to
 # the `timeout` command.

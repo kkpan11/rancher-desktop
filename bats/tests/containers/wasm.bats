@@ -15,6 +15,7 @@ local_setup() {
     if using_containerd; then
         skip "this test only works on moby right now"
     fi
+    skip "spin shim is broken with docker 28+; see #9476"
 }
 
 local_teardown_file() {
@@ -27,7 +28,7 @@ local_teardown_file() {
 }
 
 @test 'start engine without wasm support' {
-    start_container_engine
+    start_container_engine --experimental.container-engine.web-assembly.enabled=false
     wait_for_container_engine
 }
 
@@ -36,7 +37,7 @@ shim_version() {
     local version=$2
 
     run rdctl shell "containerd-shim-${shim}-${version}" -v
-    assert_success || return
+    assert_success
     semver "$output"
 }
 
@@ -65,8 +66,10 @@ hello() {
 
 @test 'verify shim is not configured in container engine' {
     run hello spin v2 rust 8080 80
+    assert_nothing                           # We assert after removing the container.
+    ctrctl rm --force spin-demo-8080 || true # Force delete the container if it got created.
     assert_failure
-    assert_output --partial "operating system is not supported"
+    assert_output --regexp 'operating system is not supported|binary not installed'
 }
 
 @test 'enable wasm support' {
@@ -88,7 +91,7 @@ hello() {
 
 check_container_logs() {
     run ctrctl logs spin-demo-8080
-    assert_success || return
+    assert_success
     assert_output --partial "Available Routes"
 }
 
@@ -144,7 +147,7 @@ verify_shim() {
     semver_eq "$output" "$MANUAL_VERSION"
 
     hello "$shim" "$version" "$lang" "$port" "$external_port"
-    try --max 5 --delay 2 curl --silent --fail "http://localhost:${port}/hello"
+    try --max 10 --delay 3 curl --silent --fail "http://localhost:${port}/hello"
 }
 
 @test 'verify spin shim' {

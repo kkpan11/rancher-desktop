@@ -1,8 +1,9 @@
-import { ChildProcessByStdio, spawn } from 'child_process';
+import { ChildProcessByStdio, spawn, SpawnOptionsWithStdioTuple } from 'child_process';
+import http from 'http';
 import path from 'path';
 import { Readable } from 'stream';
 
-import Electron, { IpcMainEvent, IpcMainInvokeEvent } from 'electron';
+import Electron, { IpcMainEvent, IpcMainInvokeEvent, net } from 'electron';
 import _ from 'lodash';
 import semver from 'semver';
 
@@ -11,16 +12,16 @@ import {
   Extension, ExtensionErrorCode, ExtensionManager, SpawnOptions, SpawnResult,
 } from './types';
 
+import MARKETPLACE_DATA from '@pkg/assets/extension-data.yaml';
 import type { ContainerEngineClient } from '@pkg/backend/containerClient';
 import { ContainerEngine, Settings } from '@pkg/config/settings';
 import { getIpcMainProxy } from '@pkg/main/ipcMain';
 import mainEvents from '@pkg/main/mainEvents';
 import type { IpcMainEvents, IpcMainInvokeEvents, IpcRendererEvents } from '@pkg/typings/electron-ipc';
-import { demoMarketplace } from '@pkg/utils/_demo_marketplace_items';
 import { parseImageReference } from '@pkg/utils/dockerUtils';
-import fetch, { RequestInit } from '@pkg/utils/fetch';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
+import { executable } from '@pkg/utils/resources';
 import { RecursiveReadonly } from '@pkg/utils/typeUtils';
 
 const console = Logging.extensions;
@@ -37,10 +38,18 @@ type IpcMainEventHandler<K extends keyof IpcMainInvokeEvents> =
 type ReadableChildProcess = ChildProcessByStdio<null, Readable, Readable>;
 
 /**
- * EXTENSION_APP is a fake extension ID the signifies the other end is not a
+ * EXTENSION_APP is a fake extension ID that signifies the other end is not a
  * real extension, but instead is our main application.
  */
 const EXTENSION_APP = '<app>';
+
+/**
+ * Flag to indicate that we've already spawned the process to wait for the main
+ * process to shut down; this is global because we may need to restart the
+ * extension manager on settings change, but we should not spawn a new copy of
+ * the process watcher in that case.
+ */
+let mainProcessWatcherInitialized = false;
 
 export class ExtensionManagerImpl implements ExtensionManager {
   /**
@@ -85,7 +94,7 @@ export class ExtensionManagerImpl implements ExtensionManager {
    * @note Only one listener per topic is supported.
    */
   protected setMainListener<K extends keyof IpcMainEvents>(channel: K, listener: IpcMainEventListener<K>) {
-    const oldListener = this.eventListeners[channel] as IpcMainEventListener<K> | undefined;
+    const oldListener = this.eventListeners[channel];
 
     if (oldListener) {
       console.error(`Removing duplicate event listener for ${ channel }`);
@@ -118,6 +127,21 @@ export class ExtensionManagerImpl implements ExtensionManager {
   protected processes: Record<string, WeakRef<ReadableChildProcess>> = {};
 
   async init(config: RecursiveReadonly<Settings>) {
+    if (process.platform !== 'win32' && !mainProcessWatcherInitialized) {
+      // If we're not running on Windows, spawn a process that waits for this
+      // process to exit and then kill all processes in this process group.
+      // We don't do this on Windows as we have a different (job-based)
+      // implementation there that will trigger automatically when we exit,
+      // based on `wsl-helper process spawn`.
+      const proc = spawn(
+        executable('rdctl'),
+        ['internal', 'process', 'wait-kill', `--pid=${ process.pid }`],
+        { stdio: ['ignore', await console.fdStream, await console.fdStream], detached: true });
+
+      proc.unref();
+      mainProcessWatcherInitialized = true;
+    }
+
     // Handle events from the renderer process.
     this.setMainListener('extensions/open-external', (...[, url]) => {
       Electron.shell.openExternal(url);
@@ -194,6 +218,12 @@ export class ExtensionManagerImpl implements ExtensionManager {
     this.setMainHandler('extensions/vm/http-fetch', async(event, config) => {
       const extensionId = this.getExtensionIdFromEvent(event);
 
+      if (!extensionId) {
+        // Sender frame has gone away, no need to fetch anymore.
+        return {
+          statusCode: -1, name: 'Request aborted', message: 'Request aborted',
+        };
+      }
       if (extensionId === EXTENSION_APP) {
         throw new Error('HTTP fetch from main app not implemented yet');
       }
@@ -225,9 +255,11 @@ export class ExtensionManagerImpl implements ExtensionManager {
         headers: config.headers ?? {},
         body:    config.data,
       };
-      const response = await fetch(url.toString(), options);
+      const response = await net.fetch(url.toString(), options);
 
-      return await response.text();
+      return {
+        statusCode: response.status, name: http.STATUS_CODES[response.status] ?? 'Unknown', message: await response.text(),
+      };
     });
 
     // Import image for port forwarding
@@ -267,6 +299,9 @@ export class ExtensionManagerImpl implements ExtensionManager {
       })(repo, tag));
     }
     await Promise.all(tasks);
+
+    // Register a listener to shut down extensions on quit
+    mainEvents.handle('extensions/shutdown', this.triggerExtensionShutdown);
   }
 
   /**
@@ -288,7 +323,7 @@ export class ExtensionManagerImpl implements ExtensionManager {
     if (!this.#supportedExtensions) {
       const supported: Record<string, boolean> = {};
 
-      for (const item of demoMarketplace.summaries) {
+      for (const item of MARKETPLACE_DATA) {
         const slug = parseImageReference(item.slug);
 
         if (!slug) {
@@ -399,8 +434,14 @@ export class ExtensionManagerImpl implements ExtensionManager {
   /**
    * Given an IpcMainEvent, return the extension ID associated with it.
    */
-  protected getExtensionIdFromEvent(event: IpcMainEvent | IpcMainInvokeEvent): string {
-    const origin = new URL(event.senderFrame.origin);
+  protected getExtensionIdFromEvent(event: IpcMainEvent | IpcMainInvokeEvent): string | undefined {
+    const { senderFrame } = event;
+
+    if (!senderFrame) {
+      return;
+    }
+
+    const origin = new URL(senderFrame.origin);
 
     return origin.protocol === 'app:' ? EXTENSION_APP : Buffer.from(origin.hostname, 'hex').toString();
   }
@@ -409,6 +450,9 @@ export class ExtensionManagerImpl implements ExtensionManager {
   protected async spawnHost(event: IpcMainEvent | IpcMainInvokeEvent, options: SpawnOptions): Promise<ReadableChildProcess> {
     const extensionId = this.getExtensionIdFromEvent(event);
 
+    if (!extensionId) {
+      throw new Error(`spawning process from a closed window`);
+    }
     if (extensionId === EXTENSION_APP) {
       throw new Error(`spawning a process from the main application is not implemented yet: ${ options.command.join(' ') }`);
     }
@@ -419,19 +463,33 @@ export class ExtensionManagerImpl implements ExtensionManager {
       throw new Error(`Could not find calling extension ${ extensionId }`);
     }
 
-    return spawn(
-      path.join(extension.dir, 'bin', options.command[0]),
-      options.command.slice(1),
-      {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        ..._.pick(options, ['cwd', 'env']),
-      });
+    const command = [...options.command];
+    const finalOptions: SpawnOptionsWithStdioTuple<'ignore', 'pipe', 'pipe'> = {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env:   {},
+      ..._.pick(options, ['cwd', 'env']),
+    };
+    const binDir = path.join(paths.resources, process.platform, 'bin');
+
+    finalOptions.env = _.merge({}, process.env, finalOptions.env);
+    finalOptions.env.PATH = finalOptions.env.PATH + path.delimiter + binDir;
+
+    command[0] = path.join(extension.dir, 'bin', command[0]);
+    if (process.platform === 'win32') {
+      // Use wsl-helper to launch the executable
+      command.unshift(executable('wsl-helper'), 'process', 'spawn', `--parent=${ process.pid }`, '--');
+    }
+
+    return spawn(command[0], command.slice(1), finalOptions);
   }
 
   /** Spawn a process in the docker-cli context. */
   protected async spawnDockerCli(event: IpcMainEvent | IpcMainInvokeEvent, options: SpawnOptions): Promise<ReadableChildProcess> {
     const extensionId = this.getExtensionIdFromEvent(event);
 
+    if (!extensionId) {
+      throw new Error(`Spawning docker client from closed sender frame`);
+    }
     if (extensionId !== EXTENSION_APP) {
       const extension = await this.getExtension(extensionId) as ExtensionImpl;
 
@@ -451,6 +509,9 @@ export class ExtensionManagerImpl implements ExtensionManager {
   protected async spawnContainer(event: IpcMainEvent | IpcMainInvokeEvent, options: SpawnOptions): Promise<ReadableChildProcess> {
     const extensionId = this.getExtensionIdFromEvent(event);
 
+    if (!extensionId) {
+      throw new Error(`Spawning docker client from closed sender frame`);
+    }
     if (extensionId === EXTENSION_APP) {
       throw new Error(`Spawning a container command is not implemented for the main app: ${ options.command.join(' ') }`);
     }
@@ -473,10 +534,10 @@ export class ExtensionManagerImpl implements ExtensionManager {
     let errored = false;
 
     process.stdout.on('data', (data: string | Buffer) => {
-      stdout.push(Buffer.from(data));
+      stdout.push(typeof data === 'string' ? Buffer.from(data) : data);
     });
     process.stderr.on('data', (data: string | Buffer) => {
-      stderr.push(Buffer.from(data));
+      stderr.push(typeof data === 'string' ? Buffer.from(data) : data);
     });
 
     return new Promise((resolve, reject) => {
@@ -557,7 +618,7 @@ export class ExtensionManagerImpl implements ExtensionManager {
     this.processes[fullId] = new WeakRef(process);
   }
 
-  async shutdown() {
+  shutdown() {
     // Remove our event listeners (to avoid issues when we switch backends).
     for (const untypedChannel in this.eventListeners) {
       const channel = untypedChannel as keyof IpcMainEvents;
@@ -570,10 +631,20 @@ export class ExtensionManagerImpl implements ExtensionManager {
       ipcMain.removeHandler(untypedChannel as keyof IpcMainInvokeEvents);
     }
 
-    await Promise.allSettled(Object.values(this.processes).map((proc) => {
+    for (const proc of Object.values(this.processes)) {
       proc.deref()?.kill();
-    }));
+    }
+
+    mainEvents.handle('extensions/shutdown', undefined);
+
+    return Promise.resolve();
   }
+
+  triggerExtensionShutdown = async() => {
+    await Promise.all((await this.getInstalledExtensions()).map((extension) => {
+      return extension.shutdown();
+    }));
+  };
 }
 
 function getExtensionManager(): Promise<ExtensionManager | undefined> {

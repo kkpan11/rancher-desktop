@@ -1,32 +1,40 @@
 <template>
   <div class="containers">
+    <banner
+      v-if="errorMessage"
+      color="error"
+      @close="clearError"
+    >
+      {{ errorMessage }}
+    </banner>
     <SortableTable
       ref="sortableTableRef"
       class="containersTable"
       :headers="headers"
-      key-field="Id"
+      key-field="id"
       :rows="rows"
       no-rows-key="containers.sortableTables.noRows"
       :row-actions="true"
       :paging="true"
-      :rows-per-page="10"
-      :has-advanced-filtering="true"
-      :loading="!containersList"
+      :has-advanced-filtering="false"
+      :loading="containers === null"
+      group-by="projectGroup"
+      :group-sort="['projectGroup']"
     >
       <template #header-middle>
         <div class="header-middle">
           <div v-if="supportsNamespaces">
-            <label>Namespace</label>
+            <label>{{ t('generic.namespace') }}</label>
             <select
               class="select-namespace"
-              :value="selectedNamespace"
+              :value="namespace"
               @change="onChangeNamespace($event)"
             >
               <option
-                v-for="item in containersNamespaces"
+                v-for="item in namespaces"
                 :key="item"
                 :value="item"
-                :selected="item === selectedNamespace"
+                :selected="item === namespace"
               >
                 {{ item }}
               </option>
@@ -34,43 +42,47 @@
           </div>
         </div>
       </template>
-      <template #col:containerState="{row}">
+      <template #col:containerState="{ row }">
         <td>
           <badge-state
             :color="isRunning(row) ? 'bg-success' : 'bg-darker'"
-            :label="row.State"
+            :label="row.state"
           />
         </td>
       </template>
-      <template #col:imageName="{row}">
+      <template #col:imageName="{ row }">
         <td>
           <span v-tooltip="getTooltipConfig(row.imageName)">
             {{ shortSha(row.imageName) }}
           </span>
         </td>
       </template>
-      <template #col:containerName="{row}">
+      <template #col:containerName="{ row }">
         <td>
-          <span v-tooltip="getTooltipConfig(row.containerName)">
+          <a
+            v-tooltip="getTooltipConfig(row.containerName)"
+            class="container-name-link"
+            @click="onContainerNameClick($event, row)"
+          >
             {{ shortSha(row.containerName) }}
-          </span>
+          </a>
         </td>
       </template>
       <template #col:ports="{ row }">
         <td>
           <div class="port-container">
             <a
-              v-for="port in getUniquePorts(row.Ports).slice(0, 2)"
-              :key="port"
+              v-for="[hostPort, containerPort] in row.portList.slice(0, 2)"
+              :key="hostPort"
               target="_blank"
               class="link"
-              @click="openUrl(port)"
+              @click="onPortClick($event, hostPort)"
             >
-              {{ port }}
+              {{ hostPort }}:{{ containerPort }}
             </a>
 
             <div
-              v-if="shouldHaveDropdown(row.Ports)"
+              v-if="shouldHaveDropdown(row.portList)"
               class="dropdown"
               @mouseenter="addDropDownPosition"
               @mouseleave="clearDropDownPosition"
@@ -80,54 +92,102 @@
               </span>
               <div class="dropdown-content">
                 <a
-                  v-for="port in getUniquePorts(row.Ports).slice(2)"
-                  :key="port"
+                  v-for="[hostPort, containerPort] in row.portList.slice(2)"
+                  :key="hostPort"
                   target="_blank"
                   class="link"
-                  @click="openUrl(port)"
+                  @click="onPortClick($event, hostPort)"
                 >
-                  {{ port }}
+                  {{ hostPort }}:{{ containerPort }}
                 </a>
               </div>
             </div>
           </div>
         </td>
       </template>
+      <template #group-row="{ group }">
+        <tr
+          class="group-row"
+          :aria-expanded="!collapsed[group.ref]"
+        >
+          <td :colspan="headers.length + 1">
+            <div class="group-tab">
+              <i
+                data-title="Toggle Expand"
+                :class="{
+                  icon: true,
+                  'icon-chevron-right': !!collapsed[group.ref],
+                  'icon-chevron-down': !collapsed[group.ref],
+                }"
+                @click.stop="toggleExpand(group.ref)"
+              />
+              {{ groupLabel(group.ref) }}
+              <span v-if="!!collapsed[group.ref]"> ({{ group.rows.length }})</span>
+            </div>
+          </td>
+        </tr>
+      </template>
     </SortableTable>
   </div>
 </template>
 
 <script>
-import SortableTable from '@pkg/components/SortableTable';
-import { BadgeState } from '@rancher/components';
+import { BadgeState, Banner } from '@rancher/components';
+import dayjs from 'dayjs';
 import { shell } from 'electron';
-import Vue from 'vue';
+import merge from 'lodash/merge';
+import { defineComponent } from 'vue';
 import { mapGetters } from 'vuex';
 
-import { ContainerEngine } from '@pkg/config/settings';
+import SortableTable from '@pkg/components/SortableTable';
+import { mapTypedGetters, mapTypedState } from '@pkg/entry/store';
+import { STANDALONE_CONTAINERS_GROUP } from '@pkg/store/container-engine';
+import { showDeleteConfirmation } from '@pkg/utils/deleteConfirmation';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
-
-let containerCheckInterval = null;
+import { isSelectionClick } from '@pkg/utils/platform';
 
 /**
- * @typedef Container {Object} The return type of ddClient.docker.listContainers
- * @property Id {string} The container id
+ * @import { Container } from '@pkg/store/container-engine'
  */
 
-export default Vue.extend({
+/**
+ * @typedef { Object } Action
+ * @property { string } label
+ * @property { string } action
+ * @property { boolean } enabled
+ * @property { boolean } bulkable
+ * @property { string } [bulkAction]
+ */
+
+/**
+ * @typedef { Container } RowItem An item in the table row
+ * @property { Action[] } [availableActions]
+ * @property { (this: Container, containers?: Container[]) => void } [stopContainer]
+ * @property { (this: Container, containers?: Container[]) => void } [restartContainer]
+ * @property { (this: Container, containers?: Container[]) => void } [startContainer]
+ * @property { (this: Container, containers?: Container[]) => Promise<void> } [deleteContainer]
+ * @property { (this: Container) => void } [viewInfo]
+ * @property { (readonly [number, number])[] } portList
+ */
+
+export default defineComponent({
   name:       'Containers',
-  title:      'Containers',
-  components: { SortableTable, BadgeState },
+  components: { SortableTable, BadgeState, Banner },
   data() {
     return {
       /** @type import('@pkg/config/settings').Settings | undefined */
-      settings:             undefined,
-      ddClient:             null,
-      containersList:       null,
-      showRunning:          false,
-      containersNamespaces: [],
+      settings:                   undefined,
+      /** @type string | null */
+      execError:                  null,
+      /** @type Record<string, boolean> */
+      collapsed:                   {},
+      /**
+       * This timer is used to retry subscribing to events until the backend is
+       * ready enough to update the vuex store.
+       * @type ReturnType<typeof setTimeout> | undefined
+       */
+      subscribeTimer:       undefined,
       headers:              [
-        // INFO: Disable for now since we can only get the running containers.
         {
           name:  'containerState',
           label: this.t('containers.manage.table.header.state'),
@@ -148,7 +208,7 @@ export default Vue.extend({
           sort:  ['ports', 'containerName', 'imageName'],
         },
         {
-          name:  'started',
+          name:  'uptime',
           label: this.t('containers.manage.table.header.started'),
           sort:  ['si', 'containerName', 'imageName'],
           width: 120,
@@ -158,156 +218,190 @@ export default Vue.extend({
   },
   computed: {
     ...mapGetters('k8sManager', { isK8sReady: 'isReady' }),
+    ...mapTypedState('container-engine', ['containers', 'namespaces']),
+    ...mapTypedGetters('container-engine', ['namespace', 'supportsNamespaces', 'error']),
+    /** @returns {RowItem[]} */
     rows() {
-      if (!this.containersList) {
+      if (!this.containers) {
         return [];
       }
-
-      const containers = structuredClone(this.containersList);
-
-      return containers.map((container) => {
-        const names = Array.isArray(container.Names) ? container.Names : container.Names.split(/\s+/);
-        const name = names[0];
-
-        container.state = container.State;
-        container.containerName = name.replace(
-          /_[a-z0-9-]{36}_[0-9]+/,
-          '',
-        );
-        container.started = container.State === 'running' ? container.Status : '';
-        container.imageName = container.Image;
-        container.containerState = container.State ?? container.Status;
-
-        if (this.isNerdCtl) {
-          container.started = container.containerState;
-          if (container.Status.match(/exited/i)) {
-            container.State = 'exited';
-          } else {
-            container.State = container.Status.toLowerCase();
+      return Object.values(this.containers)
+        .filter(container => {
+          // Filter out containers from the 'kube-system' namespace
+          return this.supportsNamespaces || container.labels['io.kubernetes.pod.namespace'] !== 'kube-system';
+        })
+        .sort((a, b) => {
+          // Sort by status, showing running first.
+          if ((a.state === 'running' || b.state === 'running') && a.state !== b.state) {
+            // One of the two is running; put that first.
+            return a.state === 'running' ? -1 : 1;
           }
-        }
-
-        container.availableActions = [
-          {
-            label:      'Stop',
-            action:     'stopContainer',
-            enabled:    this.isRunning(container),
-            bulkable:   true,
-            bulkAction: 'stopContainer',
+          // Both or running, or neither.
+          return a.state.localeCompare(b.state) || a.id.localeCompare(b.id);
+        })
+        .map(container => merge({}, container, {
+          uptime:           container.started && dayjs(container.started).toNow(true),
+          availableActions: this.getContainerActions(container),
+          stopContainer:    (args) => {
+            this.execCommand('stop', this.containerCommandTarget(container, args));
           },
-          {
-            label:      'Start',
-            action:     'startContainer',
-            enabled:    this.isStopped(container),
-            bulkable:   true,
-            bulkAction: 'startContainer',
+          restartContainer:   (args) => {
+            this.execCommand('restart', this.containerCommandTarget(container, args));
           },
-          {
-            label:      this.t('images.manager.table.action.delete'),
-            action:     'deleteContainer',
-            enabled:    this.isStopped(container),
-            bulkable:   true,
-            bulkAction: 'deleteContainer',
+          startContainer:   (args) => {
+            this.execCommand('start', this.containerCommandTarget(container, args));
           },
-        ];
+          deleteContainer:   async(args) => {
+            const targets = this.containerCommandTarget(container, args);
 
-        if (!container.stopContainer) {
-          container.stopContainer = (...args) => {
-            this.stopContainer(...(args?.length > 0 ? args : [container]));
-          };
-        }
-
-        if (!container.startContainer) {
-          container.startContainer = (...args) => {
-            this.startContainer(...(args?.length > 0 ? args : [container]));
-          };
-        }
-
-        if (!container.deleteContainer) {
-          container.deleteContainer = (...args) => {
-            this.deleteContainer(...(args?.length > 0 ? args : [container]));
-          };
-        }
-
-        return container;
-      });
+            if (await this.confirmDelete(targets)) {
+              await this.execCommand('rm', targets);
+            }
+          },
+          viewInfo: () => {
+            this.viewInfo(container);
+          },
+          portList: this.getPortList(container),
+        }));
     },
-    isNerdCtl() {
-      return this.settings?.containerEngine?.name === ContainerEngine.CONTAINERD;
-    },
-    supportsNamespaces() {
-      return this.settings?.containerEngine?.name === ContainerEngine.CONTAINERD;
-    },
-    selectedNamespace() {
-      return this.supportsNamespaces ? this.settings?.containers.namespace : undefined;
+    errorMessage() {
+      if (this.execError) {
+        return this.execError;
+      }
+      switch (this.error?.source) {
+      case 'containers': case 'namespaces': {
+        const error = this.error.error;
+
+        return `${ error?.stderr ?? error }`;
+      }
+      }
+      return null;
     },
   },
   mounted() {
-    this.$store.dispatch('page/setHeader', {
-      title:       this.t('containers.title'),
-      description: '',
-    });
+    this.$store.dispatch('page/setHeader', { titleKey: 'containers.title' });
 
     ipcRenderer.on('settings-read', (event, settings) => {
       this.settings = settings;
-      this.checkContainers().catch(console.error);
+      this.subscribe().catch(console.error);
     });
 
     ipcRenderer.send('settings-read');
 
-    ipcRenderer.on('settings-update', (_event, settings) => {
-      this.settings = settings;
-      this.containersList = [];
-      this.checkSelectedNamespace();
-    });
+    ipcRenderer.on('settings-update', this.updateSettings);
 
-    this.checkContainers().catch(console.error);
-    containerCheckInterval = setInterval(this.checkContainers.bind(this), 1_000);
+    this.subscribe().catch(console.error);
   },
-  beforeDestroy() {
-    ipcRenderer.removeAllListeners('settings-update');
-    ipcRenderer.removeAllListeners('containers-namespaces');
-    ipcRenderer.removeAllListeners('containers-namespaces-containers');
-    clearInterval(containerCheckInterval);
+  beforeUnmount() {
+    ipcRenderer.removeListener('settings-update', this.updateSettings);
+    this.$store.dispatch('container-engine/unsubscribe').catch(console.error);
+    clearTimeout(this.subscribeTimer);
   },
   methods: {
-    async checkContainers() {
-      if (window.ddClient && this.isK8sReady && this.settings) {
-        this.ddClient = window.ddClient;
-
-        try {
-          if (this.supportsNamespaces) {
-            await this.getNamespaces();
-          }
-        } catch (error) {
-          console.error('There was a problem fetching namespaces:', { error });
+    /**
+     * @param container {Container} The container in this row.
+     * @param args {Container[] | undefined} The bulk selection from the table's action bar, if any.
+     * @returns {Container[]} The bulk selection if there is one, otherwise the row's container.
+     */
+    containerCommandTarget(container, args) {
+      return args?.length ? args : [container];
+    },
+    /**
+     * Ask the user to confirm deleting the given containers.
+     * @param containers {Container[]} The containers to delete, listed by name in the dialog.
+     * @returns {Promise<boolean>} Whether the user chose to delete them.
+     */
+    async confirmDelete(containers) {
+      return await showDeleteConfirmation({
+        title:   this.t('containers.confirmDelete.title'),
+        message: this.t('containers.confirmDelete.message', { count: containers.length }),
+        confirm: this.t('containers.confirmDelete.confirm'),
+        cancel:  this.t('generic.cancel'),
+        names:   containers.map(container => container.containerName),
+      });
+    },
+    getContainerActions(container) {
+      return [
+        {
+          label:      this.t('containers.manage.table.action.info'),
+          action:     'viewInfo',
+          enabled:    true,
+          bulkable:   false,
+        },
+        {
+          label:      this.t('containers.manage.table.action.stop'),
+          action:     'stopContainer',
+          enabled:    this.isRunning(container),
+          bulkable:   true,
+          bulkAction: 'stopContainer',
+        },
+        {
+          label:      this.t('containers.manage.table.action.restart'),
+          action:     'restartContainer',
+          enabled:    this.isRunning(container),
+          bulkable:   true,
+          bulkAction: 'restartContainer',
+        },
+        {
+          label:      this.t('containers.manage.table.action.start'),
+          action:     'startContainer',
+          enabled:    this.isStopped(container),
+          bulkable:   true,
+          bulkAction: 'startContainer',
+        },
+        {
+          label:      this.t('images.manager.table.action.delete'),
+          action:     'deleteContainer',
+          enabled:    this.isStopped(container),
+          bulkable:   true,
+          bulkAction: 'deleteContainer',
+        },
+      ];
+    },
+    async subscribe() {
+      clearTimeout(this.subscribeTimer);
+      try {
+        if (!window.ddClient || !this.isK8sReady || !this.settings) {
+          setTimeout(() => this.subscribe(), 1_000);
+          return;
         }
-        try {
-          await this.getContainers();
-          clearInterval(containerCheckInterval);
-        } catch (error) {
-          console.error('There was a problem fetching containers:', { error });
-        }
+        await this.$store.dispatch('container-engine/subscribe', {
+          type:      'containers',
+          client:    window.ddClient,
+        });
+      } catch (error) {
+        console.error('There was a problem subscribing to container events:', { error });
       }
     },
+
+    updateSettings(_event, settings) {
+      this.settings = settings;
+      this.checkSelectedNamespace();
+    },
+
     checkSelectedNamespace() {
-      if (!this.supportsNamespaces || this.containersNamespaces.length === 0) {
+      if (!this.supportsNamespaces || !this.namespaces?.length) {
         // Nothing to verify yet
         return;
       }
-      if (!this.containersNamespaces.includes(this.selectedNamespace)) {
+      if (!this.namespaces.includes(this.namespace)) {
         const K8S_NAMESPACE = 'k8s.io';
-        const defaultNamespace = this.containersNamespaces.includes(K8S_NAMESPACE) ? K8S_NAMESPACE : this.containersNamespaces[0];
+        const defaultNamespace = this.namespaces.includes(K8S_NAMESPACE) ? K8S_NAMESPACE : this.namespaces[0];
 
         ipcRenderer.invoke('settings-write',
           { containers: { namespace: defaultNamespace } } );
       }
     },
-    async onChangeNamespace(value) {
-      if (value !== this.selectedNamespace) {
+    async onChangeNamespace(event) {
+      const { value } = event.target;
+      if (value !== this.namespace) {
         await ipcRenderer.invoke('settings-write',
-          { containers: { namespace: value.target.value } } );
-        this.getContainers();
+          { containers: { namespace: value } } );
+        this.$store.dispatch('container-engine/subscribe', {
+          type:      'containers',
+          client:    window.ddClient,
+          namespace: value,
+        });
       }
     },
     clearDropDownPosition(e) {
@@ -340,71 +434,91 @@ export default Vue.extend({
         }
       }
     },
-    async getNamespaces() {
-      this.containersNamespaces = await this.ddClient?.docker.listNamespaces();
-      this.checkSelectedNamespace();
+    /**
+     * @param event {MouseEvent}
+     * @param container {RowItem}
+     */
+    onContainerNameClick(event, container) {
+      if (isSelectionClick(event)) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      this.viewInfo(container);
     },
-    async getContainers() {
-      const containers = await this.ddClient?.docker.listContainers({ all: true, namespace: this.selectedNamespace });
+    /**
+     * @param event {MouseEvent}
+     * @param hostPort {number}
+     */
+    onPortClick(event, hostPort) {
+      if (isSelectionClick(event)) {
+        return;
+      }
+      this.openUrl(hostPort);
+    },
+    viewInfo(container) {
+      this.$router.push(`/containers/info/${ container.id }`);
+    },
 
-      // Sorts by status, showing running first.
-      this.containersList = containers.sort((a, b) => {
-        if (a.State === 'running' && b.State !== 'running') {
-          return -1;
-        } else if (a.State !== 'running' && b.State === 'running') {
-          return 1;
-        } else {
-          return a.State.localeCompare(b.State);
-        }
-      });
-
-      // Filter out images from "kube-system" namespace
-      this.containersList = this.containersList.filter((container) => {
-        return container.Labels['io.kubernetes.pod.namespace'] !== 'kube-system';
-      });
-    },
-    async stopContainer(container) {
-      await this.execCommand('stop', container);
-    },
-    async startContainer(container) {
-      await this.execCommand('start', container);
-    },
-    async deleteContainer(container) {
-      await this.execCommand('rm', container);
-    },
+    /** @param container {RowItem} */
     isRunning(container) {
-      return container.State === 'running' || container.Status === 'Up';
+      return container.state === 'running' || container.status === 'Up';
     },
+    /** @param container {RowItem} */
     isStopped(container) {
-      return container.State === 'created' || container.State === 'exited' || container.Status.includes('Exited');
+      return container.state === 'created' || container.state === 'exited';
     },
     /**
      * Execute a command against some containers
      * @param command {string} The command to run
-     * @param _ids {Container | Container[]} The containers to affect
+     * @param containers {Container[]} The containers to affect
      */
-    async execCommand(command, _ids) {
+    async execCommand(command, containers) {
       try {
-        const ids = Array.isArray(_ids) ? _ids.map(c => c.Id) : [_ids.Id];
+        const ids = containers.map(container => container.id);
+        const options = { cwd: '/' };
 
         console.info(`Executing command ${ command } on container ${ ids }`);
+        if (this.supportsNamespaces) {
+          options.namespace = this.namespace;
+        }
 
-        const { stderr, stdout } = await this.ddClient.docker.cli.exec(
-          command,
-          [...ids],
-          { cwd: '/', namespace: this.selectedNamespace },
-        );
+        const { stderr, stdout } = await window.ddClient.docker.cli.exec(command, [...ids], options);
 
         if (stderr) {
           throw new Error(stderr);
         }
 
-        await this.getContainers();
-
         return stdout;
       } catch (error) {
-        window.alert(error.message);
-        console.error(`Error executing command ${ command }`, error.message);
+        const extractErrorMessage = (err) => {
+          const rawMessage = err?.message || err?.stderr || err || '';
+
+          if (typeof rawMessage === 'string') {
+            // Extract message from fatal/error format: time="..." level=fatal msg="actual message"
+            const msgMatch = rawMessage.match(/msg="((?:[^"\\]|\\.)*)"/);
+            if (msgMatch) {
+              return msgMatch[1];
+            }
+
+            // Fallback: remove timestamp and level prefixes
+            const cleanedMessage = rawMessage
+              .replace(/time="[^"]*"\s*/g, '')
+              .replace(/level=(fatal|error|info)\s*/g, '')
+              .replace(/msg="/g, '')
+              .replace(/"\s*Error: exit status \d+/g, '')
+              .trim();
+
+            if (cleanedMessage) {
+              return cleanedMessage;
+            }
+          }
+
+          return `Failed to execute command: ${ command }`;
+        };
+
+        this.execError = extractErrorMessage(error);
+        console.error(`Error executing command ${ command }`, error);
       }
     },
     shortSha(sha) {
@@ -426,46 +540,64 @@ export default Vue.extend({
 
       return { content: sha };
     },
-    getUniquePorts(ports) {
-      const keys = Object.keys(ports);
-
-      if (!keys || Object.keys(keys).length === 0) {
-        return [];
-      }
-
-      const uniquePortMap = keys.map((key) => {
-        const values = ports[key];
-
-        const hostPorts = values?.map(value => value.HostPort);
-        const uniqueHostPorts = [...new Set(hostPorts)];
-
-        return { [key]: uniqueHostPorts };
-      });
-
-      const displayMap = uniquePortMap.map((element) => {
-        const key = Object.keys(element)[0];
-        const values = element[key];
-        const port = key.split('/')[0];
-
-        return values.map(value => `${ value }:${ port }`);
-      });
-
-      return [].concat.apply([], displayMap);
+    /**
+     * @param container {Container}
+     * @returns {[number, number][]} (host port, container port) tuples, sorted by host port.
+     */
+    getPortList(container) {
+      /** @type [string, { HostIp: string, HostPort: string}][] */
+      const rawPorts = Object.entries(container.ports).filter(([, host]) => !!host);
+      // Convert to a map to make sure it's unique by host port
+      /** @type Record<string, string> */
+      const mapping = Object.fromEntries(rawPorts.flatMap(([portDef, entries]) => {
+        return entries.map(({ HostPort }) => [HostPort, portDef.split('/')[0]]);
+      }));
+      return Object.entries(mapping).map(([h, c]) => [parseInt(h, 10), parseInt(c, 10)]);
     },
+    /** @param ports {(readonly [number, number])[]} */
     shouldHaveDropdown(ports) {
       if (!ports) {
         return false;
       }
 
-      return this.getUniquePorts(ports)?.length >= 3;
+      return ports.length >= 3;
     },
-    openUrl(port) {
-      const hostPort = parseInt(port.split(':')[0]);
-
+    openUrl(hostPort) {
       if ([80, 443].includes(hostPort)) {
         hostPort === 80 ? shell.openExternal(`http://localhost`) : shell.openExternal(`https://localhost`);
       } else {
         return shell.openExternal(`http://localhost:${ hostPort }`);
+      }
+    },
+
+    toggleExpand(group) {
+      this.collapsed[group] = !this.collapsed[group];
+    },
+
+    /**
+     * @param group {string} The group key (a container's projectGroup).
+     * @returns {string} The text shown in the group's header row.
+     */
+    groupLabel(group) {
+      // Compose project and pod names are user data; only the standalone group
+      // has a fixed English key that needs a translated label.
+      return group === STANDALONE_CONTAINERS_GROUP ? this.t('containers.manage.table.group.standalone') : group;
+    },
+
+    clearError() {
+      this.execError = null;
+      switch (this.error?.source) {
+      case 'namespaces': case 'containers':
+        this.$store.commit('container-engine/SET_ERROR', null);
+      }
+    },
+  },
+  watch: {
+    isK8sReady(isK8sReady) {
+      if (!isK8sReady) {
+        // The backend went from ready -> unready, unsubscribe and restart.
+        this.$store.dispatch('container-engine/unsubscribe').catch(console.error);
+        this.subscribe().catch(console.error);
       }
     },
   },
@@ -476,6 +608,25 @@ export default Vue.extend({
 .containers {
   &-status {
     padding: 8px 5px;
+  }
+
+  .group-row {
+    .group-tab {
+      font-weight: bold;
+      .icon {
+        cursor: pointer;
+      }
+    }
+    &[aria-expanded="false"] {
+      :deep(~ .main-row) {
+        visibility: collapse;
+        .checkbox-container {
+          /* When using visibility:collapse, the row selection checkbox produces
+           * some artifacts; force it to display:none to avoid flickering. */
+          display: none;
+        }
+      }
+    }
   }
 }
 
@@ -525,11 +676,22 @@ export default Vue.extend({
   min-width: 8rem;
 }
 
-.containersTable::v-deep .search-box {
+.containersTable :deep(.search-box) {
   align-self: flex-end;
 }
-.containersTable::v-deep .bulk {
+.containersTable :deep(.bulk) {
   align-self: flex-end;
+}
+
+.container-name-link {
+  color: var(--link);
+  cursor: pointer;
+  text-decoration: none;
+
+  &:hover {
+    text-decoration: underline;
+    color: var(--link-hover);
+  }
 }
 
 .port-container {

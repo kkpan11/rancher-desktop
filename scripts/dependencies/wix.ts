@@ -3,43 +3,59 @@ import path from 'path';
 
 import semver from 'semver';
 
-import { Dependency, DownloadContext, GitHubDependency, getOctokit } from '../lib/dependencies';
+import {
+  DependencyAsset,
+  DownloadContext,
+  downloadAndHash,
+  getOctokit,
+  GitHubDependency,
+  GlobalDependency,
+  selectAsset,
+} from '../lib/dependencies';
 import { download } from '../lib/download';
 
-import { simpleSpawn } from 'scripts/simple_process';
+import { simpleSpawn } from '@/scripts/simple_process';
 
 /**
  * Wix downloads the latest build of WiX3.
  */
-export class Wix implements Dependency, GitHubDependency {
+export class Wix extends GlobalDependency(GitHubDependency) {
   readonly name = 'wix';
 
   // Wix4 is packaged really oddly (involves NuGet), and while there's a sketchy
-  // build in github.com/electron-userland/electron-builder-binaries it's rather
+  // build in https://github.com/electron-userland/electron-builder-binaries, it's rather
   // outdated (and has since-fixed bugs).
   readonly githubOwner = 'wixtoolset';
   readonly githubRepo = 'wix3';
+  readonly releaseFilter = 'custom';
 
   async download(context: DownloadContext): Promise<void> {
-    // WiX doesn't appear to believe in checksum files...
-
-    const tagName = this.versionToTagName(context.versions.wix);
-    const version = semver.parse(context.versions.wix);
-
-    if (!version) {
-      throw new Error(`Could not parse WiX version ${ context.versions.wix }`);
-    }
-
+    // WiX is a .NET toolset with no per-arch build; a single Windows asset
+    // serves every architecture.  Upstream publishes no checksum file, so we
+    // rely on the digest recorded in dependencies.yaml at bump time.
+    const asset = selectAsset(context, this.name, { platform: 'windows' });
     const hostDir = path.join(context.resourcesDir, 'host');
     const wixDir = path.join(hostDir, 'wix');
-    const archivePath = path.join(hostDir, `${ tagName }.zip`);
-    // The archive name never includes the patch version.
-    const archiveName = `wix${ version.major }${ version.minor }-binaries.zip`;
-    const url = `https://github.com/wixtoolset/wix3/releases/download/${ tagName }/${ archiveName }`;
+    const archivePath = path.join(hostDir, path.basename(new URL(asset.url).pathname));
 
     await fs.promises.mkdir(wixDir, { recursive: true });
-    await download(url, archivePath);
+    await download(asset.url, archivePath, { expectedChecksum: asset.checksum });
     await simpleSpawn('unzip', ['-q', '-o', archivePath, '-d', wixDir], { cwd: wixDir });
+  }
+
+  async getAssets(version: string): Promise<DependencyAsset[]> {
+    const tagName = this.versionToTagName(version);
+    const parsed = semver.parse(version);
+
+    if (!parsed) {
+      throw new Error(`Could not parse WiX version ${ version }`);
+    }
+
+    // The archive name never includes the patch version.
+    const archiveName = `wix${ parsed.major }${ parsed.minor }-binaries.zip`;
+    const url = `https://github.com/${ this.githubOwner }/${ this.githubRepo }/releases/download/${ tagName }/${ archiveName }`;
+
+    return [{ platform: 'windows', url, checksum: await downloadAndHash(url) }];
   }
 
   versionToTagName(versionString: string): string {
@@ -61,9 +77,5 @@ export class Wix implements Dependency, GitHubDependency {
     const versions = publishedReleases.map(r => (/^WiX Toolset (v\d+\.\d+\.\d+)/.exec(r.name ?? '') ?? [])[1]);
 
     return versions.filter(version => version);
-  }
-
-  rcompareVersions(version1: string, version2: string): -1 | 0 | 1 {
-    return semver.rcompare(version1, version2);
   }
 }

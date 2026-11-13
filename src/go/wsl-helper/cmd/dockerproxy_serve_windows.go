@@ -22,10 +22,9 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/rancher-sandbox/rancher-desktop/src/go/wsl-helper/pkg/dockerproxy"
-	"github.com/rancher-sandbox/rancher-desktop/src/go/wsl-helper/pkg/dockerproxy/platform"
-
 	// Pull in to register the mungers
 	_ "github.com/rancher-sandbox/rancher-desktop/src/go/wsl-helper/pkg/dockerproxy/mungers"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/wsl-helper/pkg/dockerproxy/platform"
 )
 
 var dockerproxyServeViper = viper.New()
@@ -35,15 +34,17 @@ var dockerproxyServeCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Start the docker socket proxy server",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		isInternalCommand = true
 		cmd.SilenceUsage = true
 		cmd.SilenceErrors = true
 		endpoint := dockerproxyServeViper.GetString("endpoint")
 		port := dockerproxyServeViper.GetUint32("port")
+		logrus.WithFields(logrus.Fields{"endpoint": endpoint, "port": port}).Debug("starting docker proxy")
 		dialer, err := platform.MakeDialer(port)
 		if err != nil {
 			return err
 		}
-		err = dockerproxy.Serve(endpoint, dialer)
+		err = dockerproxy.Serve(cmd.Context(), endpoint, dialer)
 		if err != nil {
 			return err
 		}
@@ -54,7 +55,6 @@ var dockerproxyServeCmd = &cobra.Command{
 func init() {
 	dockerproxyServeCmd.Flags().String("endpoint", platform.DefaultEndpoint, "Endpoint to listen on")
 	dockerproxyServeCmd.Flags().Uint32("port", dockerproxy.DefaultPort, "Vsock port docker is listening on")
-	dockerproxyServeViper.AutomaticEnv()
 	if err := dockerproxyServeViper.BindPFlags(dockerproxyServeCmd.Flags()); err != nil {
 		logrus.WithError(err).Fatal("Failed to set up flags")
 	}

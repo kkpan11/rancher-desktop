@@ -1,17 +1,31 @@
-import { MobyClient } from '@pkg/backend/containerClient/mobyClient';
-import { NerdctlClient } from '@pkg/backend/containerClient/nerdctlClient';
-import dockerRegistry from '@pkg/backend/containerClient/registry';
-import { ContainerEngineClient } from '@pkg/backend/containerClient/types';
-import MockBackend from '@pkg/backend/mock';
+/** @jest-environment node */
 
-jest.mock('@pkg/backend/mock');
-jest.mock('@pkg/backend/containerClient/registry');
+import { jest } from '@jest/globals';
+
+import { ContainerEngineClient } from '@pkg/backend/containerClient/types';
+import mockModules from '@pkg/utils/testUtils/mockModules';
+
+const modules = mockModules({
+  '@pkg/backend/mock': {
+    default: jest.fn(),
+  },
+  '@pkg/backend/containerClient/registry': {
+    default: {
+      getTags: jest.fn((_name: string) => Promise.resolve<string[]>([])),
+    },
+  },
+  electron: undefined,
+});
+
+const { default: MockBackend } = await import('@pkg/backend/mock');
+const { NerdctlClient } = await import('@pkg/backend/containerClient/nerdctlClient');
+const { MobyClient } = await import('@pkg/backend/containerClient/mobyClient');
 
 describe.each(['nerdctl', 'moby'] as const)('%s', (clientName) => {
   let subject: ContainerEngineClient;
 
   beforeEach(() => {
-    const executor = new MockBackend() as jest.Mocked<MockBackend>;
+    const executor = new MockBackend() as jest.Mocked<InstanceType<typeof MockBackend>>;
 
     switch (clientName) {
     case 'nerdctl':
@@ -36,7 +50,7 @@ describe.each(['nerdctl', 'moby'] as const)('%s', (clientName) => {
       localTags = [];
       localExtras = [];
 
-      jest.mocked(dockerRegistry).getTags.mockImplementation((name) => {
+      modules['@pkg/backend/containerClient/registry'].default.getTags.mockImplementation((name) => {
         expect(name).toEqual(repository);
 
         if (registryTags.length) {

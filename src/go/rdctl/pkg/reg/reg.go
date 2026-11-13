@@ -10,15 +10,27 @@ package reg
 import (
 	"encoding/json"
 	"fmt"
-	options "github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/options/generated"
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/utils"
 	"reflect"
 	"strings"
 	"unicode/utf16"
+
+	options "github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/options/generated"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/utils"
 )
 
-const HkcuRegistryHive = "hkcu"
-const HklmRegistryHive = "hklm"
+type RegistryHive string
+
+const (
+	HkcuRegistryHive RegistryHive = "hkcu"
+	HklmRegistryHive RegistryHive = "hklm"
+)
+
+type ProfileType string
+
+const (
+	DefaultsProfileType ProfileType = "defaults"
+	LockedProfileType   ProfileType = "locked"
+)
 
 func escape(s string) string {
 	s1 := strings.ReplaceAll(s, "\\", "\\\\")
@@ -46,7 +58,7 @@ func convertToRegFormat(pathParts []string, structType reflect.Type, value refle
 		}
 		return convertToRegFormat(pathParts, structType, value.Elem(), jsonTag, path)
 	}
-	if value.Kind() == reflect.Ptr {
+	if value.Kind() == reflect.Pointer {
 		return nil, fmt.Errorf("reg-file generation: got an unexpected pointer for %s value %v, expecting type %v", path, value, structType)
 	}
 	switch kind {
@@ -63,7 +75,8 @@ func convertToRegFormat(pathParts []string, structType reflect.Type, value refle
 		sortedStructFields := utils.SortStructFields(structType)
 		scalarReturnedLines := make([]string, 0, numTypedFields)
 		nestedReturnedLines := make([]string, 0)
-		for _, compoundStructField := range sortedStructFields {
+		for i := range sortedStructFields {
+			compoundStructField := &sortedStructFields[i]
 			fieldName := compoundStructField.FieldName
 			valueElement := value.MapIndex(reflect.ValueOf(fieldName))
 			if valueElement.IsValid() {
@@ -78,7 +91,7 @@ func convertToRegFormat(pathParts []string, structType reflect.Type, value refle
 				if len(newRetLines) == 0 {
 					continue
 				}
-				// If the first character of the first line is a '[' it's a struct. Otherwise it's a scalar.
+				// If the first character of the first line is a '[' it's a struct. Otherwise, it's a scalar.
 				// ']' placed here to appease my IDE's linter.
 				if newRetLines[0][0] == '[' {
 					nestedReturnedLines = append(nestedReturnedLines, newRetLines...)
@@ -94,7 +107,7 @@ func convertToRegFormat(pathParts []string, structType reflect.Type, value refle
 		retLines = append(retLines, scalarReturnedLines...)
 		retLines = append(retLines, nestedReturnedLines...)
 		return retLines, nil
-	case reflect.Ptr:
+	case reflect.Pointer:
 		return convertToRegFormat(pathParts, structType.Elem(), value, jsonTag, path)
 	case reflect.Slice, reflect.Array:
 		if value.Kind() != reflect.Slice && value.Kind() != reflect.Array {
@@ -152,7 +165,7 @@ func convertToRegFormat(pathParts []string, structType reflect.Type, value refle
 	case reflect.String:
 		return []string{fmt.Sprintf(`"%s"="%s"`, jsonTag, escape(value.String()))}, nil
 	}
-	return nil, fmt.Errorf("convertToRegFormat: don't know how to process %s kind: %q, (%T), value: %v for var %q\n", path, kind, structType, value, jsonTag)
+	return nil, fmt.Errorf("convertToRegFormat: don't know how to process %s kind: %q, (%T), value: %v for var %q", path, kind, structType, value, jsonTag)
 }
 
 // Encode multi-stringSZ settings in comma-separated ucs2 little-endian bytes
@@ -174,19 +187,19 @@ func stringToMultiStringHexBytes(values []string) string {
 	return strings.Join(hexChars, ",") + ",00,00,00,00"
 }
 
-// JsonToReg - convert the json settings to a reg file
+// JSONToReg - convert the json settings to a reg file
 // @param hiveType: "hklm" or "hkcu"
 // @param profileType: "defaults" or "locked"
 // @param settingsBodyAsJSON - options marshaled as JSON
 // @returns: array of strings, intended for writing to a reg file
-func JsonToReg(hiveType string, profileType string, settingsBodyAsJSON string) ([]string, error) {
+func JSONToReg(hiveType RegistryHive, profileType ProfileType, settingsBodyAsJSON string) ([]string, error) {
 	var actualSettingsJSON map[string]interface{}
 
-	fullHiveType, ok := map[string]string{"hklm": "HKEY_LOCAL_MACHINE", "hkcu": "HKEY_CURRENT_USER"}[hiveType]
+	fullHiveType, ok := map[RegistryHive]string{HklmRegistryHive: "HKEY_LOCAL_MACHINE", HkcuRegistryHive: "HKEY_CURRENT_USER"}[hiveType]
 	if !ok {
 		return nil, fmt.Errorf(`unrecognized hiveType of %q, must be "hklm" or "hkcu"`, hiveType)
 	}
-	_, ok = map[string]bool{"defaults": true, "locked": true}[profileType]
+	_, ok = map[ProfileType]bool{DefaultsProfileType: true, LockedProfileType: true}[profileType]
 	if !ok {
 		return nil, fmt.Errorf(`unrecognized profileType of %q, must be "defaults" or "locked"`, profileType)
 	}
@@ -198,13 +211,15 @@ func JsonToReg(hiveType string, profileType string, settingsBodyAsJSON string) (
 		actualSettingsJSON["version"] = options.CURRENT_SETTINGS_VERSION
 	}
 	headerLines := []string{"Windows Registry Editor Version 5.00"}
-	bodyLines, err := convertToRegFormat([]string{fullHiveType, "SOFTWARE", "Policies", "Rancher Desktop", profileType}, reflect.TypeOf(options.ServerSettingsForJSON{}), reflect.ValueOf(actualSettingsJSON), "", "")
+	bodyLines, err := convertToRegFormat([]string{fullHiveType, "SOFTWARE", "Policies", "Rancher Desktop", string(profileType)}, reflect.TypeOf(options.ServerSettingsForJSON{}), reflect.ValueOf(actualSettingsJSON), "", "")
 	if err != nil {
 		return nil, err
 	}
 	if len(bodyLines) > 0 {
-		headerLines = append(headerLines, fmt.Sprintf("[%s\\%s\\%s]", fullHiveType, "SOFTWARE", "Policies"))
-		headerLines = append(headerLines, fmt.Sprintf("[%s\\%s\\%s\\%s]", fullHiveType, "SOFTWARE", "Policies", "Rancher Desktop"))
+		headerLines = append(
+			headerLines,
+			fmt.Sprintf("[%s\\%s\\%s]", fullHiveType, "SOFTWARE", "Policies"),
+			fmt.Sprintf("[%s\\%s\\%s\\%s]", fullHiveType, "SOFTWARE", "Policies", "Rancher Desktop"))
 	}
 	return append(headerLines, bodyLines...), nil
 }

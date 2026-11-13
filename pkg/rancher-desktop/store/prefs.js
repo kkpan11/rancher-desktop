@@ -1,5 +1,3 @@
-import { set } from 'vue';
-
 import { STEVE } from '@pkg/config/types';
 import { clone } from '@pkg/utils/object';
 
@@ -59,7 +57,7 @@ export const THEME = create('theme', 'auto', {
 export const PREFERS_SCHEME = create('pcs', '', { asCookie, asUserPreference: false });
 export const LOCALE = create('locale', 'en-us', { asCookie });
 export const KEYMAP = create('keymap', 'sublime', { options: ['sublime', 'emacs', 'vim'] });
-export const ROWS_PER_PAGE = create('per-page', 100, { options: [10, 25, 50, 100, 250, 500, 1000], parseJSON });
+export const ROWS_PER_PAGE = create('per-page', 1000, { options: [10, 25, 50, 100, 250, 500, 1000], parseJSON });
 export const LOGS_WRAP = create('logs-wrap', true, { parseJSON });
 export const LOGS_TIME = create('logs-time', true, { parseJSON });
 export const LOGS_RANGE = create('logs-range', '30 minutes', { parseJSON });
@@ -219,7 +217,7 @@ export const getters = {
 
 export const mutations = {
   load(state, { key, value }) {
-    set(state.data, key, value);
+    state.data[key] = value;
   },
 
   cookiesLoaded(state) {
@@ -257,9 +255,9 @@ export const actions = {
           }
 
           if ( definition.parseJSON ) {
-            set(server.data, key, JSON.stringify(value));
+            server.data[key] = JSON.stringify(value);
           } else {
-            set(server.data, key, value);
+            server.data[key] = value;
           }
 
           await server.save({ redirectUnauthorized: false });
@@ -319,21 +317,18 @@ export const actions = {
         changed(fromClock());
       }
 
-      // eslint-disable-next-line deprecation/deprecation
       watchDark.addListener((e) => {
         if ( e.matches ) {
           changed('dark');
         }
       });
 
-      // eslint-disable-next-line deprecation/deprecation
       watchLight.addListener((e) => {
         if ( e.matches ) {
           changed('light');
         }
       });
 
-      // eslint-disable-next-line deprecation/deprecation
       watchNone.addListener((e) => {
         if ( e.matches ) {
           changed(fromClock());

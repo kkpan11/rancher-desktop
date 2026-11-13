@@ -1,7 +1,8 @@
 //go:build !(linux || windows)
-// +build !linux,!windows
 
 package main
+
+import "context"
 
 // This file is a stub for unsupported platforms to make IDEs happy.
 
@@ -19,7 +20,7 @@ var argHandlers = argHandlersType{
 	builderCacheArgHandler: unhandledArgHandler,
 }
 
-func spawn(opts spawnOptions) error {
+func spawn(ctx context.Context, opts spawnOptions) error {
 	panic("Platform is unsupported")
 }
 

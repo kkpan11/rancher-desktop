@@ -1,6 +1,3 @@
-<router lang="yaml">
-  name: Port Forwarding
-</router>
 <template>
   <PortForwarding
     class="content"
@@ -10,31 +7,33 @@
     :kubernetes-is-disabled="!settings.kubernetes.enabled"
     :service-being-edited="serviceBeingEdited"
     :error-message="errorMessage"
-    @updatePort="handleUpdatePort"
-    @toggledServiceFilter="onIncludeK8sServicesChanged"
-    @editPortForward="handleEditPortForward"
-    @cancelPortForward="handleCancelPortForward"
-    @cancelEditPortForward="handleCancelEditPortForward"
-    @updatePortForward="handleUpdatePortForward"
-    @closeError="handleCloseError"
+    @update-port="handleUpdatePort"
+    @toggled-service-filter="onIncludeK8sServicesChanged"
+    @edit-port-forward="handleEditPortForward"
+    @cancel-port-forward="handleCancelPortForward"
+    @cancel-edit-port-forward="handleCancelEditPortForward"
+    @update-port-forward="handleUpdatePortForward"
+    @close-error="handleCloseError"
   />
 </template>
 
 <script lang="ts">
 
-import Vue from 'vue';
+import clone from 'lodash/cloneDeep';
+import { defineComponent } from 'vue';
 
 import type { ServiceEntry } from '@pkg/backend/k8s';
 import PortForwarding from '@pkg/components/PortForwarding.vue';
 import { defaultSettings, Settings } from '@pkg/config/settings';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
 
-export default Vue.extend({
+export default defineComponent({
+  name:       'port-forwarding',
   components: { PortForwarding },
   data() {
     return {
       state:              ipcRenderer.sendSync('k8s-state'),
-      settings:           defaultSettings as Settings,
+      settings:           defaultSettings,
       services:           [] as ServiceEntry[],
       errorMessage:       null as string | null,
       serviceBeingEdited: null as ServiceEntry | null,
@@ -42,21 +41,24 @@ export default Vue.extend({
   },
 
   watch: {
-    services(newServices: ServiceEntry[]): void {
-      if (this.serviceBeingEdited) {
-        const newService = newServices.find(service => this.compareServices(this.serviceBeingEdited as ServiceEntry, service));
+    services: {
+      handler(newServices: ServiceEntry[]): void {
+        if (this.serviceBeingEdited) {
+          const newService = newServices.find(service => this.compareServices(this.serviceBeingEdited as ServiceEntry, service));
 
-        if (newService) {
-          this.serviceBeingEdited = Object.assign(this.serviceBeingEdited, { listenPort: newService.listenPort });
+          if (newService) {
+            this.serviceBeingEdited = Object.assign(this.serviceBeingEdited, { listenPort: newService.listenPort });
+          }
         }
-      }
+      },
+      deep: true,
     },
   },
 
   mounted() {
     this.$store.dispatch(
       'page/setHeader',
-      { title: this.t('portForwarding.title') },
+      { titleKey: 'portForwarding.title' },
     );
     ipcRenderer.on('k8s-check-state', (event, state) => {
       this.$data.state = state;
@@ -140,7 +142,7 @@ export default Vue.extend({
     handleUpdatePortForward(): void {
       this.errorMessage = null;
       if (this.serviceBeingEdited) {
-        ipcRenderer.invoke('service-forward', this.serviceBeingEdited, true);
+        ipcRenderer.invoke('service-forward', clone(this.serviceBeingEdited), true);
       }
       this.serviceBeingEdited = null;
     },

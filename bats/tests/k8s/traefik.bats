@@ -1,9 +1,9 @@
 load '../helpers/load'
 
 local_setup() {
-    if using_networking_tunnel && ! using_windows_exe; then
+    if is_windows && ! using_windows_exe; then
         # BUG BUG BUG not yet implemented
-        skip "Test does not yet work from inside a WSL distro when using networking tunnel, since it requires WSL integration"
+        skip "Test does not yet work from inside a WSL distro, since it requires WSL integration"
     fi
     needs_port 80
 }
@@ -35,6 +35,26 @@ assert_traefik_pods_are_down() {
     return 0
 }
 
+# The traefik pods go away long before the k3s uninstall Jobs finish. Enabling
+# traefik again in that window reinstalls the traefik chart while traefik-crd
+# is still being uninstalled, and helm-install-traefik then crash-loops on
+# "Required CRDs are missing".
+assert_traefik_charts_are_gone() {
+    local charts count
+    run --separate-stderr kubectl get --all-namespaces --output 'jsonpath={.items}' helmcharts
+    assert_success
+
+    charts=$(jq_output 'map(select(.metadata.name | contains("traefik")))')
+    count="$(output=$charts jq_output length)"
+    if [[ $count -gt 0 ]]; then
+        trace "Found $count traefik HelmChart resources"
+        return 1
+    fi
+
+    trace "No traefik HelmChart resources"
+    return 0
+}
+
 assert_traefik_pods_are_up() {
     ip_regex="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
     run kubectl -n kube-system get service traefik -o jsonpath="{.status.loadBalancer.ingress[0].ip}"
@@ -42,7 +62,7 @@ assert_traefik_pods_are_up() {
 }
 
 assert_curl() {
-    try --max 30 --delay 10 curl --silent --head "$@"
+    run curl --silent --head "$@"
     assert_success
     assert_output --regexp 'HTTP/[0-9.]* 404'
 }
@@ -52,6 +72,8 @@ refute_curl() {
     assert_output --partial "curl: (7) Failed to connect"
 }
 
+# Traefik refuses connections and answers 503 while it is starting, so callers
+# retry this whole assertion with `try`.
 assert_traefik() {
     assert_curl "http://$1:80"
     assert_curl --insecure "https://$1:443"
@@ -63,11 +85,11 @@ refute_traefik() {
 }
 
 assert_traefik_on_localhost() {
-    if using_networking_tunnel && ! using_windows_exe; then
+    if is_windows && ! using_windows_exe; then
         # BUG BUG BUG not yet implemented
-        skip "Test does not yet work from inside a WSL distro when using networking tunnel"
+        skip "Test does not yet work from inside a WSL distro"
     fi
-    try --max 10 assert_traefik localhost
+    try --max 30 --delay 10 assert_traefik localhost
 }
 
 @test 'factory reset' {
@@ -95,6 +117,9 @@ assert_traefik_on_localhost() {
 
     trace "Check if the traefik pods go down"
     try --max 30 --delay 10 assert_traefik_pods_are_down
+
+    trace "Wait for the uninstall jobs to remove the traefik charts"
+    try --max 30 --delay 10 assert_traefik_charts_are_gone
 }
 
 @test 'no connection on localhost' {
@@ -127,7 +152,7 @@ assert_traefik_on_localhost() {
 
 @test 'curl traefik via host-ip while kubernetes.ingress.localhost-only is false' {
     skip_unless_host_ip
-    try --max 10 assert_traefik "$HOST_IP"
+    try --max 30 --delay 10 assert_traefik "$HOST_IP"
 }
 
 @test 'set kubernetes.ingress.localhost-only to true' {

@@ -1,9 +1,9 @@
 <script lang="ts">
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 
 import EmptyState from '@pkg/components/EmptyState.vue';
 
-export default Vue.extend({
+export default defineComponent({
   name:       'extensions-uninstalled',
   components: { EmptyState },
   props:      {
@@ -23,7 +23,6 @@ export default Vue.extend({
       return this.t(
         'extensions.view.emptyState.body',
         { extensionId: `<code>${ this.extensionId }</code>` },
-        true,
       );
     },
   },
@@ -41,7 +40,8 @@ export default Vue.extend({
     :heading="emptyStateHeading"
   >
     <template #body>
-      <span v-html="emptyStateBody"></span>
+      <!-- v-clean-html: the interpolated extension id is not our content -->
+      <span v-clean-html="emptyStateBody" />
     </template>
     <template #primary-action>
       <button

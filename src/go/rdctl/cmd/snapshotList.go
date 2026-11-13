@@ -9,8 +9,14 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/snapshot"
 	"github.com/spf13/cobra"
+
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/snapshot"
+)
+
+const (
+	// The maximum number of runes to output for tabular output.
+	tableMaxRunes = 63
 )
 
 // SortableSnapshots are []snapshot.Snapshot sortable by date created.
@@ -25,9 +31,7 @@ func (snapshots SortableSnapshots) Less(i, j int) bool {
 }
 
 func (snapshots SortableSnapshots) Swap(i, j int) {
-	temp := snapshots[i]
-	snapshots[i] = snapshots[j]
-	snapshots[j] = temp
+	snapshots[i], snapshots[j] = snapshots[j], snapshots[i]
 }
 
 var snapshotListCmd = &cobra.Command{
@@ -37,13 +41,13 @@ var snapshotListCmd = &cobra.Command{
 	Args:    cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmd.SilenceUsage = true
-		return exitWithJsonOrErrorCondition(listSnapshot())
+		return exitWithJSONOrErrorCondition(listSnapshot())
 	},
 }
 
 func init() {
 	snapshotCmd.AddCommand(snapshotListCmd)
-	snapshotListCmd.Flags().BoolVar(&outputJsonFormat, "json", false, "output json format")
+	snapshotListCmd.Flags().BoolVar(&outputJSONFormat, "json", false, "output json format")
 }
 
 func listSnapshot() error {
@@ -56,7 +60,7 @@ func listSnapshot() error {
 		return fmt.Errorf("failed to list snapshots: %w", err)
 	}
 	sort.Sort(SortableSnapshots(snapshots))
-	if outputJsonFormat {
+	if outputJSONFormat {
 		return jsonOutput(snapshots)
 	}
 	return tabularOutput(snapshots)
@@ -83,7 +87,7 @@ func tabularOutput(snapshots []snapshot.Snapshot) error {
 	fmt.Fprintf(writer, "NAME\tCREATED\tDESCRIPTION\n")
 	for _, aSnapshot := range snapshots {
 		prettyCreated := aSnapshot.Created.Format(time.RFC1123)
-		desc := truncateAtNewlineOrMaxRunes(aSnapshot.Description, 63)
+		desc := truncateAtNewlineOrMaxRunes(aSnapshot.Description, tableMaxRunes)
 		fmt.Fprintf(writer, "%s\t%s\t%s\n", aSnapshot.Name, prettyCreated, desc)
 	}
 	writer.Flush()

@@ -17,13 +17,16 @@ limitations under the License.
 package cmd
 
 import (
+	"context"
 	"fmt"
+	"net/http"
+
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
 
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/client"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/config"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/shutdown"
-	"github.com/sirupsen/logrus"
-	"github.com/spf13/cobra"
 )
 
 type shutdownSettingsStruct struct {
@@ -42,7 +45,7 @@ var shutdownCmd = &cobra.Command{
 			return err
 		}
 		cmd.SilenceUsage = true
-		result, err := doShutdown(&commonShutdownSettings, shutdown.Shutdown)
+		result, err := doShutdown(cmd.Context(), &commonShutdownSettings, shutdown.Shutdown)
 		if err != nil {
 			return err
 		}
@@ -58,15 +61,15 @@ func init() {
 	shutdownCmd.Flags().BoolVar(&commonShutdownSettings.WaitForShutdown, "wait", true, "wait for shutdown to be confirmed")
 }
 
-func doShutdown(shutdownSettings *shutdownSettingsStruct, initiatingCommand shutdown.InitiatingCommand) ([]byte, error) {
+func doShutdown(ctx context.Context, shutdownSettings *shutdownSettingsStruct, initiatingCommand shutdown.InitiatingCommand) ([]byte, error) {
 	var output []byte
 	connectionInfo, err := config.GetConnectionInfo(true)
 	if err == nil && connectionInfo != nil {
 		rdClient := client.NewRDClient(connectionInfo)
-		request, err := rdClient.DoRequest("PUT", client.VersionCommand("", "shutdown"))
-		output, _ = client.ProcessRequestForUtility(request, err)
+		command := client.VersionCommand("", "shutdown")
+		output, _ = client.ProcessRequestForUtility(rdClient.DoRequest(ctx, http.MethodPut, command))
 		logrus.WithError(err).Trace("Shut down requested")
 	}
-	err = shutdown.FinishShutdown(shutdownSettings.WaitForShutdown, initiatingCommand)
+	err = shutdown.FinishShutdown(ctx, shutdownSettings.WaitForShutdown, initiatingCommand)
 	return output, err
 }

@@ -6,7 +6,7 @@
 # Usage:
 #   jobs:
 #     check-paths:
-#        uses: ./.github/workflows/actions/paths-ignore.yaml
+#        uses: $/.github/workflows/paths-ignore.yaml
 #     do_thing:
 #        if: jobs.check-paths.outputs.should-run == 'true'
 #        # Unfortunately, a string comparison is required.
@@ -54,7 +54,7 @@ jobs:
         echo "$PATHS_IGNORE" >> "$GITHUB_ENV"
       env:
         INPUT: ${{ inputs.paths-ignore-globs }}
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       if: github.event_name == 'pull_request'
       with:
         fetch-depth: 0

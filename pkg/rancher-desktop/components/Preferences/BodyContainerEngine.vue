@@ -1,6 +1,6 @@
 <script lang="ts">
 
-import Vue from 'vue';
+import { Component, defineComponent } from 'vue';
 import { mapGetters, mapState } from 'vuex';
 
 import PreferencesContainerEngineAllowedImages from '@pkg/components/Preferences/ContainerEngineAllowedImages.vue';
@@ -14,7 +14,7 @@ import { RecursivePartial } from '@pkg/utils/typeUtils';
 
 import type { PropType } from 'vue';
 
-export default Vue.extend({
+export default defineComponent({
   name:       'preferences-body-container-engine',
   components: {
     PreferencesContainerEngineAllowedImages,
@@ -36,7 +36,7 @@ export default Vue.extend({
     },
   },
   methods: {
-    async tabSelected({ tab }: { tab: Vue.Component }) {
+    async tabSelected({ tab }: { tab: Component }) {
       if (this.activeTab !== tab.name) {
         await this.commitPreferences(tab.name || '');
       }
@@ -46,7 +46,7 @@ export default Vue.extend({
         'transientSettings/commitPreferences',
         {
           ...this.credentials as ServerState,
-          payload: { preferences: { navItem: { currentTabs: { 'Container Engine': tabName } } } } as RecursivePartial<TransientSettings>,
+          payload: { preferences: { navItem: { currentTabs: { 'Container Engine': tabName } } } },
         },
       );
     },
@@ -64,21 +64,21 @@ export default Vue.extend({
   >
     <template #tabs>
       <tab
-        label="General"
+        label-key="preferences.tabs.general"
         name="general"
         :weight="2"
       />
       <tab
-        label="Allowed Images"
+        label-key="preferences.tabs.allowedImages"
         name="allowed-images"
         :weight="1"
       />
     </template>
     <div class="container-engine-content">
       <component
-        :is="`preferences-container-engine-${ activeTab }`"
+        v-bind="$attrs"
+        :is="`preferences-container-engine-${activeTab}`"
         :preferences="preferences"
-        v-on="$listeners"
       />
     </div>
   </rd-tabbed>

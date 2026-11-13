@@ -8,14 +8,14 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestImageBuildHandler(t *testing.T) {
+func TestBuilderBuildHandler(t *testing.T) {
 	t.Run("munges the image directory", func(t *testing.T) {
 		handlers := argHandlersType{
 			filePathArgHandler: func(s string) (string, []cleanupFunc, error) {
 				return "<<path>>", nil, nil
 			},
 		}
-		parsed, err := imageBuildHandler(nil, []string{"path"}, handlers)
+		parsed, err := builderBuildHandler(nil, []string{"path"}, handlers)
 		assert.NoError(t, err)
 		assert.EqualValues(t, []string{"<<path>>"}, parsed.args)
 		assert.Nil(t, parsed.cleanup)
@@ -28,7 +28,7 @@ func TestImageBuildHandler(t *testing.T) {
 				return "", []cleanupFunc{func() error { return cleanupError }}, handlerError
 			},
 		}
-		_, err := imageBuildHandler(nil, []string{"path"}, handlers)
+		_, err := builderBuildHandler(nil, []string{"path"}, handlers)
 		assert.Error(t, err)
 		assert.ErrorContains(t, err, handlerError.Error())
 		assert.ErrorContains(t, err, cleanupError.Error())
@@ -137,4 +137,65 @@ func TestContainerCopyHandler(t *testing.T) {
 		assert.ErrorContains(t, err, handlerError.Error())
 		assert.ErrorContains(t, err, cleanupError.Error())
 	})
+}
+
+func TestImageImportHandler(t *testing.T) {
+	cleanupError := fmt.Errorf("cleanup error")
+	testCases := []struct {
+		description   string
+		input         []string
+		expected      []string
+		handler       func(s string) (string, []cleanupFunc, error)
+		assertCleanup func(*testing.T, []cleanupFunc)
+	}{
+		{
+			description: "ignore missing arguments",
+			input:       []string{},
+			expected:    []string{},
+		},
+		{
+			description: "accepts stdin",
+			input:       []string{"-"},
+			expected:    []string{"-"},
+		},
+		{
+			description: "accepts URLs",
+			input:       []string{"https://registry.example.com/hello"},
+			expected:    []string{"https://registry.example.com/hello"},
+		},
+		{
+			description: "accepts paths",
+			input:       []string{"hello"},
+			expected:    []string{"<<hello>>"},
+			handler: func(s string) (string, []cleanupFunc, error) {
+				return "<<hello>>", []cleanupFunc{func() error { return cleanupError }}, nil
+			},
+			assertCleanup: func(t *testing.T, cf []cleanupFunc) {
+				if assert.Len(t, cf, 1) {
+					assert.ErrorIs(t, cf[0](), cleanupError)
+				}
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.description, func(t *testing.T) {
+			handlers := argHandlersType{
+				filePathArgHandler: func(s string) (string, []cleanupFunc, error) {
+					panic("should not be called")
+				},
+			}
+			if testCase.handler != nil {
+				handlers.filePathArgHandler = testCase.handler
+			}
+			parsed, err := imageImportHandler(nil, testCase.input, handlers)
+			assert.NoError(t, err)
+			assert.EqualValues(t, testCase.expected, parsed.args)
+			if testCase.assertCleanup != nil {
+				testCase.assertCleanup(t, parsed.cleanup)
+			} else {
+				assert.Zero(t, parsed.cleanup)
+			}
+		})
+	}
 }

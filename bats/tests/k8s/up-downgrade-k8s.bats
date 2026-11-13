@@ -1,22 +1,45 @@
 # Test cases 8, 13, 19
 
 load '../helpers/load'
-ARCH_FOR_KUBERLR=amd64
+
+local_setup_file() {
+    if semver_eq "$RD_KUBERNETES_VERSION" "$RD_KUBERNETES_ALT_VERSION"; then
+        printf "Cannot upgrade from %s to %s\n" \
+            "$RD_KUBERNETES_VERSION" "$RD_KUBERNETES_ALT_VERSION" |
+            fail
+    fi
+    # It is undefined whether RD_KUBERNETES_VERSION is greater or less than
+    # RD_KUBERNETES_ALT_VERSION (and it's expected to flip in CI); actually
+    # compare them so we can expect to wipe data on the downgrade.
+    if semver_gt "$RD_KUBERNETES_VERSION" "$RD_KUBERNETES_ALT_VERSION"; then
+        export RD_KUBERNETES_VERSION_LOW=$RD_KUBERNETES_ALT_VERSION
+        export RD_KUBERNETES_VERSION_HIGH=$RD_KUBERNETES_VERSION
+    else
+        export RD_KUBERNETES_VERSION_LOW=$RD_KUBERNETES_VERSION
+        export RD_KUBERNETES_VERSION_HIGH=$RD_KUBERNETES_ALT_VERSION
+    fi
+    case "$(uname -m)" in
+    amd64 | x86_64 | i*86) export ARCH_FOR_KUBERLR=amd64 ;;
+    arm*) export ARCH_FOR_KUBERLR=arm64 ;;
+    *) printf "Unsupported architecture %s\n" "$(uname -m)" | fail ;;
+    esac
+}
 
 @test 'factory reset' {
     factory_reset
 }
 
 @test 'start rancher desktop' {
-    start_kubernetes
-    wait_for_kubelet
+    # Force use the pre-upgrade version
+    RD_KUBERNETES_VERSION=$RD_KUBERNETES_VERSION_LOW start_kubernetes
+    wait_for_kubelet "$RD_KUBERNETES_VERSION_LOW"
     # the docker context "rancher-desktop" may not have been written
     # even though the apiserver is already running
     wait_for_container_engine
 }
 
 @test 'deploy nginx - always restart' {
-    ctrctl pull "$IMAGE_NGINX"
+    ctrctl pull --quiet "$IMAGE_NGINX"
     run ctrctl run -d -p 8585:80 --restart=always --name nginx-restart "$IMAGE_NGINX"
     assert_success
 }
@@ -54,13 +77,14 @@ verify_busybox() {
 
 verify_images() {
     if using_docker; then
-        run docker images
-        assert_output --partial "$IMAGE_NGINX" "$IMAGE_BUSYBOX"
+        run docker images --format '{{.Repository}}'
+        assert_line "$IMAGE_NGINX"
+        assert_line "$IMAGE_BUSYBOX"
     else
-        run nerdctl images --format json
-        assert_output --partial "\"Repository\":\"$IMAGE_NGINX"
-        run nerdctl --namespace k8s.io images
-        assert_output --partial "$IMAGE_BUSYBOX"
+        run nerdctl images --format '{{.Repository}}'
+        assert_line "$IMAGE_NGINX"
+        run nerdctl --namespace k8s.io images --format '{{.Repository}}'
+        assert_line "$IMAGE_BUSYBOX"
     fi
 }
 @test 'verify images before upgrade' {
@@ -77,24 +101,26 @@ verify_kuberlr_for_version() {
 
     rm -f "${KUBERLR_DIR}/kubectl"*
     run kubectl version
-    assert_output --regexp "Client Version.*GitVersion:.v${K8S_VERSION}"
+    assert_output --regexp "Client Version.*:.v${K8S_VERSION}"
     assert_exists "${KUBERLR_DIR}/kubectl${K8S_VERSION}$EXE"
 }
 
 @test 'upgrade kubernetes' {
-    rdctl set --kubernetes.version "$RD_KUBERNETES_VERSION"
-    wait_for_kubelet "$RD_KUBERNETES_VERSION"
+    rdctl set --kubernetes.version "$RD_KUBERNETES_VERSION_HIGH"
+    wait_for_kubelet "$RD_KUBERNETES_VERSION_HIGH"
     wait_for_container_engine
 }
 
 @test 'kuberlr pulls in kubectl for new k8s version' {
-    verify_kuberlr_for_version "$RD_KUBERNETES_VERSION"
+    verify_kuberlr_for_version "$RD_KUBERNETES_VERSION_HIGH"
 }
 
 verify_nginx_after_change_k8s() {
     run curl http://localhost:8686
     assert_failure
-    assert_output --partial "Failed to connect to localhost port 8686"
+    # curl 8.6+ reports "...localhost:8686 after N ms..." instead of the older
+    # "...localhost port 8686..."; match both spellings.
+    assert_output --regexp "Failed to connect to localhost(:| port )8686"
 
     run curl http://localhost:8585
     assert_success
@@ -129,13 +155,13 @@ verify_nginx_after_change_k8s() {
 }
 
 @test 'downgrade kubernetes' {
-    rdctl set --kubernetes-version "$RD_KUBERNETES_PREV_VERSION"
-    wait_for_kubelet
+    rdctl set --kubernetes.version "$RD_KUBERNETES_VERSION_LOW"
+    wait_for_kubelet "$RD_KUBERNETES_VERSION_LOW"
     wait_for_container_engine
 }
 
 @test 'kuberlr pulls in kubectl for previous k8s version' {
-    verify_kuberlr_for_version "$RD_KUBERNETES_PREV_VERSION"
+    verify_kuberlr_for_version "$RD_KUBERNETES_VERSION_LOW"
 }
 
 @test 'verify nginx after downgrade' {

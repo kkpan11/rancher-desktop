@@ -1,4 +1,3 @@
-// eslint-disable-next-line deprecation/deprecation
 export const platform = ( typeof window === 'undefined' ? 'server' : window.navigator.platform.toLowerCase() );
 export const userAgent = ( typeof window === 'undefined' ? 'server' : window.navigator.userAgent );
 
@@ -25,6 +24,10 @@ export function isMore(event) {
 
 export function isRange(event) {
   return !!event[rangeKey];
+}
+
+export function isSelectionClick(event) {
+  return isMore(event) || isRange(event);
 }
 
 export function suppressContextMenu(event) {

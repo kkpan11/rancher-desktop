@@ -1,4 +1,4 @@
-# **[Rancher Desktop Guest Agent](https://github.com/rancher-sandbox/rancher-desktop-agent)**
+# **[Rancher Desktop Guest Agent](../../../src/go/guestagent)**
 
 The Rancher Desktop Guest Agent operates within the Rancher Desktop WSL distribution, particularly in an isolated namespace when the network tunnel is enabled. It facilitates interactions between various container engine APIs like Moby, containerd, and Kubernetes. The agent monitors container/service creation events from these APIs and, upon detecting ports needing exposure, forwards the port mappings to internal services accordingly. This ensures efficient and automated port forwarding management within the Rancher Desktop environment.
 
@@ -45,8 +45,6 @@ end
 
 -   **vtunnelAddr**: Peer address for the Vtunnel process that forwards port mappings to the Vtunnel Host process over `AF_VSOCK`. This feature will soon be deprecated.
 
--   **privilegedService**: This flag enables privileged service mode. When enabled, the Rancher Desktop guest agent communicates over `AF_VSOCK` to a privileged service process running on the host. This functionality is primarily designed for Windows and will soon be deprecated.
-
 -   **k8sServiceListenerAddr**: Specifies an IP address (`0.0.0.0` or `127.0.0.1`) to bind Kubernetes services on the host.
 
 -   **adminInstall**: This flag indicates whether Rancher Desktop is installed with administrator privileges. It is used to enable Network Tunnel mode, where port mappings are forwarded to Rancher Desktop Networking's `host-switch`. The `host-switch` hosts an API that exposes ports from the host into the network namespace.
@@ -55,31 +53,27 @@ end
 
 ## PortMapping
 
-Is a struct object that represents an exposed container or a service. [Portmapping](https://github.com/rancher-sandbox/rancher-desktop-agent/blob/8348a5e10578f8662532eddfac73b243cfd419f4/pkg/types/portmapping.go#L22) objects consist of the following fields:
+Is a struct object that represents an exposed container or a service. [Portmapping](../../../src/go/ports/portmapping.go#L12) objects consist of the following fields:
 
 ```
 type PortMapping struct {
 	// Remove indicates whether to remove or add the entry
 	Remove bool `json:"remove"`
 	// Ports are the port mappings for both IPV4 and IPV6
-	Ports nat.PortMap `json:"ports"`
+	Ports PortMap `json:"ports"`
 	// ConnectAddrs are the backend addresses to connect to
 	ConnectAddrs []ConnectAddrs `json:"connectAddrs"`
 }
 ```
 ## Networking Mode
 
-Rancher Desktop Guest Agent can operate in one of three networking modes, depending on startup arguments:
-
-**-privilegedService**
-
-Rancher Desktop utilizes the vtunnel peer process to forward all port mappings to privileged services running on the host, thereby creating port proxies. However, this mode lacks network namespace isolation and shares iptables with other WSL distros, and it will soon be deprecated.
+Rancher Desktop Guest Agent can operate in one of two networking modes, depending on startup arguments:
 
 **-adminInstall**
 
 The Network Tunnel mode allows the Guest Agent to operate in an isolated network namespace with a dedicated iptables. This mode is enabled through Rancher Desktop Networking.
 
-Neither  **-privilegedService**  nor  **-adminInstall**
+None  **-adminInstall**
 
 Rancher Desktop Guest Agent operates in non-admin user mode. In this mode, all port mappings are bound to localhost, and the use of privileged ports is restricted.
 
@@ -136,10 +130,10 @@ Additionally, if network tunnel mode is enabled along with the WSL integration o
 
 Below port mapping is an example of what is emitted to `wsl-proxy`:
 ```
-types.PortMapping {
+ports.PortMapping {
     Remove: false,
-    Ports: nat.PortMap {
-        port: [] nat.PortBinding {
+    Ports: ports.PortMap {
+        port: [] ports.PortBinding {
             {
                 HostIP: "127.0.0.1",
                 HostPort: 6443,
@@ -154,3 +148,78 @@ types.PortMapping {
 In [newer versions](https://github.com/rancher-sandbox/rancher-desktop/blob/bb7f71f18828c45b711d6d4982a2dcaf19f8f3fa/pkg/rancher-desktop/backend/k3sHelper.ts#L1152) of Kubernetes, kubelet no longer automatically creates listeners for NodePort and LoadBalancer services. To address this, we manually create these listeners to ensure proper port forwarding functionality. Service ports requiring forwarding are identified in iptables DNAT. When iptables identifies such ports, it creates a port mapping object representing that service. Depending on the selected network mode, the port mapping object is then forwarded to the host. If the privileged service is enabled, it uses the vtunnel peer process to communicate the port mappings with privileged services. Otherwise, if network tunnel mode is enabled, it sends the port mappings to the API provided by the host switch process.
 
 If network tunnel mode is enabled along with the WSL integration option, a copy of the port mapping is also forwarded to the `wsl-proxy` process, allowing access to the exposed port from other distributions.
+
+## Port forwarding (Network Tunnel)
+
+```mermaid
+sequenceDiagram
+  box VM
+    participant dockerd
+    participant containerd
+    participant kubernetes
+    participant iptables
+    participant guest-agent
+    participant wsl-proxy
+  end
+  box Host
+    participant host-switch as host-switch.exe
+  end
+  rect transparent
+    note over dockerd,containerd: adding port
+    alt containerd
+      containerd ->> guest-agent: /tasks/start
+      guest-agent ->> guest-agent: loopback iptables
+    else dockerd
+      dockerd ->> guest-agent: event[start]
+      guest-agent ->> guest-agent: loopback iptables
+    else kubernetes
+      kubernetes ->> guest-agent: event[not deleted]
+    else iptables
+      iptables ->> iptables: poll iptables
+      iptables ->> guest-agent: add new ports
+    end
+
+    guest-agent ->> wsl-proxy: add port
+    wsl-proxy ->> wsl-proxy: listen in default namespace
+    guest-agent ->> host-switch: add port (APITracker)
+    host-switch ->> host-switch: add port via gvisor
+
+  end
+  rect transparent
+    note over dockerd, containerd: updating port
+    alt containerd
+      containerd ->> guest-agent: /containers/update
+    end
+
+    guest-agent ->> wsl-proxy: remove port
+    wsl-proxy ->> wsl-proxy: remove listener in default namespace
+    guest-agent ->> host-switch: remove port (APITracker)
+    host-switch ->> host-switch: remove port via gvisor
+    guest-agent ->> wsl-proxy: add port
+    wsl-proxy ->> wsl-proxy: listen in default namespace
+    guest-agent ->> host-switch: add port (APITracker)
+    host-switch ->> host-switch: add port via gvisor
+
+  end
+  rect transparent
+    note over dockerd,containerd: removing port
+    alt containerd
+      containerd ->> guest-agent: /tasks/exit
+    else dockerd
+      dockerd ->> guest-agent: event[stop]
+      dockerd ->> guest-agent: event[die]
+    else kubernetes
+      kubernetes ->> guest-agent: event[deleted]
+    else iptables
+      iptables ->> iptables: poll iptables
+      iptables ->> guest-agent: remove old ports
+    end
+
+    guest-agent ->> wsl-proxy: remove port
+    wsl-proxy ->> wsl-proxy: remove listener in default namespace
+    guest-agent ->> host-switch: remove port (APITracker)
+    host-switch ->> host-switch: remove port via gvisor
+
+  end
+
+```

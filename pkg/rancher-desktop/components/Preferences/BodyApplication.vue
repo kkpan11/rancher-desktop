@@ -1,6 +1,6 @@
 <script lang="ts">
 
-import Vue from 'vue';
+import { defineComponent, Component, PropType } from 'vue';
 import { mapGetters, mapState } from 'vuex';
 
 import PreferencesApplicationBehavior from '@pkg/components/Preferences/ApplicationBehavior.vue';
@@ -13,9 +13,7 @@ import type { TransientSettings } from '@pkg/config/transientSettings';
 import type { ServerState } from '@pkg/main/commandServer/httpCommandServer';
 import { RecursivePartial } from '@pkg/utils/typeUtils';
 
-import type { PropType } from 'vue';
-
-export default Vue.extend({
+export default defineComponent({
   name:       'preferences-body-application',
   components: {
     RdTabbed,
@@ -30,9 +28,6 @@ export default Vue.extend({
       required: true,
     },
   },
-  async fetch() {
-    await this.$store.dispatch('credentials/fetchCredentials');
-  },
   computed: {
     ...mapGetters('preferences', ['isPlatformWindows']),
     ...mapGetters('transientSettings', ['getActiveTab']),
@@ -41,8 +36,11 @@ export default Vue.extend({
       return this.getActiveTab || 'behavior';
     },
   },
+  async beforeMount() {
+    await this.$store.dispatch('credentials/fetchCredentials');
+  },
   methods: {
-    async tabSelected({ tab }: { tab: Vue.Component }) {
+    async tabSelected({ tab }: { tab: Component }) {
       if (this.activeTab !== tab.name) {
         await this.commitPreferences(tab.name || '');
       }
@@ -52,7 +50,7 @@ export default Vue.extend({
         'transientSettings/commitPreferences',
         {
           ...this.credentials as ServerState,
-          payload: { preferences: { navItem: { currentTabs: { Application: tabName } } } } as RecursivePartial<TransientSettings>,
+          payload: { preferences: { navItem: { currentTabs: { Application: tabName } } } },
         },
       );
     },
@@ -71,26 +69,26 @@ export default Vue.extend({
     <template #tabs>
       <tab
         v-if="!isPlatformWindows"
-        label="Environment"
+        label-key="preferences.tabs.environment"
         name="environment"
         :weight="1"
       />
       <tab
-        label="Behavior"
+        label-key="preferences.tabs.behavior"
         name="behavior"
         :weight="2"
       />
       <tab
-        label="General"
+        label-key="preferences.tabs.general"
         name="general"
         :weight="3"
       />
     </template>
     <div class="application-content">
       <component
-        :is="`preferences-application-${ activeTab }`"
+        v-bind="$attrs"
+        :is="`preferences-application-${activeTab}`"
         :preferences="preferences"
-        v-on="$listeners"
       />
     </div>
   </rd-tabbed>

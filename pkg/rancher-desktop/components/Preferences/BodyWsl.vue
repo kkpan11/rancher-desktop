@@ -1,10 +1,9 @@
 <script lang="ts">
 
-import Vue from 'vue';
+import { Component, defineComponent } from 'vue';
 import { mapGetters, mapState } from 'vuex';
 
 import PreferencesWslIntegrations from '@pkg/components/Preferences/WslIntegrations.vue';
-import PreferencesWslNetwork from '@pkg/components/Preferences/WslNetwork.vue';
 import PreferencesWslProxy from '@pkg/components/Preferences/WslProxy.vue';
 import RdTabbed from '@pkg/components/Tabbed/RdTabbed.vue';
 import Tab from '@pkg/components/Tabbed/Tab.vue';
@@ -15,10 +14,10 @@ import { RecursivePartial } from '@pkg/utils/typeUtils';
 
 import type { PropType } from 'vue';
 
-export default Vue.extend({
+export default defineComponent({
   name:       'preferences-body-wsl',
   components: {
-    RdTabbed, Tab, PreferencesWslIntegrations, PreferencesWslNetwork, PreferencesWslProxy,
+    RdTabbed, Tab, PreferencesWslIntegrations, PreferencesWslProxy,
   },
   props: {
     preferences: {
@@ -34,7 +33,7 @@ export default Vue.extend({
     },
   },
   methods: {
-    async tabSelected({ tab }: { tab: Vue.Component }) {
+    async tabSelected({ tab }: { tab: Component }) {
       if (this.activeTab !== tab.name) {
         await this.commitPreferences(tab.name || '');
       }
@@ -44,7 +43,7 @@ export default Vue.extend({
         'transientSettings/commitPreferences',
         {
           ...this.credentials as ServerState,
-          payload: { preferences: { navItem: { currentTabs: { WSL: tabName } } } } as RecursivePartial<TransientSettings>,
+          payload: { preferences: { navItem: { currentTabs: { WSL: tabName } } } },
         },
       );
     },
@@ -62,24 +61,19 @@ export default Vue.extend({
   >
     <template #tabs>
       <tab
-        label="Network"
-        name="network"
-        :weight="3"
-      />
-      <tab
-        label="Integrations"
+        label-key="preferences.tabs.integrations"
         name="integrations"
         :weight="2"
       />
       <tab
-        label="Proxy"
+        label-key="preferences.tabs.proxy"
         name="proxy"
         :weight="1"
       />
     </template>
     <div class="wsl-content">
       <component
-        :is="`preferences-wsl-${ activeTab }`"
+        :is="`preferences-wsl-${activeTab}`"
         :preferences="preferences"
       />
     </div>

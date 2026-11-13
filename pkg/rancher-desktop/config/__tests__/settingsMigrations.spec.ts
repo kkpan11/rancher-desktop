@@ -2,7 +2,7 @@ import _ from 'lodash';
 
 import { updateTable } from '../settingsImpl';
 
-import { defaultSettings } from '@pkg/config/settings';
+import { defaultSettings, MountType, VMType } from '@pkg/config/settings';
 
 describe('settings migrations', () => {
   describe('step 9', () => {
@@ -69,14 +69,35 @@ describe('settings migrations', () => {
       const testSettings = {};
 
       updateTable[10](testSettings, false);
-      expect(!_.has(testSettings, 'experimental.containerEngine.webAssembly.enabled'));
+      expect(testSettings).not.toHaveProperty('experimental.containerEngine.webAssembly.enabled', false);
     });
 
     it('should disable wasm in locked profiles', () => {
       const testSettings = {};
 
       updateTable[10](testSettings, true);
-      expect(_.has(testSettings, 'experimental.containerEngine.webAssembly.enabled'));
+      expect(testSettings).toHaveProperty('experimental.containerEngine.webAssembly.enabled', false);
+    });
+  });
+
+  describe('step 14', () => {
+    it('should migrate experimental.virtualMachine.type (and useRosetta) to virtualMachine.*', () => {
+      const testSettings = { experimental: { virtualMachine: { type: VMType.VZ, useRosetta: true } } };
+
+      updateTable[14](testSettings, false);
+      expect(testSettings).not.toHaveProperty('experimental.virtualMachine');
+      expect(testSettings).toHaveProperty('virtualMachine.type', VMType.VZ);
+      expect(testSettings).toHaveProperty('virtualMachine.useRosetta', true);
+    });
+  });
+
+  describe('step 15', () => {
+    it('should migrate experimental.virtualMachine.mount.type to virtualMachine.*', () => {
+      const testSettings = { experimental: { virtualMachine: { mount: { type: MountType.REVERSE_SSHFS } } } };
+
+      updateTable[15](testSettings, false);
+      expect(testSettings).not.toHaveProperty('experimental.virtualMachine.mount.type');
+      expect(testSettings).toHaveProperty('virtualMachine.mount.type', MountType.REVERSE_SSHFS);
     });
   });
 });

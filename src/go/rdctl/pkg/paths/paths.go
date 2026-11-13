@@ -2,9 +2,10 @@ package paths
 
 import (
 	"fmt"
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/utils"
 	"os"
 	"path/filepath"
+
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/utils"
 )
 
 const appName = "rancher-desktop"
@@ -32,6 +33,8 @@ type Paths struct {
 	Resources string `json:"resources"`
 	// Deployment Profile System-wide startup settings path.
 	DeploymentProfileSystem string `json:"deploymentProfileSystem,omitempty"`
+	// Secondary Deployment Profile System-wide startup settings path.
+	AltDeploymentProfileSystem string `json:"altDeploymentProfileSystem,omitempty"`
 	// Deployment Profile User startup settings path.
 	DeploymentProfileUser string `json:"deploymentProfileUser,omitempty"`
 	// Directory that holds extension data.
@@ -40,16 +43,28 @@ type Paths struct {
 	Snapshots string `json:"snapshots,omitempty"`
 	// Directory containing user-managed containerd-shims
 	ContainerdShims string `json:"containerdShims,omitempty"`
+	// Previous location of Electron user data (e.g. cookies) up to Rancher Desktop 1.16.
+	// Current location is `$AppHome/electron` and does not need special treatment.
+	OldUserData string `json:"oldUserData,omitempty"`
 }
 
-func getResourcesPath() (string, error) {
-	rdctlSymlinkPath, err := os.Executable()
-	if err != nil {
-		return "", fmt.Errorf("failed to get path to rdctl: %w", err)
-	}
-	rdctlPath, err := filepath.EvalSymlinks(rdctlSymlinkPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to resolve %q: %w", rdctlSymlinkPath, err)
+var rdctlPathOverride string
+
+// Get the path to the resources directory (the parent directory of the
+// platform-specific directory); this is used to fill in [Paths.Resources].
+func GetResourcesPath() (string, error) {
+	var rdctlPath string
+	if rdctlPathOverride != "" {
+		rdctlPath = rdctlPathOverride
+	} else {
+		rdctlSymlinkPath, err := os.Executable()
+		if err != nil {
+			return "", fmt.Errorf("failed to get path to rdctl: %w", err)
+		}
+		rdctlPath, err = filepath.EvalSymlinks(rdctlSymlinkPath)
+		if err != nil {
+			return "", fmt.Errorf("failed to resolve %q: %w", rdctlSymlinkPath, err)
+		}
 	}
 	return utils.GetParentDir(rdctlPath, 3), nil
 }

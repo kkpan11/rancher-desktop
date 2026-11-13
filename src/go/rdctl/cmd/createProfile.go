@@ -17,16 +17,19 @@ limitations under the License.
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
+
+	"github.com/spf13/cobra"
 
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/client"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/config"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/plist"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/reg"
-	"github.com/spf13/cobra"
 )
 
 const plistFormat = "plist"
@@ -62,7 +65,7 @@ can be imported into the Windows registry using the "eg import FILE" command.`,
 		if err := cobra.NoArgs(cmd, args); err != nil {
 			return err
 		}
-		result, err := createProfile()
+		result, err := createProfile(cmd.Context())
 		if err != nil {
 			return err
 		}
@@ -74,14 +77,14 @@ can be imported into the Windows registry using the "eg import FILE" command.`,
 func init() {
 	rootCmd.AddCommand(createProfileCmd)
 	createProfileCmd.Flags().StringVar(&outputSettingsFlags.Format, "output", "", fmt.Sprintf("output format: %s|%s", plistFormat, regFormat))
-	createProfileCmd.Flags().StringVar(&outputSettingsFlags.RegistryHive, "hive", "", fmt.Sprintf(`registry hive: %s|%s (default "%s")`, reg.HklmRegistryHive, reg.HkcuRegistryHive, reg.HklmRegistryHive))
-	createProfileCmd.Flags().StringVar(&outputSettingsFlags.RegistryProfileType, "type", "", fmt.Sprintf(`registry section: %s|%s (default "%s")`, defaultsType, lockedType, defaultsType))
+	createProfileCmd.Flags().StringVar(&outputSettingsFlags.RegistryHive, "hive", "", fmt.Sprintf(`registry hive: %s|%s (default %q)`, reg.HklmRegistryHive, reg.HkcuRegistryHive, reg.HklmRegistryHive))
+	createProfileCmd.Flags().StringVar(&outputSettingsFlags.RegistryProfileType, "type", "", fmt.Sprintf(`registry section: %s|%s (default %q)`, defaultsType, lockedType, defaultsType))
 	createProfileCmd.Flags().StringVar(&InputFile, "input", "", "File containing a JSON document (- for standard input)")
 	createProfileCmd.Flags().StringVarP(&JSONBody, "body", "b", "", "Command-line option containing a JSON document")
 	createProfileCmd.Flags().BoolVar(&UseCurrentSettings, "from-settings", false, "Use current settings")
 }
 
-func createProfile() (string, error) {
+func createProfile(ctx context.Context) (string, error) {
 	err := validateProfileFormatFlags()
 	if err != nil {
 		return "", err
@@ -101,25 +104,26 @@ func createProfile() (string, error) {
 			// This should have been caught in validateProfileFormatFlags
 			return "", fmt.Errorf(`no input format specified: must specify exactly one input format of "--input FILE|-", "--body|-b STRING", or "--from-settings"`)
 		}
-		connectionInfo, err := config.GetConnectionInfo(false)
-		if err != nil {
-			return "", fmt.Errorf("failed to get connection info: %w", err)
+		connectionInfo, err2 := config.GetConnectionInfo(false)
+		if err2 != nil {
+			return "", fmt.Errorf("failed to get connection info: %w", err2)
 		}
 		rdClient := client.NewRDClient(connectionInfo)
-		response, err := rdClient.DoRequest("GET", client.VersionCommand("", "settings"))
-		output, err = client.ProcessRequestForUtility(response, err)
+		command := client.VersionCommand("", "settings")
+		output, err = client.ProcessRequestForUtility(rdClient.DoRequest(ctx, http.MethodGet, command))
 	}
 	if err != nil {
 		return "", err
 	}
-	if outputSettingsFlags.Format == regFormat {
-		lines, err := reg.JsonToReg(outputSettingsFlags.RegistryHive, outputSettingsFlags.RegistryProfileType, string(output))
+	switch outputSettingsFlags.Format {
+	case regFormat:
+		lines, err := reg.JSONToReg(reg.RegistryHive(outputSettingsFlags.RegistryHive), reg.ProfileType(outputSettingsFlags.RegistryProfileType), string(output))
 		if err != nil {
 			return "", err
 		}
 		return strings.Join(lines, "\n"), nil
-	} else if outputSettingsFlags.Format == plistFormat {
-		return plist.JsonToPlist(string(output))
+	case plistFormat:
+		return plist.JSONToPlist(string(output))
 	}
 	return "", fmt.Errorf(`internal error: expecting an output format of %q or %q, got %q`, regFormat, plistFormat, outputSettingsFlags.Format)
 }
@@ -146,10 +150,10 @@ func validateProfileFormatFlags() error {
 	}
 
 	switch strings.ToLower(outputSettingsFlags.RegistryHive) {
-	case reg.HklmRegistryHive, reg.HkcuRegistryHive:
+	case string(reg.HklmRegistryHive), string(reg.HkcuRegistryHive):
 		outputSettingsFlags.RegistryHive = strings.ToLower(outputSettingsFlags.RegistryHive)
 	case "":
-		outputSettingsFlags.RegistryHive = reg.HklmRegistryHive
+		outputSettingsFlags.RegistryHive = string(reg.HklmRegistryHive)
 	default:
 		return fmt.Errorf("invalid registry hive of %q specified, must be %q or %q", outputSettingsFlags.RegistryHive, systemHive, userHive)
 	}

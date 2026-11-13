@@ -23,6 +23,7 @@
         :current-command="currentCommand"
         :action="activeTab"
         :image-output-culler="imageOutputCuller"
+        :image-to-pull="imageToPull"
         @ok:process-end="resetCurrentCommand"
         @ok:show="toggleOutput"
       />
@@ -70,7 +71,7 @@ export default {
   mounted() {
     this.$store.dispatch(
       'page/setHeader',
-      { title: this.t('images.add.title') },
+      { titleKey: 'images.add.title' },
     );
     ipcRenderer.once('settings-read', (_event, settings) => {
       this.enableAllowedImages(settings);
@@ -99,7 +100,7 @@ export default {
       }
     },
     doPullAnImage() {
-      const imageName = this.imageToPull.trim();
+      const imageName = this.imageToPull;
 
       this.currentCommand = `pull ${ imageName }`;
       this.startRunningCommand('pull');
@@ -107,7 +108,7 @@ export default {
       this.showOutput = true;
     },
     doBuildAnImage() {
-      const imageName = this.imageToPull.trim();
+      const imageName = this.imageToPull;
 
       this.currentCommand = `build ${ imageName }`;
       this.startRunningCommand('build');
@@ -136,7 +137,7 @@ export default {
     margin-left: 1px;
   }
 
-  .image-input::v-deep .labeled-input {
+  .image-input :deep(.labeled-input) {
     min-height: 42px;
     padding: 8px;
   }

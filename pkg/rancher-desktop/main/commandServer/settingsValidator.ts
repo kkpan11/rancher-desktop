@@ -1,3 +1,4 @@
+import net from 'net';
 import os from 'os';
 
 import _ from 'lodash';
@@ -5,6 +6,7 @@ import semver from 'semver';
 
 import {
   CacheMode,
+  ContainerEngine,
   defaultSettings,
   LockedSettingsType,
   MountType,
@@ -15,7 +17,9 @@ import {
 } from '@pkg/config/settings';
 import { NavItemName, navItemNames, TransientSettings } from '@pkg/config/transientSettings';
 import { PathManagementStrategy } from '@pkg/integrations/pathManager';
+import { availableLocales, t } from '@pkg/main/i18n';
 import { parseImageReference, validateImageName, validateImageTag } from '@pkg/utils/dockerUtils';
+import { stripNoproxyPrefix } from '@pkg/utils/networks';
 import { getMacOsVersion } from '@pkg/utils/osVersion';
 import { RecursivePartial } from '@pkg/utils/typeUtils';
 import { preferencesNavItems } from '@pkg/window/preferenceConstants';
@@ -32,8 +36,8 @@ type settingsLike = Record<string, any>;
  * @param fqname The fully qualified name of the setting, for formatting in error messages.
  * @returns boolean - true if the setting has been changed otherwise false.
  */
-type ValidatorFunc<S, C, D> =
-  (mergedSettings: S, currentValue: C, desiredValue: D, errors: string[], fqname: string) => boolean;
+type ValidatorFunc<S, C, D, N extends string> =
+  (mergedSettings: S, currentValue: C, desiredValue: D, errors: string[], fqname: N) => boolean;
 
 /**
  * SettingsValidationMapEntry describes validators that are valid for some
@@ -41,13 +45,16 @@ type ValidatorFunc<S, C, D> =
  * for that subtree, or an object containing validators for each member of the
  * subtree.
  */
-type SettingsValidationMapEntry<S, T> = {
+type SettingsValidationMapEntry<S, T, N extends string = ''> = {
   [k in keyof T]:
-  T[k] extends string | Array<string> | number | boolean ?
-  ValidatorFunc<S, T[k], T[k]> :
-  T[k] extends Record<string, infer V> ?
-  SettingsValidationMapEntry<S, T[k]> | ValidatorFunc<S, T[k], Record<string, V>> :
-  never;
+  k extends string ?
+    T[k] extends string | string[] | number | boolean ?
+      ValidatorFunc<S, T[k], T[k], N extends '' ? k : `${ N }.${ k }`> :
+      T[k] extends Record<string, infer V> ?
+        SettingsValidationMapEntry<S, T[k], N extends '' ? k : `${ N }.${ k }`> |
+          ValidatorFunc<S, T[k], Record<string, V>, N extends '' ? k : `${ N }.${ k }`> :
+        never :
+    never;
 };
 
 /**
@@ -59,12 +66,13 @@ type SettingsValidationMap = SettingsValidationMapEntry<Settings, Settings>;
 type TransientSettingsValidationMap = SettingsValidationMapEntry<TransientSettings, TransientSettings>;
 
 export default class SettingsValidator {
-  k8sVersions: Array<string> = [];
-  allowedSettings: SettingsValidationMap | null = null;
+  k8sVersions:              string[] = [];
+  allowedSettings:          SettingsValidationMap | null = null;
   allowedTransientSettings: TransientSettingsValidationMap | null = null;
-  synonymsTable: settingsLike|null = null;
-  lockedSettings: LockedSettingsType = { };
+  synonymsTable:            settingsLike | null = null;
+  lockedSettings:           LockedSettingsType = { };
   protected isFatal = false;
+  hasLockedFieldError = false;
 
   validateSettings(
     currentSettings: Settings,
@@ -73,6 +81,7 @@ export default class SettingsValidator {
   ): [boolean, string[], boolean] {
     this.lockedSettings = lockedSettings;
     this.isFatal = false;
+    this.hasLockedFieldError = false;
     this.allowedSettings ||= {
       version:     this.checkUnchanged,
       application: {
@@ -92,63 +101,68 @@ export default class SettingsValidator {
         autoStart:              this.checkBoolean,
         startInBackground:      this.checkBoolean,
         hideNotificationIcon:   this.checkBoolean,
+        locale:                 this.checkEnum(...availableLocales),
         window:                 { quitOnClose: this.checkBoolean },
+        theme:                  this.checkEnum('system', 'light', 'dark'),
       },
       containerEngine: {
         allowedImages: {
           enabled:  this.checkBoolean,
           patterns: this.checkUniqueStringArray,
         },
-        // 'docker' has been canonicalized to 'moby' already, but we want to include it as a valid value in the error message
-        name: this.checkEnum('containerd', 'moby', 'docker'),
+        mobyStorageDriver: this.checkMulti(
+          this.checkEnum('classic', 'snapshotter', 'auto'),
+          this.checkWASMWithMobyStorage,
+        ),
+        name: this.checkMulti(
+          // 'docker' has been canonicalized to 'moby' already, but we want to include it as a valid value in the error message
+          this.checkEnum('containerd', 'moby', 'docker'),
+          this.checkWASMWithMobyStorage,
+        ),
       },
       virtualMachine: {
-        memoryInGB:   this.checkLima(this.checkNumber(1, Number.POSITIVE_INFINITY)),
-        numberCPUs:   this.checkLima(this.checkNumber(1, Number.POSITIVE_INFINITY)),
-        hostResolver: this.checkPlatform('win32', this.checkBoolean),
+        memoryInGB: this.checkLima(this.checkNumber(1, Number.POSITIVE_INFINITY)),
+        numberCPUs: this.checkLima(this.checkInteger(1, Number.POSITIVE_INFINITY)),
+        useRosetta: this.checkPlatform('darwin', this.checkRosetta),
+        type:       this.checkPlatform('darwin', this.checkMulti(
+          this.checkEnum(...Object.values(VMType)),
+          this.checkVMType),
+        ),
+        mount: {
+          type: this.checkLima(this.checkMulti(
+            this.checkEnum(...Object.values(MountType)),
+            this.checkMountType),
+          ),
+        },
       },
       experimental: {
-        containerEngine: { webAssembly: { enabled: this.checkBoolean } },
+        containerEngine: { webAssembly: { enabled: this.checkMulti(this.checkBoolean, this.checkWASMWithMobyStorage) } },
         kubernetes:      { options: { spinkube: this.checkMulti(this.checkBoolean, this.checkSpinkube) } },
         virtualMachine:  {
-          mount: {
-            type: this.checkLima(this.checkMulti(
-              this.checkEnum(...Object.values(MountType)),
-              this.checkMountType),
-            ),
+          diskSize: this.checkLima(this.checkByteUnits),
+          mount:    {
             '9p': {
               securityModel:   this.checkLima(this.check9P(this.checkEnum(...Object.values(SecurityModel)))),
               protocolVersion: this.checkLima(this.check9P(this.checkEnum(...Object.values(ProtocolVersion)))),
-              msizeInKib:      this.checkLima(this.check9P(this.checkNumber(4, Number.POSITIVE_INFINITY))),
+              msizeInKib:      this.checkLima(this.check9P(this.checkInteger(4, Number.POSITIVE_INFINITY))),
               cacheMode:       this.checkLima(this.check9P(this.checkEnum(...Object.values(CacheMode)))),
             },
           },
-          // networkingTunnel only applies to Win32, but deployment profiles on macOS/Linux may still include
-          // the setting. Since we changed the default value, this would now throw a validation error.
-          // see https://github.com/rancher-sandbox/rancher-desktop/issues/6953
-          // The setting will be removed once the legacy Windows networking mode is disabled, so until
-          // then we will allow changing the setting on all platforms to avoid the profile error.
-          // Changing the setting will have no effect on macOS/Linux anyways.
-          networkingTunnel: this.checkBoolean,
-          useRosetta:       this.checkPlatform('darwin', this.checkRosetta),
-          type:             this.checkPlatform('darwin', this.checkMulti(
-            this.checkEnum(...Object.values(VMType)),
-            this.checkVMType),
-          ),
           proxy: {
             enabled:  this.checkPlatform('win32', this.checkBoolean),
             address:  this.checkPlatform('win32', this.checkString),
             password: this.checkPlatform('win32', this.checkString),
-            port:     this.checkPlatform('win32', this.checkNumber(1, 65535)),
+            port:     this.checkPlatform('win32', this.checkInteger(1, 65535)),
             username: this.checkPlatform('win32', this.checkString),
-            noproxy:  this.checkPlatform('win32', this.checkUniqueStringArray),
+            noproxy:  this.checkPlatform('win32', this.checkNoproxyList),
           },
+          sshPortForwarder: this.checkLima(this.checkBoolean),
         },
       },
       WSL:        { integrations: this.checkPlatform('win32', this.checkBooleanMapping) },
       kubernetes: {
         version: this.checkKubernetesVersion,
-        port:    this.checkNumber(1, 65535),
+        port:    this.checkInteger(1, 65535),
         enabled: this.checkBoolean,
         options: { traefik: this.checkBoolean, flannel: this.checkBoolean },
         ingress: { localhostOnly: this.checkPlatform('win32', this.checkBoolean) },
@@ -163,12 +177,16 @@ export default class SettingsValidator {
         namespace: this.checkString,
       },
       diagnostics: {
-        mutedChecks: this.checkBooleanMapping,
-        showMuted:   this.checkBoolean,
+        mutedChecks:  this.checkBooleanMapping,
+        showMuted:    this.checkBoolean,
+        connectivity: {
+          interval: this.checkNumber(0, 2 ** 31 - 1),
+          timeout:  this.checkNumber(1, 2 ** 31 - 1),
+        },
       },
     };
     this.canonicalizeSynonyms(newSettings);
-    const errors: Array<string> = [];
+    const errors: string[] = [];
     const needToUpdate = this.checkProposedSettings(
       _.merge({}, currentSettings, newSettings),
       this.allowedSettings,
@@ -196,7 +214,7 @@ export default class SettingsValidator {
     };
 
     this.canonicalizeSynonyms(currentTransientSettings);
-    const errors: Array<string> = [];
+    const errors: string[] = [];
     const needToUpdate = this.checkProposedSettings(
       _.merge({}, currentTransientSettings, newTransientSettings),
       this.allowedTransientSettings,
@@ -240,36 +258,46 @@ export default class SettingsValidator {
         continue;
       }
       if (typeof (allowedSettings[k]) === 'object') {
-        if (typeof (newSettings[k]) === 'object') {
-          changeNeeded = this.checkProposedSettings(mergedSettings, allowedSettings[k], currentSettings[k], newSettings[k], errors, fqname) || changeNeeded;
+        const proposedValue = newSettings[k];
+        if (typeof proposedValue === 'object' && proposedValue && !Array.isArray(proposedValue)) {
+          changeNeeded = this.checkProposedSettings(mergedSettings, allowedSettings[k], currentSettings[k], proposedValue, errors, fqname) || changeNeeded;
+        } else if (typeof proposedValue === 'object') {
+          errors.push(t('validation.shouldBeObject', { field: fqname, value: JSON.stringify(proposedValue) }));
         } else {
-          errors.push(`Setting "${ fqname }" should wrap an inner object, but got <${ newSettings[k] }>.`);
+          errors.push(t('validation.shouldBeObject', { field: fqname, value: proposedValue }));
         }
       } else if (typeof (newSettings[k]) === 'object') {
         if (typeof allowedSettings[k] === 'function') {
           // Special case for things like `.WSLIntegrations` which have unknown fields.
-          const validator: ValidatorFunc<S, any, any> = allowedSettings[k];
+          const validator: ValidatorFunc<S, any, any, any> = allowedSettings[k];
 
           changeNeededHere = validator.call(this, mergedSettings, currentSettings[k], newSettings[k], errors, fqname);
         } else {
           // newSettings[k] should be valid JSON because it came from `JSON.parse(incoming-payload)`.
           // It's an internal error (HTTP Status 500) if it isn't.
-          errors.push(`Setting "${ fqname }" should be a simple value, but got <${ JSON.stringify(newSettings[k]) }>.`);
+          errors.push(t('validation.shouldBeSimple', { field: fqname, value: JSON.stringify(newSettings[k]) }));
         }
       } else if (typeof allowedSettings[k] === 'function') {
-        const validator: ValidatorFunc<S, any, any> = allowedSettings[k];
+        const validator: ValidatorFunc<S, any, any, any> = allowedSettings[k];
 
         changeNeededHere = validator.call(this, mergedSettings, currentSettings[k], newSettings[k], errors, fqname);
       } else {
         errors.push(this.notSupported(fqname));
       }
       if (changeNeededHere) {
-        const isLocked = _.get(this.lockedSettings, `${ prefix }.${ k }`);
+        // At the root prefix is empty, so `${ prefix }.${ k }` would yield a
+        // leading dot, and lodash resolves that against `lockedSettings['']`
+        // instead of the lock. No test covers this today, because `version` is
+        // the only root-level leaf and its validator never reports a change.
+        const isLocked = _.get(this.lockedSettings, fqname);
 
         if (isLocked) {
-          // A delayed error condition, raised only if we try to change a field in a locked object
-          errors.push(`field "${ prefix }.${ k }" is locked`);
+          // A delayed error condition, raised only if we try to change a field in a locked object.
+          // Callers check hasLockedFieldError to detect this condition without
+          // parsing the translated error message.
+          errors.push(t('validation.fieldLocked', { field: fqname }));
           this.isFatal = true;
+          this.hasLockedFieldError = true;
         } else {
           changeNeeded = true;
         }
@@ -279,16 +307,19 @@ export default class SettingsValidator {
     return changeNeeded;
   }
 
+  // Validation messages are locale-dependent. The CLI and HTTP API return
+  // these strings directly, so callers must not parse them; classification
+  // uses structured flags like hasLockedFieldError.
   protected invalidSettingMessage(fqname: string, desiredValue: any): string {
-    return `Invalid value for "${ fqname }": <${ JSON.stringify(desiredValue) }>`;
+    return t('validation.invalidValue', { field: fqname, value: JSON.stringify(desiredValue) });
   }
 
   /**
    * checkLima ensures that the given parameter is only set on Lima-based platforms.
    * @note This should not be used for things with default values.
    */
-  protected checkLima<C, D>(validator: ValidatorFunc<Settings, C, D>) {
-    return (mergedSettings: Settings, currentValue: C, desiredValue: D, errors: string[], fqname: string) => {
+  protected checkLima<C, D, N extends string>(validator: ValidatorFunc<Settings, C, D, N>) {
+    return (mergedSettings: Settings, currentValue: C, desiredValue: D, errors: string[], fqname: N) => {
       if (!['darwin', 'linux'].includes(os.platform())) {
         if (!_.isEqual(currentValue, desiredValue)) {
           this.isFatal = true;
@@ -304,14 +335,14 @@ export default class SettingsValidator {
 
   protected checkRosetta(mergedSettings: Settings, currentValue: boolean, desiredValue: boolean, errors: string[], fqname: string): boolean {
     if (desiredValue && !currentValue) {
-      if (mergedSettings.experimental.virtualMachine.type !== VMType.VZ) {
-        errors.push(`Setting ${ fqname } can only be enabled when experimental.virtual-machine.type is "${ VMType.VZ }".`);
+      if (mergedSettings.virtualMachine.type !== VMType.VZ) {
+        errors.push(t('validation.requiresVz', { field: fqname, vmType: VMType.VZ }));
         this.isFatal = true;
 
         return false;
       }
       if (process.arch !== 'arm64') {
-        errors.push(`Setting ${ fqname } can only be enabled on aarch64 systems.`);
+        errors.push(t('validation.requiresArm', { field: fqname }));
         this.isFatal = true;
 
         return false;
@@ -325,28 +356,38 @@ export default class SettingsValidator {
     if (desiredValue === VMType.VZ) {
       if (os.arch() === 'arm64' && semver.gt('13.3.0', getMacOsVersion())) {
         this.isFatal = true;
-        errors.push(`Setting ${ fqname } to "${ VMType.VZ }" on ARM requires macOS 13.3 (Ventura) or later.`);
+        errors.push(t('validation.vzArmMacOs', { field: fqname, vmType: VMType.VZ }));
 
         return false;
       } else if (semver.gt('13.0.0', getMacOsVersion())) {
         this.isFatal = true;
-        errors.push(`Setting ${ fqname } to "${ VMType.VZ }" on Intel requires macOS 13.0 (Ventura) or later.`);
+        errors.push(t('validation.vzIntelMacOs', { field: fqname, vmType: VMType.VZ }));
 
         return false;
       }
-      if (mergedSettings.experimental.virtualMachine.mount.type === MountType.NINEP) {
+      if (mergedSettings.virtualMachine.mount.type === MountType.NINEP) {
         errors.push(
-          `Setting ${ fqname } to "${ VMType.VZ }" requires that experimental.virtual-machine.mount.type is ` +
-          `"${ MountType.REVERSE_SSHFS }" or "${ MountType.VIRTIOFS }".`);
+          t('validation.settingRequiresEither', {
+            field:      fqname,
+            value:      VMType.VZ,
+            otherField: 'virtual-machine.mount.type',
+            option1:    MountType.REVERSE_SSHFS,
+            option2:    MountType.VIRTIOFS,
+          }));
 
         return false;
       }
     }
     if (desiredValue === VMType.QEMU) {
-      if (mergedSettings.experimental.virtualMachine.mount.type === MountType.VIRTIOFS && os.platform() === 'darwin') {
+      if (mergedSettings.virtualMachine.mount.type === MountType.VIRTIOFS && os.platform() === 'darwin') {
         errors.push(
-          `Setting ${ fqname } to "${ VMType.QEMU }" requires that experimental.virtual-machine.mount.type is ` +
-          `"${ MountType.REVERSE_SSHFS }" or "${ MountType.NINEP }".`);
+          t('validation.settingRequiresEither', {
+            field:      fqname,
+            value:      VMType.QEMU,
+            otherField: 'virtual-machine.mount.type',
+            option1:    MountType.REVERSE_SSHFS,
+            option2:    MountType.NINEP,
+          }));
 
         return false;
       }
@@ -356,20 +397,20 @@ export default class SettingsValidator {
   }
 
   protected checkMountType(mergedSettings: Settings, currentValue: string, desiredValue: string, errors: string[], fqname: string): boolean {
-    if (desiredValue === MountType.VIRTIOFS && mergedSettings.experimental.virtualMachine.type !== VMType.VZ && os.platform() === 'darwin') {
-      errors.push(`Setting ${ fqname } to "${ MountType.VIRTIOFS }" requires that experimental.virtual-machine.type is "${ VMType.VZ }".`);
+    if (desiredValue === MountType.VIRTIOFS && mergedSettings.virtualMachine.type !== VMType.VZ && os.platform() === 'darwin') {
+      errors.push(t('validation.settingRequires', { field: fqname, value: MountType.VIRTIOFS, otherField: 'virtual-machine.type', required: VMType.VZ }));
       this.isFatal = true;
 
       return false;
     }
-    if (desiredValue === MountType.VIRTIOFS && mergedSettings.experimental.virtualMachine.type !== VMType.QEMU && os.platform() === 'linux') {
-      errors.push(`Setting ${ fqname } to "${ MountType.VIRTIOFS }" requires that experimental.virtual-machine.type is "${ VMType.QEMU }".`);
+    if (desiredValue === MountType.VIRTIOFS && mergedSettings.virtualMachine.type !== VMType.QEMU && os.platform() === 'linux') {
+      errors.push(t('validation.settingRequires', { field: fqname, value: MountType.VIRTIOFS, otherField: 'virtual-machine.type', required: VMType.QEMU }));
       this.isFatal = true;
 
       return false;
     }
-    if (desiredValue === MountType.NINEP && mergedSettings.experimental.virtualMachine.type !== VMType.QEMU) {
-      errors.push(`Setting ${ fqname } to "${ MountType.NINEP }" requires that experimental.virtual-machine.type is "${ VMType.QEMU }".`);
+    if (desiredValue === MountType.NINEP && mergedSettings.virtualMachine.type !== VMType.QEMU) {
+      errors.push(t('validation.settingRequires', { field: fqname, value: MountType.NINEP, otherField: 'virtual-machine.type', required: VMType.QEMU }));
       this.isFatal = true;
 
       return false;
@@ -381,13 +422,7 @@ export default class SettingsValidator {
   protected checkSpinkube(mergedSettings: Settings, currentValue: boolean, desiredValue: boolean, errors: string[], fqname: string): boolean {
     if (mergedSettings.kubernetes.enabled && desiredValue) {
       if (!mergedSettings.experimental.containerEngine.webAssembly.enabled) {
-        errors.push(`Setting ${ fqname } can only be set when experimental.container-engine.web-assembly.enabled is set as well.`);
-        this.isFatal = true;
-
-        return false;
-      }
-      if (mergedSettings.kubernetes.version === '' || semver.gt('1.22.0', mergedSettings.kubernetes.version)) {
-        errors.push(`Setting ${ fqname } requires Kubernetes 1.22 or later`);
+        errors.push(t('validation.requiresWebAssembly', { field: fqname }));
         this.isFatal = true;
 
         return false;
@@ -397,8 +432,32 @@ export default class SettingsValidator {
     return currentValue !== desiredValue;
   }
 
-  protected checkPlatform<C, D>(platform: NodeJS.Platform, validator: ValidatorFunc<Settings, C, D>) {
-    return (mergedSettings: Settings, currentValue: C, desiredValue: D, errors: string[], fqname: string) => {
+  // checkWASMWithMobyStorage checks that we can't use classic storage for moby
+  // in combination with WASM.
+  protected checkWASMWithMobyStorage<
+    T,
+    N extends 'containerEngine.name' | 'containerEngine.mobyStorageDriver' | 'experimental.containerEngine.webAssembly.enabled',
+  >(mergedSettings: Settings, currentValue: T, desiredValue: T, errors: string[], fqname: N): boolean {
+    if (mergedSettings.containerEngine.name === ContainerEngine.MOBY &&
+        mergedSettings.experimental.containerEngine.webAssembly.enabled &&
+        mergedSettings.containerEngine.mobyStorageDriver === 'classic'
+    ) {
+      const message: string = {
+        'containerEngine.name':                             t('validation.cannotSwitchMobyClassicWasm'),
+        'experimental.containerEngine.webAssembly.enabled': t('validation.cannotEnableWasmClassic'),
+        'containerEngine.mobyStorageDriver':                t('validation.cannotSwitchClassicWasm'),
+      }[fqname];
+
+      if (currentValue !== desiredValue) {
+        errors.push(message);
+        this.isFatal = true;
+      }
+    }
+    return currentValue !== desiredValue;
+  }
+
+  protected checkPlatform<C, D, N extends string>(platform: NodeJS.Platform, validator: ValidatorFunc<Settings, C, D, N>) {
+    return (mergedSettings: Settings, currentValue: C, desiredValue: D, errors: string[], fqname: N) => {
       if (os.platform() !== platform) {
         if (!_.isEqual(currentValue, desiredValue)) {
           errors.push(this.notSupported(fqname));
@@ -412,11 +471,11 @@ export default class SettingsValidator {
     };
   }
 
-  protected check9P<C, D>(validator: ValidatorFunc<Settings, C, D>) {
-    return (mergedSettings: Settings, currentValue: C, desiredValue: D, errors: string[], fqname: string) => {
-      if (mergedSettings.experimental.virtualMachine.mount.type !== MountType.NINEP) {
+  protected check9P<C, D, N extends string>(validator: ValidatorFunc<Settings, C, D, N>) {
+    return (mergedSettings: Settings, currentValue: C, desiredValue: D, errors: string[], fqname: N) => {
+      if (mergedSettings.virtualMachine.mount.type !== MountType.NINEP) {
         if (!_.isEqual(currentValue, desiredValue)) {
-          errors.push(`Setting ${ fqname } can only be changed when experimental.virtualMachine.mount.type is "${ MountType.NINEP }".`);
+          errors.push(t('validation.requiresNineP', { field: fqname, mountType: MountType.NINEP }));
           this.isFatal = true;
         }
 
@@ -427,8 +486,8 @@ export default class SettingsValidator {
     };
   }
 
-  protected checkMulti<S, C, D>(...validators: ValidatorFunc<S, C, D>[]) {
-    return (mergedSettings: S, currentValue: C, desiredValue: D, errors: string[], fqname: string) => {
+  protected checkMulti<S, C, D, N extends string>(...validators: ValidatorFunc<S, C, D, N>[]) {
+    return (mergedSettings: S, currentValue: C, desiredValue: D, errors: string[], fqname: N) => {
       let retval = false;
 
       for (const validator of validators) {
@@ -472,17 +531,38 @@ export default class SettingsValidator {
     };
   }
 
+  /**
+   * checkInteger returns a checker for a whole number in the given range,
+   * inclusive.  Use it for counts, sizes and ports, where fractional
+   * values do not make sense.
+   */
+  protected checkInteger(min: number, max: number) {
+    const checkRange = this.checkNumber(min, max);
+
+    return <S>(mergedSettings: S, currentValue: number, desiredValue: number, errors: string[], fqname: string) => {
+      if (typeof desiredValue === 'number' && !Number.isInteger(desiredValue)) {
+        errors.push(this.invalidSettingMessage(fqname, desiredValue));
+
+        return false;
+      }
+
+      return checkRange(mergedSettings, currentValue, desiredValue, errors, fqname);
+    };
+  }
+
   protected checkEnum(...validValues: string[]) {
     return <S>(mergedSettings: S, currentValue: string, desiredValue: string, errors: string[], fqname: string) => {
-      const explanation = `must be one of ${ JSON.stringify(validValues) }`;
-
       if (typeof desiredValue !== 'string') {
-        errors.push(`${ this.invalidSettingMessage(fqname, desiredValue) }; ${ explanation }`);
+        errors.push(t('validation.invalidValueEnum', {
+          field: fqname, value: JSON.stringify(desiredValue), validValues: JSON.stringify(validValues),
+        }));
 
         return false;
       }
       if (!validValues.includes(desiredValue)) {
-        errors.push(`Invalid value for "${ fqname }": <${ JSON.stringify(desiredValue) }>; ${ explanation }`);
+        errors.push(t('validation.invalidValueEnum', {
+          field: fqname, value: JSON.stringify(desiredValue), validValues: JSON.stringify(validValues),
+        }));
         this.isFatal = true;
 
         return false;
@@ -502,12 +582,52 @@ export default class SettingsValidator {
     return currentValue !== desiredValue;
   }
 
+  /**
+   * Parse a string representing a number of bytes into a number, in a way that
+   * is compatible with `github.com/docker/go-units`.
+   * @param input The string to parse.
+   * @returns The parsed number, or `undefined` if the input is not valid.
+   */
+  protected parseByteUnits(input: string): number | undefined {
+    const expression = /^(\d+(?:\.\d+)?) ?([kmgtpezy]?)(i?b)?$/i; // spellcheck-ignore-line
+    const prefix = ['', 'k', 'm', 'g', 't', 'p', 'e', 'z', 'y'];
+    const match = expression.exec(input);
+
+    if (!match) {
+      return undefined;
+    }
+
+    const [, number, scale, unit] = match;
+    const base = unit?.startsWith('i') ? 1_024 : 1_000;
+    const exponent = prefix.indexOf(scale.toLowerCase() ?? '');
+
+    return parseFloat(number) * base ** exponent;
+  }
+
+  /**
+   * Check that the setting is a valid number of bytes, per `github.com/docker/go-units`.
+   */
+  protected checkByteUnits(_: Settings, currentValue: string, desiredValue: string, errors: string[], fqname: string): boolean {
+    const current = this.parseByteUnits(currentValue);
+    const desired = this.parseByteUnits(desiredValue);
+
+    if (typeof desired === 'undefined') {
+      errors.push(this.invalidSettingMessage(fqname, desiredValue));
+    } else if (typeof current !== 'undefined' && desired < current) {
+      errors.push(t('validation.cannotDecrease', { field: fqname, from: currentValue, to: desiredValue }));
+    } else {
+      return currentValue !== desiredValue;
+    }
+
+    return false;
+  }
+
   protected checkKubernetesVersion(mergedSettings: Settings, currentValue: string, desiredVersion: string, errors: string[], _: string): boolean {
     /**
      * desiredVersion can be an empty string when Kubernetes is disabled, but otherwise it must be a valid version.
     */
     if ((mergedSettings.kubernetes.enabled || desiredVersion !== '') && !this.k8sVersions.includes(desiredVersion)) {
-      errors.push(`Kubernetes version "${ desiredVersion }" not found.`);
+      errors.push(t('validation.kubernetesVersionNotFound', { version: desiredVersion }));
 
       return false;
     }
@@ -516,7 +636,7 @@ export default class SettingsValidator {
   }
 
   protected notSupported(fqname: string) {
-    return `Changing field "${ fqname }" via the API isn't supported.`;
+    return t('validation.notSupported', { field: fqname });
   }
 
   protected checkUnchanged<S>(mergedSettings: S, currentValue: any, desiredValue: any, errors: string[], fqname: string): boolean {
@@ -534,8 +654,8 @@ export default class SettingsValidator {
    * and mutedChecks.
    */
   protected checkBooleanMapping<S>(mergedSettings: S, currentValue: Record<string, boolean>, desiredValue: Record<string, boolean>, errors: string[], fqname: string): boolean {
-    if (typeof (desiredValue) !== 'object') {
-      errors.push(`Proposed field "${ fqname }" should be an object, got <${ desiredValue }>.`);
+    if (typeof (desiredValue) !== 'object' || desiredValue === null || Array.isArray(desiredValue)) {
+      errors.push(t('validation.proposedShouldBeObject', { field: fqname, value: String(desiredValue) }));
 
       return false;
     }
@@ -563,7 +683,7 @@ export default class SettingsValidator {
 
     if (duplicateValues.length > 0) {
       duplicateValues.sort(Intl.Collator().compare);
-      errors.push(`field "${ fqname }" has duplicate entries: "${ duplicateValues.join('", "') }"`);
+      errors.push(t('validation.duplicateEntries', { field: fqname, duplicates: duplicateValues.join('", "') }));
 
       return false;
     }
@@ -593,6 +713,81 @@ export default class SettingsValidator {
     return Array.from(duplicates).concat(whiteSpaceMembers);
   }
 
+  /**
+   * Validate that a string is an IP address or CIDR subnet.
+   * Accepts IPv4 and IPv6 addresses with optional prefix length.
+   */
+  protected static isIPAddressOrCIDR(entry: string): boolean {
+    const slashIndex = entry.indexOf('/');
+
+    if (slashIndex === -1) {
+      return net.isIP(entry) !== 0;
+    }
+    const address = entry.substring(0, slashIndex);
+    const prefixStr = entry.substring(slashIndex + 1);
+    const ipVersion = net.isIP(address);
+
+    if (ipVersion === 0) {
+      return false;
+    }
+    if (!/^\d+$/.test(prefixStr)) {
+      return false;
+    }
+    const prefix = parseInt(prefixStr, 10);
+    const maxPrefix = ipVersion === 4 ? 32 : 128;
+
+    return prefix >= 0 && prefix <= maxPrefix;
+  }
+
+  /**
+   * Validate that a string is a domain name, optionally with a wildcard prefix.
+   * Accepts "example.com", "*.example.com", and ".example.com" (NO_PROXY convention).
+   */
+  protected static isDomainName(entry: string): boolean {
+    const domain = stripNoproxyPrefix(entry);
+
+    if (domain.length === 0 || domain.length > 253) {
+      return false;
+    }
+    // Reject prefixed IP addresses like "*.10.0.0.1" or ".10.0.0.1".
+    if (net.isIP(domain) !== 0) {
+      return false;
+    }
+    const labels = domain.split('.');
+    const labelRE = /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$/;
+
+    return labels.every(label => labelRE.test(label));
+  }
+
+  /**
+   * Validate the noproxy list: must be unique strings, each a valid IP address,
+   * CIDR subnet, domain name, or wildcard domain.
+   */
+  protected checkNoproxyList<S>(mergedSettings: S, currentValue: string[], desiredValue: string[], errors: string[], fqname: string): boolean {
+    if (!Array.isArray(desiredValue) || desiredValue.some(s => typeof (s) !== 'string')) {
+      errors.push(this.invalidSettingMessage(fqname, desiredValue));
+
+      return false;
+    }
+    const duplicateValues = this.findDuplicates(desiredValue);
+
+    if (duplicateValues.length > 0) {
+      duplicateValues.sort(Intl.Collator().compare);
+      errors.push(t('validation.duplicateEntries', { field: fqname, duplicates: duplicateValues.join('", "') }));
+
+      return false;
+    }
+    const invalidEntries = desiredValue.filter(entry => !SettingsValidator.isIPAddressOrCIDR(entry) && !SettingsValidator.isDomainName(entry));
+
+    if (invalidEntries.length > 0) {
+      errors.push(t('validation.invalidNoproxyEntries', { field: fqname, entries: invalidEntries.join('", "') }));
+
+      return false;
+    }
+
+    return currentValue.length !== desiredValue.length || currentValue.some((v, i) => v !== desiredValue[i]);
+  }
+
   protected checkInstalledExtensions(
     mergedSettings: Settings,
     currentValue: Record<string, string>,
@@ -605,20 +800,20 @@ export default class SettingsValidator {
       return false;
     }
 
-    if (typeof desiredValue !== 'object' || !desiredValue) {
-      errors.push(`${ fqname }: "${ desiredValue }" is not a valid mapping`);
+    if (typeof desiredValue !== 'object' || !desiredValue || Array.isArray(desiredValue)) {
+      errors.push(t('validation.invalidMapping', { field: fqname, value: desiredValue }));
 
       return false;
     }
 
     for (const [name, tag] of Object.entries(desiredValue)) {
       if (!validateImageName(name)) {
-        errors.push(`${ fqname }: "${ name }" is an invalid name`);
+        errors.push(t('validation.invalidName', { field: fqname, name }));
       }
       if (typeof tag !== 'string') {
-        errors.push(`${ fqname }: "${ name }" has non-string tag "${ tag }"`);
+        errors.push(t('validation.nonStringTag', { field: fqname, name, tag: String(tag) }));
       } else if (!validateImageTag(tag)) {
-        errors.push(`${ fqname }: "${ name }" has invalid tag "${ tag }"`);
+        errors.push(t('validation.invalidTag', { field: fqname, name, tag }));
       }
     }
 
@@ -645,7 +840,7 @@ export default class SettingsValidator {
 
     for (const pattern of desiredValue as string[]) {
       if (!parseImageReference(pattern, true)) {
-        errors.push(`${ fqname }: "${ pattern }" does not describe an image reference`);
+        errors.push(t('validation.invalidImageReference', { field: fqname, pattern }));
       }
     }
 
@@ -660,7 +855,7 @@ export default class SettingsValidator {
     fqname: string,
   ): boolean {
     if (!desiredValue || !navItemNames.includes(desiredValue)) {
-      errors.push(`${ fqname }: "${ desiredValue }" is not a valid page name for Preferences Dialog`);
+      errors.push(t('validation.invalidPageName', { field: fqname, value: desiredValue }));
 
       return false;
     }
@@ -677,7 +872,7 @@ export default class SettingsValidator {
   ): boolean {
     for (const k of Object.keys(desiredValue)) {
       if (!navItemNames.includes(k as NavItemName)) {
-        errors.push(`${ fqname }: "${ k }" is not a valid page name for Preferences Dialog`);
+        errors.push(t('validation.invalidPageName', { field: fqname, value: k }));
 
         return false;
       }
@@ -691,7 +886,7 @@ export default class SettingsValidator {
       const navItem = preferencesNavItems.find(item => item.name === k);
 
       if (!navItem?.tabs?.includes(desiredValue[k])) {
-        errors.push(`${ fqname }: tab name "${ desiredValue[k] }" is not a valid tab name for "${ k }" Preference page`);
+        errors.push(t('validation.invalidTabName', { field: fqname, tabName: desiredValue[k], page: k }));
 
         return false;
       }
@@ -739,7 +934,7 @@ export default class SettingsValidator {
   }
 
   protected canonicalizeBool(newSettings: settingsLike, index: string): void {
-    const desiredValue: boolean|string = newSettings[index];
+    const desiredValue: boolean | string = newSettings[index];
 
     if (desiredValue === 'true') {
       newSettings[index] = true;
@@ -752,10 +947,10 @@ export default class SettingsValidator {
     const desiredValue: number | string = newSettings[index];
 
     if (typeof desiredValue === 'string') {
-      const parsedValue = parseInt(desiredValue, 10);
+      const parsedValue = Number(desiredValue);
 
-      // Ignore NaN; we'll fail validation later.
-      if (!Number.isNaN(parsedValue)) {
+      // Ignore invalid values; we'll fail validation later.
+      if (desiredValue.trim() !== '' && Number.isFinite(parsedValue)) {
         newSettings[index] = parsedValue;
       }
     }

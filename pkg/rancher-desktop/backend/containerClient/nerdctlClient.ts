@@ -8,7 +8,7 @@ import _ from 'lodash';
 import tar from 'tar-stream';
 
 import {
-  ContainerComposeExecOptions, ReadableProcess, ContainerComposeOptions,
+  ContainerComposeExecOptions, ReadableProcess, WritableReadableProcess, ContainerComposeOptions,
   ContainerEngineClient, ContainerRunOptions, ContainerStopOptions,
   ContainerRunClientOptions, ContainerComposePortOptions, ContainerBasicOptions,
 } from './types';
@@ -19,6 +19,7 @@ import { spawn, spawnFile } from '@pkg/utils/childProcess';
 import { parseImageReference } from '@pkg/utils/dockerUtils';
 import Logging, { Log } from '@pkg/utils/logging';
 import { executable } from '@pkg/utils/resources';
+import { tarStreamFinished } from '@pkg/utils/tarStream';
 import { defined } from '@pkg/utils/typeUtils';
 
 const console = Logging.nerdctl;
@@ -39,7 +40,7 @@ export class NerdctlClient implements ContainerEngineClient {
    * Run nerdctl with the given arguments, returning the standard output.
    */
   protected async nerdctl(...args: string[]): Promise<string>;
-  protected async nerdctl(options: { env?: Record<string, string>}, ...args: string[]): Promise<string>;
+  protected async nerdctl(options: { env?: Record<string, string> }, ...args: string[]): Promise<string>;
   protected async nerdctl(optionOrArg: any, ...args: string[]): Promise<string> {
     const finalArgs = args.concat();
     const options: { env?: Record<string, string> } = {};
@@ -144,12 +145,23 @@ export class NerdctlClient implements ContainerEngineClient {
     ];
 
     for (const cmd of commandsToCheck) {
+      let failureCount = 0;
+
       while (true) {
         try {
           await this.vm.execCommand({ expectFailure: true, root: true }, ...cmd);
           break;
         } catch (ex) {
-          // Ignore the error, try again
+          failureCount++;
+          // Nothing bounds this loop, so an engine that never becomes ready
+          // stalls the whole start with no log line naming the command that
+          // fails.  A production SpawnError prints neither stdout nor stderr,
+          // so read stderr off the exception.
+          if (failureCount % 10 === 0) {
+            const stderr = ex && typeof ex === 'object' && 'stderr' in ex && typeof ex.stderr === 'string' ? ex.stderr.trim() : '';
+
+            console.error(`Failed to run ${ cmd.join(' ') } ${ failureCount } times (will retry): ${ ex }${ stderr ? `\n${ stderr }` : '' }`);
+          }
           await util.promisify(setTimeout)(1_000);
         }
       }
@@ -206,7 +218,7 @@ export class NerdctlClient implements ContainerEngineClient {
         '--dereference', '--one-file-system', '--sparse', '--files-from', fileList,
       ].filter(defined);
 
-      await this.vm.execCommand({ root: true }, '/usr/bin/tar', ...args);
+      await this.vm.execCommand({ root: true }, '/bin/tar', ...args);
 
       // Copy the archive to the host
       const hostWorkDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'rd-nerdctl-copy-'));
@@ -325,9 +337,9 @@ export class NerdctlClient implements ContainerEngineClient {
 
       const tarStream = fs.createWriteStream(path.join(hostDir, archiveName));
       const archive = tar.pack();
-      const archiveFinished = util.promisify(stream.finished)(archive);
+      const archiveFinished = tarStreamFinished(archive);
       const newEntry = util.promisify(archive.entry.bind(archive));
-      const baseHeader: Partial<tar.Headers> = {
+      const baseHeader: Partial<tar.Header> = {
         mode:  0o755,
         uid:   0,
         uname: 'root',
@@ -374,7 +386,7 @@ export class NerdctlClient implements ContainerEngineClient {
       await archiveFinished;
 
       await this.vm.copyFileIn(path.join(hostDir, archiveName), path.posix.join(workDir, archiveName));
-      await this.vm.execCommand('/usr/bin/tar', 'xf', path.posix.join(workDir, archiveName), '-C', resultDir);
+      await this.vm.execCommand('/bin/tar', 'xf', path.posix.join(workDir, archiveName), '-C', resultDir);
       succeeded = true;
 
       return resultDir;
@@ -391,8 +403,8 @@ export class NerdctlClient implements ContainerEngineClient {
    */
   protected async composePrep(options: ContainerComposeOptions): Promise<{
     projectDir: string,
-    envFile: string,
-    cleanups: (() => Promise<void>)[],
+    envFile:    string,
+    cleanups:   (() => Promise<void>)[],
   }> {
     const cleanups: (() => Promise<void>)[] = [];
     const envData = Object.entries(options.env ?? {})
@@ -537,8 +549,9 @@ export class NerdctlClient implements ContainerEngineClient {
   runClient(args: string[], stdio: Log, options?: ContainerRunClientOptions): Promise<Record<string, never>>;
   runClient(args: string[], stdio: 'pipe', options?: ContainerRunClientOptions): Promise<{ stdout: string; stderr: string; }>;
   runClient(args: string[], stdio: 'stream', options?: ContainerRunClientOptions): ReadableProcess;
-  runClient(args: string[], stdio?: 'ignore' | 'pipe' | 'stream' | Log, options?: ContainerRunClientOptions) {
-    const opts = options ?? {};
+  runClient(args: string[], stdio: 'interactive', options?: ContainerRunClientOptions): WritableReadableProcess;
+  runClient(args: string[], stdio?: 'ignore' | 'pipe' | 'stream' | 'interactive' | Log, options?: ContainerRunClientOptions) {
+    const opts = _.merge({ env: process.env }, options);
 
     if (opts.namespace) {
       args = ['--namespace', opts.namespace].concat(args);
@@ -550,6 +563,8 @@ export class NerdctlClient implements ContainerEngineClient {
       return spawnFile(this.executable, args, { ...opts, stdio: 'ignore' });
     case 'stream':
       return spawn(this.executable, args, { ...opts, stdio: ['ignore', 'pipe', 'pipe'] });
+    case 'interactive':
+      return spawn(this.executable, args, { ...opts, stdio: 'pipe' });
     case 'pipe':
       return spawnFile(this.executable, args, { ...opts, stdio: 'pipe' });
     }

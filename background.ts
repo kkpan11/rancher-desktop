@@ -4,7 +4,7 @@ import os from 'os';
 import path from 'path';
 import util from 'util';
 
-import Electron, { MessageBoxOptions } from 'electron';
+import Electron, { MessageBoxOptions, nativeTheme } from 'electron';
 import _ from 'lodash';
 import semver from 'semver';
 
@@ -25,11 +25,13 @@ import { PathManagementStrategy, PathManager } from '@pkg/integrations/pathManag
 import { getPathManagerFor } from '@pkg/integrations/pathManagerImpl';
 import { BackendState, CommandWorkerInterface, HttpCommandServer } from '@pkg/main/commandServer/httpCommandServer';
 import SettingsValidator from '@pkg/main/commandServer/settingsValidator';
+import { ContainerExecHandler } from '@pkg/main/containerExec';
+import { ContainerStatsHandler } from '@pkg/main/containerStats';
 import { HttpCredentialHelperServer } from '@pkg/main/credentialServer/httpCredentialHelperServer';
-import { DashboardServer } from '@pkg/main/dashboardServer';
 import { DeploymentProfileError, readDeploymentProfiles } from '@pkg/main/deploymentProfiles';
 import { DiagnosticsManager, DiagnosticsResultCollection } from '@pkg/main/diagnostics/diagnostics';
 import { ExtensionErrorCode, isExtensionError } from '@pkg/main/extensions';
+import { initMainI18n, onLocaleChange, t } from '@pkg/main/i18n';
 import { ImageEventHandler } from '@pkg/main/imageEvents';
 import { getIpcMainProxy } from '@pkg/main/ipcMain';
 import mainEvents from '@pkg/main/mainEvents';
@@ -41,21 +43,27 @@ import { Tray } from '@pkg/main/tray';
 import setupUpdate from '@pkg/main/update';
 import { spawnFile } from '@pkg/utils/childProcess';
 import getCommandLineArgs from '@pkg/utils/commandLine';
-import DockerDirManager from '@pkg/utils/dockerDirManager';
+import dockerDirManager from '@pkg/utils/dockerDirManager';
 import { isDevEnv } from '@pkg/utils/environment';
 import Logging, { clearLoggingDirectory, setLogLevel } from '@pkg/utils/logging';
+import { getAvailablePorts } from '@pkg/utils/networks';
 import { fetchMacOsVersion, getMacOsVersion } from '@pkg/utils/osVersion';
 import paths from '@pkg/utils/paths';
 import { protocolsRegistered, setupProtocolHandlers } from '@pkg/utils/protocols';
 import { executable } from '@pkg/utils/resources';
 import { jsonStringifyWithWhiteSpace } from '@pkg/utils/stringify';
 import { RecursivePartial, RecursiveReadonly } from '@pkg/utils/typeUtils';
-import { getVersion } from '@pkg/utils/version';
 import getWSLVersion from '@pkg/utils/wslVersion';
 import * as window from '@pkg/window';
 import { closeDashboard, openDashboard } from '@pkg/window/dashboard';
 import { openPreferences, preferencesSetDirtyFlag } from '@pkg/window/preferences';
 
+// https://www.electronjs.org/docs/latest/breaking-changes#changed-gtk-4-is-default-when-running-gnome
+if (process.platform === 'linux') {
+  Electron.app.commandLine.appendSwitch('gtk-version', '3');
+}
+
+Electron.app.setPath('userData', path.join(paths.appHome, 'electron'));
 Electron.app.setPath('cache', paths.cache);
 Electron.app.setAppLogsPath(paths.logs);
 
@@ -76,14 +84,15 @@ clearLoggingDirectory();
 const SNAPSHOT_OPERATION = 'Snapshot operation in progress';
 
 const ipcMainProxy = getIpcMainProxy(console);
-const dockerDirManager = new DockerDirManager(path.join(os.homedir(), '.docker'));
 const k8smanager = newK8sManager();
 const diagnostics: DiagnosticsManager = new DiagnosticsManager();
 
 let cfg: settings.Settings;
 let firstRunDialogComplete = false;
 let gone = false; // when true indicates app is shutting down
-let imageEventHandler: ImageEventHandler|null = null;
+let imageEventHandler: ImageEventHandler | null = null;
+let containerExecHandler: ContainerExecHandler | null = null;
+let containerStatsHandler: ContainerStatsHandler | null = null;
 let currentContainerEngine = settings.ContainerEngine.NONE;
 let currentImageProcessor: ImageProcessor | null = null;
 let enabledK8s: boolean;
@@ -106,8 +115,18 @@ let deploymentProfiles: settings.DeploymentProfileType = { defaults: {}, locked:
  */
 let pendingRestartContext: CommandWorkerInterface.CommandContext | undefined;
 
-let httpCommandServer: HttpCommandServer|null = null;
+let httpCommandServer: HttpCommandServer | null = null;
 const httpCredentialHelperServer = new HttpCredentialHelperServer();
+
+if (process.platform === 'linux') {
+  // On Linux, put Electron into a new process group so that we can more
+  // reliably kill processes we spawn from extensions.
+  import('posix-node').then(({ default: { setpgid } }) => {
+    setpgid?.(0, 0);
+  }).catch(ex => {
+    console.error(`Ignoring error setting process group: ${ ex }`);
+  });
+}
 
 // Scheme must be registered before the app is ready
 Electron.protocol.registerSchemesAsPrivileged([
@@ -134,6 +153,7 @@ Electron.app.on('second-instance', async() => {
 // when settings change
 mainEvents.on('settings-update', async(newSettings) => {
   console.log(`mainEvents settings-update: ${ JSON.stringify(newSettings) }`);
+  nativeTheme.themeSource = newSettings.application.theme;
   const runInDebugMode = settingsImpl.runInDebugMode(newSettings.application.debug);
 
   if (runInDebugMode) {
@@ -142,6 +162,12 @@ mainEvents.on('settings-update', async(newSettings) => {
     setLogLevel('info');
   }
   k8smanager.debug = runInDebugMode;
+
+  if (gone) {
+    console.debug('Suppressing settings-update because app is quitting');
+
+    return;
+  }
 
   await setPathManager(newSettings.application.pathManagementStrategy);
   await pathManager.enforce();
@@ -166,8 +192,12 @@ mainEvents.handle('settings-fetch', () => {
 Electron.protocol.registerSchemesAsPrivileged([{ scheme: 'app' }, {
   scheme:     'x-rd-extension',
   privileges: {
-    standard:        true,
-    supportFetchAPI: true,
+    standard:            true,
+    secure:              true,
+    bypassCSP:           true,
+    allowServiceWorkers: true,
+    supportFetchAPI:     true,
+    corsEnabled:         true,
   },
 }]);
 
@@ -191,15 +221,13 @@ Electron.app.whenReady().then(async() => {
       await fetchMacOsVersion(console);
     }
 
-    // Needs to happen before any file is written, otherwise that file
+    // Needs to happen before any file is written; otherwise, that file
     // could be owned by root, which will lead to future problems.
     if (['linux', 'darwin'].includes(os.platform())) {
       await checkForRootPrivs();
     }
     // Check for required OS versions and features
     await checkPrerequisites();
-
-    DashboardServer.getInstance().init();
 
     await setupNetworking();
 
@@ -216,6 +244,7 @@ Electron.app.whenReady().then(async() => {
     }
     try {
       cfg = settingsImpl.load(deploymentProfiles);
+      nativeTheme.themeSource = cfg.application.theme;
       settingsImpl.updateLockedFields(deploymentProfiles.locked);
     } catch (err: any) {
       const titlePart = err.name || 'Failed to load settings';
@@ -256,6 +285,7 @@ Electron.app.whenReady().then(async() => {
     await httpCommandServer.init();
     await httpCredentialHelperServer.init();
 
+    await initMainI18n();
     await initUI();
     await checkForBackendLock();
     await setPathManager(cfg.application.pathManagementStrategy);
@@ -341,7 +371,7 @@ function updateBackendLockState(backendIsLocked: string, action?: string): void 
  * status.
  */
 async function doesBackendLockExist(): Promise<boolean> {
-  let backendIsLocked = '';
+  let backendIsLocked: string;
 
   const lockFileContents = await readBackendLockFile();
 
@@ -394,14 +424,17 @@ async function initUI() {
 
   buildApplicationMenu();
 
-  Electron.app.setAboutPanelOptions({
+  const updateAboutPanel = () => Electron.app.setAboutPanelOptions({
     // TODO: Update this to 2021-... as dev progresses
     // also needs to be updated in electron-builder.yml
-    copyright:          'Copyright © 2021-2023 SUSE LLC',
+    copyright:          'Copyright © 2021-2026 SUSE LLC',
     applicationName:    `${ Electron.app.name } by SUSE`,
-    applicationVersion: `Version ${ await getVersion() }`,
+    applicationVersion: `${ t('product.version') } ${ process.env.RD_VERSION }`,
     iconPath:           path.join(paths.resources, 'icons', 'logo-square-512.png'),
   });
+
+  updateAboutPanel();
+  onLocaleChange(updateAboutPanel);
 
   if (!cfg.application.hideNotificationIcon) {
     Tray.getInstance(cfg).show();
@@ -456,21 +489,26 @@ async function checkPrerequisites() {
     break;
   }
   case 'linux': {
-    // Required: Nested virtualization enabled
-    const nestedFiles = [
-      '/sys/module/kvm_amd/parameters/nested',
-      '/sys/module/kvm_intel/parameters/nested'];
+    // TODO: This whole testing for nested virtualization is wrong. All we should test for is if
+    // hardware acceleration is available, e.g. checking /proc/cpuinfo for "vmx" (Intel) or "svm" (AMD).
+    if (process.arch === 'x64') {
+      // Required: Nested virtualization enabled
+      const nestedFiles = [
+        '/sys/module/kvm_amd/parameters/nested',
+        '/sys/module/kvm_intel/parameters/nested'];
 
-    messageId = 'linux-nested';
-    for (const nestedFile of nestedFiles) {
-      try {
-        const data = await fs.promises.readFile(nestedFile, { encoding: 'utf8' });
+      messageId = 'linux-nested';
+      for (const nestedFile of nestedFiles) {
+        try {
+          const data = await fs.promises.readFile(nestedFile, { encoding: 'utf8' });
 
-        if (data && (data.toLowerCase()[0] === 'y' || data[0] === '1')) {
-          messageId = 'ok';
-          break;
+          if (data && (data.toLowerCase().startsWith('y') || data.startsWith('1'))) {
+            messageId = 'ok';
+            break;
+          }
+        } catch {
         }
-      } catch {}
+      }
     }
     break;
   }
@@ -543,6 +581,7 @@ async function startBackend() {
  */
 async function startK8sManager() {
   const changedContainerEngine = currentContainerEngine !== cfg.containerEngine.name;
+  const runningStates = [K8s.State.STARTED, K8s.State.DISABLED];
 
   currentContainerEngine = cfg.containerEngine.name;
   enabledK8s = cfg.kubernetes.enabled;
@@ -552,10 +591,43 @@ async function startK8sManager() {
   }
   await k8smanager.start(cfg);
 
+  // start() resolves without a client when the start was aborted, and stop()
+  // clears the client, which can happen while the import below loads.  The
+  // getter then throws and masks the real failure.
+  if (!runningStates.includes(k8smanager.state)) {
+    console.log(`Backend is ${ k8smanager.state } after start; skipping post-start setup.`);
+
+    return;
+  }
+  const containerEngineClient = k8smanager.containerEngineClient;
+
   const { initializeExtensionManager } = await import('@pkg/main/extensions/manager');
 
-  await initializeExtensionManager(k8smanager.containerEngineClient, cfg);
+  try {
+    await initializeExtensionManager(containerEngineClient, cfg);
+  } catch (ex: any) {
+    // Stopping the backend interrupts this setup, and the next start repeats
+    // it.  A failure on a running backend is a real error.
+    if (runningStates.includes(k8smanager.state)) {
+      throw ex;
+    }
+    console.log(`Backend is ${ k8smanager.state } after extension setup failed; skipping post-start setup.`, ex);
+
+    return;
+  }
   window.send('extensions/changed');
+
+  if (!containerExecHandler) {
+    containerExecHandler = new ContainerExecHandler(containerEngineClient);
+  } else {
+    containerExecHandler.updateClient(containerEngineClient);
+  }
+
+  if (!containerStatsHandler) {
+    containerStatsHandler = new ContainerStatsHandler(containerEngineClient);
+  } else {
+    containerStatsHandler.updateClient(containerEngineClient);
+  }
 }
 
 /**
@@ -569,7 +641,7 @@ async function startK8sManager() {
  */
 
 function setupImageProcessor() {
-  const imageProcessor = getImageProcessor(cfg.containerEngine.name, k8smanager.executor);
+  const imageProcessor = getImageProcessor(cfg.containerEngine.name, k8smanager);
 
   currentImageProcessor?.deactivate();
   if (!imageEventHandler) {
@@ -602,14 +674,9 @@ Electron.app.on('before-quit', async(event) => {
   httpCredentialHelperServer.closeServer();
 
   try {
+    await mainEvents.tryInvoke('extensions/shutdown');
     await k8smanager?.stop();
-    try {
-      await mainEvents.invoke('shutdown-integrations');
-    } catch (ex) {
-      if (!`${ ex }`.includes('No handlers registered')) {
-        throw ex;
-      }
-    }
+    await mainEvents.tryInvoke('shutdown-integrations');
 
     console.log(`2: Child exited cleanly.`);
   } catch (ex: any) {
@@ -760,6 +827,59 @@ ipcMainProxy.handle('api-get-credentials', () => mainEvents.invoke('api-get-cred
 
 ipcMainProxy.handle('get-locked-fields', () => settingsImpl.getLockedSettings());
 
+const blogFeedURL = 'https://docs.rancherdesktop.io/blog/rss.xml';
+// The feed runs well under a megabyte, so 4 MiB leaves headroom.
+const blogFeedSizeLimit = 4 * 1024 * 1024;
+// The General page refetches on every visit, so cache the feed. Expire it
+// hourly so an instance left running for days still sees new posts.
+const blogFeedCacheLifetime = 60 * 60 * 1000;
+let blogFeedCache: { expires: number, feed: string } | undefined;
+
+ipcMainProxy.handle('get-blog-feed', async() => {
+  if (blogFeedCache && Date.now() < blogFeedCache.expires) {
+    return blogFeedCache.feed;
+  }
+
+  // Fetch in the main process to avoid the renderer's CORS restrictions;
+  // the renderer parses the returned XML.
+  // Time out a stalled request so the renderer's invoke does not hang forever.
+  const response = await Electron.net.fetch(blogFeedURL, { signal: AbortSignal.timeout(10_000) });
+
+  if (!response.ok || !response.body) {
+    throw new Error(`Failed to fetch blog feed: ${ response.status } ${ response.statusText }`);
+  }
+
+  // The timeout bounds how long the response may stream, but not how much
+  // arrives in that time. Fail on an oversized feed, because a truncated
+  // document would not parse.
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+
+    if (done) {
+      break;
+    }
+
+    size += value.byteLength;
+    if (size > blogFeedSizeLimit) {
+      await reader.cancel();
+      throw new Error(`Blog feed exceeds ${ blogFeedSizeLimit } bytes`);
+    }
+
+    chunks.push(value);
+  }
+
+  const feed = Buffer.concat(chunks).toString('utf8');
+
+  // Only successes land here, so a failed fetch retries on the next visit.
+  blogFeedCache = { expires: Date.now() + blogFeedCacheLifetime, feed };
+
+  return feed;
+});
+
 function backendIsBusy() {
   return [K8s.State.STARTING, K8s.State.STOPPING].includes(k8smanager.state);
 }
@@ -821,7 +941,15 @@ ipcMainProxy.on('k8s-restart', async() => {
 });
 
 ipcMainProxy.on('k8s-versions', async() => {
-  window.send('k8s-versions', await k8smanager.kubeBackend.availableVersions, await k8smanager.kubeBackend.cachedVersionsOnly());
+  try {
+    const versions = await k8smanager.kubeBackend.availableVersions;
+    const cachedOnly = await k8smanager.kubeBackend.cachedVersionsOnly();
+
+    window.send('k8s-versions', versions.map(v => v.versionEntry), cachedOnly);
+  } catch (ex) {
+    console.error(`Error handling k8s-versions: ${ ex }`);
+    window.send('k8s-versions', [], true);
+  }
 });
 
 ipcMainProxy.on('k8s-progress', () => {
@@ -881,7 +1009,7 @@ async function doFactoryReset(keepSystemImages: boolean) {
   // Don't wait for this process to return -- the whole point is for us to not be running.
   const tmpdir = os.tmpdir();
   const outfile = await fs.promises.open(path.join(tmpdir, 'rdctl-stdout.txt'), 'w');
-  const args = ['factory-reset', `--remove-kubernetes-cache=${ (!keepSystemImages) ? 'true' : 'false' }`];
+  const args = ['reset', '--factory', `--cache=${ (!keepSystemImages) ? 'true' : 'false' }`];
 
   if (cfg.application.debug) {
     args.push('--verbose=true');
@@ -892,7 +1020,7 @@ async function doFactoryReset(keepSystemImages: boolean) {
     });
 
   rdctl.unref();
-  console.debug(`If factory-reset fails, the rdctl factory-reset output files are in ${ tmpdir }`);
+  console.debug(`If reset fails, the rdctl reset output files are in ${ tmpdir }`);
 }
 
 ipcMainProxy.on('factory-reset', (event, keepSystemImages) => {
@@ -924,10 +1052,6 @@ ipcMainProxy.on('diagnostics/run', () => {
   diagnostics.runChecks();
 });
 
-ipcMainProxy.on('get-app-version', async(event) => {
-  event.reply('get-app-version', await getVersion());
-});
-
 ipcMainProxy.on('snapshot', (event, args) => {
   event.reply('snapshot', args);
 });
@@ -952,8 +1076,8 @@ ipcMainProxy.handle('host/isArm', () => {
   return process.arch === 'arm64';
 });
 
-ipcMainProxy.on('help/preferences/open-url', async() => {
-  Help.preferences.openUrl(await getVersion());
+ipcMainProxy.on('help/preferences/open-url', () => {
+  Help.preferences.openUrl();
 });
 
 ipcMainProxy.handle('show-message-box', (_event, options: Electron.MessageBoxOptions): Promise<Electron.MessageBoxReturnValue> => {
@@ -1010,7 +1134,7 @@ ipcMainProxy.handle('show-snapshots-confirm-dialog', async(
   const dialog = window.openDialog(
     'SnapshotsDialog',
     {
-      title:   'Snapshots',
+      title:   t('snapshots.title'),
       modal:   true,
       parent:  mainWindow || undefined,
       frame:   true,
@@ -1146,8 +1270,8 @@ function showErrorDialog(title: string, message: string, fatal?: boolean) {
 }
 
 async function handleFailure(payload: any) {
-  let titlePart = 'Error Starting Kubernetes';
-  let message = 'There was an unknown error starting Kubernetes';
+  let titlePart = 'Error Starting Rancher Desktop';
+  let message = 'There was an unknown error starting Rancher Desktop';
   let secondaryMessage = '';
 
   if (payload instanceof K8s.KubernetesError) {
@@ -1167,12 +1291,12 @@ async function handleFailure(payload: any) {
   } else if (payload instanceof Error) {
     secondaryMessage = payload.toString();
   } else if (typeof payload === 'number') {
-    message = `Kubernetes was unable to start with the following exit code: ${ payload }`;
+    message = `Rancher Desktop was unable to start with the following exit code: ${ payload }`;
   } else if ('errorCode' in payload) {
     message = payload.message || message;
     titlePart = payload.context || titlePart;
   }
-  console.log(`Kubernetes was unable to start:`, payload);
+  console.log(`Rancher Desktop was unable to start:`, payload);
   try {
     // getFailureDetails is going to read from existing log files.
     // Wait 1 second before reading them to allow recent writes to appear in them.
@@ -1221,29 +1345,40 @@ async function getExtensionManager() {
 
 function newK8sManager() {
   const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
-  const mgr = K8sFactory(arch, dockerDirManager);
+  const mgr = K8sFactory(arch);
 
-  mgr.on('state-changed', (state: K8s.State) => {
-    mainEvents.emit('k8s-check-state', mgr);
-    window.send('k8s-check-state', state);
-    if ([K8s.State.STARTED, K8s.State.DISABLED].includes(state)) {
-      if (!cfg.kubernetes.version) {
-        writeSettings({ kubernetes: { version: mgr.kubeBackend.version } });
+  mgr.on('state-changed', async(state: K8s.State) => {
+    try {
+      if ([K8s.State.STARTED, K8s.State.DISABLED].includes(state)) {
+        if (!cfg.kubernetes.version) {
+          writeSettings({ kubernetes: { version: mgr.kubeBackend.version } });
+        }
+        currentImageProcessor?.relayNamespaces();
+
+        if (enabledK8s) {
+          try {
+            await Steve.getInstance().start();
+          } catch (ex) {
+            console.error('Failed to start Steve:', ex);
+          }
+        }
       }
-      currentImageProcessor?.relayNamespaces();
 
-      if (enabledK8s) {
-        Steve.getInstance().start();
+      // Notify the tray and renderer after Steve is ready, so the dashboard
+      // button is only enabled when Steve can accept connections.
+      mainEvents.emit('k8s-check-state', mgr);
+      window.send('k8s-check-state', state);
+
+      if (state === K8s.State.STOPPING) {
+        Steve.getInstance().stop();
       }
-    }
-
-    if (state === K8s.State.STOPPING) {
-      Steve.getInstance().stop();
-    }
-    if (pendingRestartContext !== undefined && !backendIsBusy()) {
-      // If we restart immediately the QEMU process in the VM doesn't always respond to a shutdown messages
-      setTimeout(doFullRestart, 2_000, pendingRestartContext);
-      pendingRestartContext = undefined;
+      if (pendingRestartContext !== undefined && !backendIsBusy()) {
+        // If we restart immediately the QEMU process in the VM doesn't always respond to a shutdown messages
+        setTimeout(doFullRestart, 2_000, pendingRestartContext);
+        pendingRestartContext = undefined;
+      }
+    } catch (ex) {
+      console.error(ex);
     }
   });
 
@@ -1270,7 +1405,10 @@ function newK8sManager() {
   });
 
   mgr.kubeBackend.on('versions-updated', async() => {
-    window.send('k8s-versions', await mgr.kubeBackend.availableVersions, await mgr.kubeBackend.cachedVersionsOnly());
+    const versions = await mgr.kubeBackend.availableVersions;
+    const cachedOnly = await mgr.kubeBackend.cachedVersionsOnly();
+
+    window.send('k8s-versions', versions.map(v => v.versionEntry), cachedOnly);
   });
 
   return mgr;
@@ -1290,7 +1428,7 @@ function validateEarlySettings(cfg: settings.Settings, newSettings: RecursivePar
 }
 
 /**
- * Implement the methods the HttpCommandServer needs to service its requests.
+ * Implement the methods that HttpCommandServer needs to service its requests.
  * These methods do two things:
  * 1. Verify the semantics of the parameters (the server just checks syntax).
  * 2. Provide a thin wrapper over existing functionality in this module.
@@ -1342,15 +1480,15 @@ class BackgroundCommandWorker implements CommandWorkerInterface {
     return jsonStringifyWithWhiteSpace(settingsImpl.getLockedSettings());
   }
 
-  getDiagnosticCategories(): string[]|undefined {
+  getDiagnosticCategories(): string[] | undefined {
     return diagnostics.getCategoryNames();
   }
 
-  getDiagnosticIdsByCategory(category: string): string[]|undefined {
+  getDiagnosticIdsByCategory(category: string): string[] | undefined {
     return diagnostics.getIdsForCategory(category);
   }
 
-  getDiagnosticChecks(category: string|null, checkID: string|null): Promise<DiagnosticsResultCollection> {
+  getDiagnosticChecks(category: string | null, checkID: string | null): Promise<DiagnosticsResultCollection> {
     return diagnostics.getChecks(category, checkID);
   }
 
@@ -1360,6 +1498,10 @@ class BackgroundCommandWorker implements CommandWorkerInterface {
 
   factoryReset(keepSystemImages: boolean) {
     doFactoryReset(keepSystemImages);
+  }
+
+  async k8sReset(context: CommandWorkerInterface.CommandContext, mode: 'fast' | 'wipe') {
+    return await doK8sReset(mode, context);
   }
 
   async forwardPort(namespace: string, service: string, k8sPort: string | number, hostPort: number) {
@@ -1453,7 +1595,7 @@ class BackgroundCommandWorker implements CommandWorkerInterface {
     const [, errors] = await this.validateSettings(cfg, newSettings);
 
     if (errors.length > 0) {
-      return ['', `Errors in proposed settings:\n${ errors.join('\n') }`];
+      return ['', `${ t('validation.errorsInProposedSettings') }\n${ errors.join('\n') }`];
     }
     const result = await k8smanager?.requiresRestartReasons(newSettings ?? {}) ?? {};
 
@@ -1507,7 +1649,7 @@ class BackgroundCommandWorker implements CommandWorkerInterface {
     return Object.fromEntries(entries);
   }
 
-  async installExtension(image: string, state: 'install' | 'uninstall'): Promise<{status: number, data?: any}> {
+  async installExtension(image: string, state: 'install' | 'uninstall'): Promise<{ status: number, data?: any }> {
     const em = await getExtensionManager();
 
     if (!em) {

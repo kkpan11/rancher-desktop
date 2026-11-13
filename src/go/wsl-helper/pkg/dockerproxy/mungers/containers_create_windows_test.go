@@ -25,11 +25,12 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/rancher-sandbox/rancher-desktop/src/go/wsl-helper/pkg/dockerproxy"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/wsl-helper/pkg/dockerproxy/models"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/wsl-helper/pkg/dockerproxy/platform"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestContainersCreate(t *testing.T) {
@@ -58,7 +59,7 @@ func TestContainersCreate(t *testing.T) {
 
 		err = readRequestBodyJSON(req, &body)
 		assert.NoError(t, err)
-		slashPath, err := platform.TranslatePathFromClient(bindPath)
+		slashPath, err := platform.TranslatePathFromClient(t.Context(), bindPath)
 		assert.NoError(t, err)
 		expectedBind := fmt.Sprintf("%s:/host", slashPath)
 		assert.Equal(t, []string{expectedBind}, body.HostConfig.Binds)
@@ -71,7 +72,7 @@ func TestContainersCreate(t *testing.T) {
 			Consistency: "cached",
 			Source:      bindPath,
 			Target:      "/host",
-			Type:        "bind",
+			Type:        models.MountTypeBind,
 		}
 		body := containersCreateBody{
 			HostConfig: models.HostConfig{
@@ -94,7 +95,7 @@ func TestContainersCreate(t *testing.T) {
 		err = readRequestBodyJSON(req, &body)
 		assert.NoError(t, err)
 		expected := mount
-		slashPath, err := platform.TranslatePathFromClient(bindPath)
+		slashPath, err := platform.TranslatePathFromClient(t.Context(), bindPath)
 		expected.Source = slashPath
 		assert.NoError(t, err)
 		require.NotEmpty(t, body.HostConfig.Mounts)

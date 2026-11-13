@@ -40,43 +40,43 @@ interface commandFlagType {
    * The default value to enter as a string in the `cmd.Flags()...` statement.
    * This is a string internally, but is written as the appropriate type for `cmd.Flags.TVar(...)`.
    */
-  defaultValue: string;
+  defaultValue:    string;
   /**
    * Capitalized name of the type given in command-api.yaml.
    * This maps to go code like `cmdFlags.StringVar(...)`.
    */
-  flagType: goCmdFlagTypeName;
+  flagType:        goCmdFlagTypeName;
   /**
    * Lower-case name of a scalar golang type, like `string`.
    */
-  lcTypeName?: goTypeName;
+  lcTypeName?:     goTypeName;
   /**
    * A property name from the API spec, like `kubernetes`.
    * Can be the name of a leaf or a compound object.
    */
-  propertyName: string;
+  propertyName:    string;
   /**
    * Used to map a shortcut option (like `--container-engine` to the full name `--kubernetes.containerEngine`)
    */
-  aliasFor: string;
+  aliasFor:        string;
   /**
    * Some options can be specified with a limited set of possible values.
    * This field carries those values as a string, to be inserted into the golang command definition.
    */
-  enums: string;
+  enums:           string;
   /**
-   * Used to insert an optional `x-rd-usage` field from a preference spec
+   * Used to insert the `x-rd-usage` field from a preference spec
    * into the help text for the command in the generated go code.
    */
-  usageNote?: string;
+  usageNote?:      string;
   /**
    * Used to format the specified value for a command-line option depending on the value's golang type.
    */
-  valuePart: string;
+  valuePart:       string;
   /**
    * The option is not available for the current platform
    */
-  notAvailable: boolean;
+  notAvailable:    boolean;
 }
 
 type yamlObject = any;
@@ -84,7 +84,7 @@ type yamlObject = any;
 type goTypeName = 'string' | 'bool' | 'int' | 'array';
 type goCmdFlagTypeName = 'String' | 'Bool' | 'Int' | 'Array';
 type typeValue = goTypeName | settingsTreeType | 'hash';
-type settingsTypeObject = { type: typeValue };
+interface settingsTypeObject { type: typeValue }
 type settingsTreeType = Record<string, settingsTypeObject>;
 
 function assert(predicate: boolean, error: string) {
@@ -122,11 +122,13 @@ function lastName(s: string): string {
 class Generator {
   constructor() {
     this.commandFlags = [];
+    this.flagsWithoutUsage = [];
     this.settingsTree = { version: { type: 'int' } };
   }
 
-  commandFlags: Array<commandFlagType>;
-  settingsTree: settingsTreeType;
+  commandFlags:      commandFlagType[];
+  flagsWithoutUsage: string[];
+  settingsTree:      settingsTreeType;
 
   protected async loadInput(inputFile: string): Promise<yamlObject> {
     const contents = (await fs.promises.readFile(inputFile)).toString();
@@ -150,6 +152,7 @@ class Generator {
     for (const propertyName of Object.keys(preferences.properties)) {
       this.walkProperty(propertyName, preferences.properties[propertyName], false, this.settingsTree);
     }
+    assert(this.flagsWithoutUsage.length === 0, `Flags without x-rd-usage in ${ inputFile }: ${ this.flagsWithoutUsage.join(', ') }`);
   }
 
   protected async emitOutput(outputFile: string) {
@@ -237,7 +240,7 @@ class Generator {
     }
   }
 
-  protected getFullUsageNote(usageNote: string, rawEnums: undefined|string[]): string {
+  protected getFullUsageNote(usageNote: string, rawEnums: undefined | string[]): string {
     const usageParts = [usageNote];
 
     if (rawEnums) {
@@ -257,6 +260,12 @@ class Generator {
     settingsTree: settingsTreeType) {
     const enums = this.convertStringsToGolang(preference.enum);
     const usageNote = preference['x-rd-usage'] ?? '';
+
+    // Don't use `notAvailable` here: a flag for another platform must fail on this one too.
+    // Arrays don't get a flag.
+    if (!usageNote && !preference['x-rd-hidden'] && flagType !== 'Array') {
+      this.flagsWithoutUsage.push(`--${ kebabCase(propertyName) }`);
+    }
     const newFlag: commandFlagType = {
       capitalizedName,
       defaultValue,

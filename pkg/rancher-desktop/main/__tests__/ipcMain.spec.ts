@@ -1,5 +1,6 @@
 import events from 'events';
 
+import { jest } from '@jest/globals';
 import Electron from 'electron';
 
 import { getIpcMainProxy } from '@pkg/main/ipcMain';
@@ -12,8 +13,8 @@ describe('IpcMainProxy', () => {
   let emitter: E;
   let subject: ReturnType<typeof getIpcMainProxy>;
 
-  class E extends events.EventEmitter {
-    protected handlers: Record<string, {once: boolean, handler: Handler}> = {};
+  class E extends events.EventEmitter implements Electron.IpcMain {
+    protected handlers: Record<string, { once: boolean, handler: Handler }> = {};
 
     handle(channel: string, handler: Handler) {
       this.handleInternal(channel, handler, false);
@@ -66,24 +67,7 @@ describe('IpcMainProxy', () => {
   }
 
   beforeAll(() => {
-    const methods: (keyof ReturnType<typeof getIpcMainProxy>)[] = [
-      'on', 'once', 'removeListener', 'removeAllListeners',
-      'handle', 'handleOnce', 'removeHandler',
-    ];
-
     emitter = new E();
-
-    for (const prop of methods) {
-      (Electron.ipcMain as any)[prop] ??= () => {};
-      expect(typeof emitter[prop]).toEqual('function');
-      jest.spyOn(Electron.ipcMain, prop as keyof typeof Electron.ipcMain).mockImplementation((...args: any) => {
-        //  TODO: Issue #5544 Don't use Function as a type
-        // eslint-disable-next-line @typescript-eslint/ban-types
-        const meth = emitter[prop as keyof typeof emitter] as Function;
-
-        return meth.apply(emitter, args);
-      });
-    }
   });
 
   afterAll(() => {
@@ -95,7 +79,7 @@ describe('IpcMainProxy', () => {
     for (const meth of ['log', 'error', 'info', 'warn', 'debug', 'debugE'] as const) {
       jest.spyOn(log, meth);
     }
-    subject = getIpcMainProxy(log);
+    subject = getIpcMainProxy(log, emitter);
   });
 
   afterEach(() => {
@@ -104,7 +88,7 @@ describe('IpcMainProxy', () => {
   });
 
   it('should allow adding event listeners', () => {
-    const topic = 'get-app-version' as const;
+    const topic = 'update-state' as const;
     const cb = jest.fn();
 
     subject.on(topic, cb);
@@ -114,7 +98,7 @@ describe('IpcMainProxy', () => {
   });
 
   it('should allow removing event listeners', () => {
-    const topic = 'get-app-version' as const;
+    const topic = 'update-state' as const;
     const cb = jest.fn();
 
     subject.on(topic, cb);
@@ -125,7 +109,7 @@ describe('IpcMainProxy', () => {
   });
 
   it('should allow single-use listeners', () => {
-    const topic = 'get-app-version' as const;
+    const topic = 'update-state' as const;
     const cb = jest.fn();
 
     subject.once(topic, cb);
@@ -136,7 +120,7 @@ describe('IpcMainProxy', () => {
   });
 
   it('should allow removing all listeners of a topic', () => {
-    const topic = 'get-app-version' as const;
+    const topic = 'update-state' as const;
     const cb = jest.fn();
 
     subject.on(topic, cb);
@@ -154,7 +138,9 @@ describe('IpcMainProxy', () => {
 
   it('should allow adding event handlers', async() => {
     const topic = 'api-get-credentials' as const;
-    const cb = jest.fn().mockImplementation(() => Promise.resolve(1));
+
+    type cbType = Parameters<typeof subject.handle<typeof topic>>[1];
+    const cb = jest.fn().mockImplementation(() => Promise.resolve(1)) as cbType;
 
     subject.handle(topic, cb);
     await expect(emitter.invoke(topic)).resolves.not.toThrow();
@@ -164,7 +150,9 @@ describe('IpcMainProxy', () => {
 
   it('should allow removing event handlers', async() => {
     const topic = 'api-get-credentials' as const;
-    const cb = jest.fn().mockImplementation(() => Promise.resolve(1));
+
+    type cbType = Parameters<typeof subject.handle<typeof topic>>[1];
+    const cb = jest.fn().mockImplementation(() => Promise.resolve(1)) as cbType;
 
     subject.handle(topic, cb);
     subject.removeHandler(topic);
@@ -175,7 +163,9 @@ describe('IpcMainProxy', () => {
 
   it('should allow single-use event handlers', async() => {
     const topic = 'api-get-credentials' as const;
-    const cb = jest.fn().mockImplementation(() => Promise.resolve(1));
+
+    type cbType = Parameters<typeof subject.handle<typeof topic>>[1];
+    const cb = jest.fn().mockImplementation(() => Promise.resolve(1)) as cbType;
 
     subject.handleOnce(topic, cb);
     await expect(emitter.invoke(topic)).resolves.not.toThrow();

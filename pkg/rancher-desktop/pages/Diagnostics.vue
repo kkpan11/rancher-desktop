@@ -1,25 +1,24 @@
 <script lang="ts">
 
-import Vue from 'vue';
-import { mapGetters } from 'vuex';
+import { defineComponent } from 'vue';
 
 import DiagnosticsBody from '@pkg/components/DiagnosticsBody.vue';
+import { mapTypedState } from '@pkg/entry/store';
 
-export default Vue.extend({
+export default defineComponent({
   name:       'diagnostics',
   components: { DiagnosticsBody },
 
-  async fetch() {
-    const credentials = await this.$store.dispatch('credentials/fetchCredentials');
-
-    await this.$store.dispatch('preferences/fetchPreferences', credentials);
-    await this.$store.dispatch('diagnostics/fetchDiagnostics', credentials);
+  computed: mapTypedState('diagnostics', ['diagnostics', 'timeLastRun']),
+  async beforeMount() {
+    await this.$store.dispatch('credentials/fetchCredentials');
+    await this.$store.dispatch('preferences/fetchPreferences');
+    await this.$store.dispatch('diagnostics/fetchDiagnostics');
   },
-  computed: mapGetters('diagnostics', ['diagnostics', 'timeLastRun']),
   mounted() {
     this.$store.dispatch(
       'page/setHeader',
-      { title: 'Diagnostics' },
+      { titleKey: 'diagnostics.title' },
     );
   },
 });
@@ -29,5 +28,5 @@ export default Vue.extend({
   <diagnostics-body
     :rows="diagnostics"
     :time-last-run="timeLastRun"
-  ></diagnostics-body>
+  />
 </template>

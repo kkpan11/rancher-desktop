@@ -1,8 +1,8 @@
 <script lang="ts">
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 
-import { ipcRenderer } from '@pkg/utils/ipcRenderer';
-export default Vue.extend({
+export default defineComponent({
+  name:  'version',
   props: {
     icon: {
       type:    String,
@@ -14,29 +14,24 @@ export default Vue.extend({
     },
   },
   data() {
-    return { version: this.t('product.versionChecking') };
+    return { version: process.env.RD_VERSION ?? '?' };
   },
   computed: {
-    getTooltip(): { content: string, placement: string, classes: string } {
+    getTooltip() {
       return {
-        content:   `<b>${ this.t('product.version') }</b>: ${ this.version }`,
-        placement: 'top',
-        classes:   'tooltip-footer',
+        content:     `<b>${ this.t('product.version') }</b>: ${ this.version }`,
+        html:        true,
+        placement:   'top',
+        popperClass: 'tooltip-footer',
       };
     },
-  },
-  mounted() {
-    ipcRenderer.on('get-app-version', (event, version) => {
-      this.version = version;
-    });
-    ipcRenderer.send('get-app-version');
   },
 });
 </script>
 
 <template>
   <span
-    v-tooltip="isStatusBarItem ? getTooltip : {}"
+    v-clean-tooltip="isStatusBarItem ? getTooltip : {}"
     class="versionInfo"
   >
     <i

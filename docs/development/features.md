@@ -118,7 +118,9 @@ Note:
 
 :heavy_check_mark: Cluster exploration - Rancher Dashboard (Preview)
 
-:sun_with_face: Container Exploration
+:heavy_check_mark: Container Exploration
+
+:heavy_check_mark: Container Stats (CPU, memory, network, I/O, processes)
 
 :sun_with_face: Configuration settings
 

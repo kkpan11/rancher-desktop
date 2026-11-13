@@ -2,25 +2,31 @@
   <div
     class="wrapper"
     :class="{
-      'blur': blur
+      blur,
     }"
   >
     <rd-nav
       class="nav"
       :items="routes"
-      :extensions="extensions"
+      :extensions="installedExtensions"
       @open-dashboard="openDashboard"
       @open-preferences="openPreferences"
     />
     <the-title ref="title" />
-    <main ref="body" class="body">
-      <Nuxt />
+    <main
+      ref="body"
+      class="body"
+    >
+      <RouterView />
     </main>
     <!-- The extension area is used for sizing the extension view. -->
-    <div id="extension-spacer" class="extension" />
-    <status-bar class="status-bar"></status-bar>
+    <div
+      id="extension-spacer"
+      class="extension"
+    />
+    <status-bar class="status-bar" />
     <!-- The ActionMenu is used by SortableTable for per-row actions. -->
-    <ActionMenu />
+    <ActionMenu data-testid="actionmenu" />
   </div>
 </template>
 
@@ -32,6 +38,7 @@ import ActionMenu from '@pkg/components/ActionMenu.vue';
 import Nav from '@pkg/components/Nav.vue';
 import StatusBar from '@pkg/components/StatusBar.vue';
 import TheTitle from '@pkg/components/TheTitle.vue';
+import { mapTypedState } from '@pkg/entry/store';
 import initExtensions from '@pkg/preload/extensions';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
 import { mainRoutes } from '@pkg/window/constants';
@@ -49,42 +56,44 @@ export default {
     return { blur: false };
   },
 
-  async fetch() {
-    await this.$store.dispatch('credentials/fetchCredentials');
-    if (!this.credentials.port || !this.credentials.user || !this.credentials.password) {
-      console.log(`Credentials aren't ready for getting diagnostics -- will try later`);
-
-      return;
-    }
-    await this.$store.dispatch('preferences/fetchPreferences', this.credentials);
-    await this.$store.dispatch('diagnostics/fetchDiagnostics', this.credentials);
-  },
-
-  head() {
-    // If dark-mode is set to auto (follow system-prefs) this is all we need
-    // In a possible future with a three-way pref
-    // (Always off // Always on // Follow system pref)
-    // the "dark" part will be a dynamic pref.
-    // See https://github.com/rancher/dashboard/blob/3454590ff6a825f7e739356069576fbae4afaebc/layouts/default.vue#L227 for an example
-    return { bodyAttrs: { class: 'theme-dark' } };
-  },
-
   computed: {
     routes() {
-      return mainRoutes.map(route => route.route === '/Diagnostics' ? { ...route, error: this.errorCount } : route);
+      const badges = {
+        '/Diagnostics': this.diagnosticsCount,
+        '/Extensions':  this.extensionUpgradeCount,
+      };
+
+      return mainRoutes.map((route) => {
+        if (route.route in badges) {
+          return { ...route, error: badges[route.route] };
+        }
+
+        return route;
+      });
     },
     paths() {
       return mainRoutes.map(r => r.route);
     },
-    errorCount() {
+    /** @returns {number} The number of diagnostics errors. */
+    diagnosticsCount() {
       return this.diagnostics.filter(diagnostic => !diagnostic.mute).length;
     },
+    /** @returns {number} The number of extensions with upgrade available. */
+    extensionUpgradeCount() {
+      return this.installedExtensions.filter(ext => ext.canUpgrade).length;
+    },
     ...mapState('credentials', ['credentials']),
-    ...mapGetters('diagnostics', ['diagnostics']),
-    ...mapGetters('extensions', { extensions: 'list' }),
+    ...mapTypedState('diagnostics', ['diagnostics']),
+    ...mapGetters('extensions', ['installedExtensions']),
   },
 
   beforeMount() {
+    // The window title isn't set correctly in E2E; as a workaround, force set
+    // it here again.
+    document.title ||= 'Rancher Desktop';
+
+    this.fetch().catch(ex => console.error(ex));
+
     initExtensions();
     ipcRenderer.on('window/blur', (event, blur) => {
       this.blur = blur;
@@ -111,7 +120,7 @@ export default {
     this.$store.dispatch('extensions/fetch');
 
     ipcRenderer.on('preferences/changed', () => {
-      this.$store.dispatch('preferences/fetchPreferences', this.credentials);
+      this.$store.dispatch('preferences/fetchPreferences');
     });
 
     ipcRenderer.on('extensions/getContentArea', () => {
@@ -130,7 +139,12 @@ export default {
     });
   },
 
-  beforeDestroy() {
+  mounted() {
+    this.$store.dispatch('credentials/fetchCredentials').catch(console.error);
+    this.$store.dispatch('i18n/init').catch(ex => console.error(ex));
+  },
+
+  beforeUnmount() {
     ipcRenderer.off('k8s-check-state');
     ipcRenderer.off('extensions/getContentArea');
     ipcRenderer.removeAllListeners('backend-locked');
@@ -139,6 +153,17 @@ export default {
   },
 
   methods: {
+    async fetch() {
+      await this.$store.dispatch('credentials/fetchCredentials');
+      if (!this.credentials.port || !this.credentials.user || !this.credentials.password) {
+        console.log(`Credentials aren't ready for getting diagnostics -- will try later`);
+
+        return;
+      }
+      await this.$store.dispatch('preferences/fetchPreferences');
+      await this.$store.dispatch('diagnostics/fetchDiagnostics');
+    },
+
     openDashboard() {
       ipcRenderer.send('dashboard-open');
     },
@@ -170,9 +195,9 @@ export default {
             cancelId: 1,
           },
           format: {
-            header:            action || this.t('snapshots.dialog.generic.header', {}, true),
+            header:            action || this.t('snapshots.dialog.generic.header'),
             /** TODO: put here operation type information from 'state' */
-            message:           this.t('snapshots.dialog.generic.message', {}, true),
+            message:           this.t('snapshots.dialog.generic.message'),
             showProgressBar:   true,
             snapshotEventType: 'backend-lock',
           },
@@ -183,9 +208,8 @@ export default {
 };
 </script>
 
+<style lang="scss" src="@pkg/assets/styles/app.scss"></style>
 <style lang="scss" scoped>
-@import "@pkg/assets/styles/app.scss";
-
 .wrapper {
   display: grid;
   grid-template:
@@ -216,9 +240,9 @@ export default {
   }
 
   .body {
-    display: grid;
     grid-area: body;
-    grid-template-rows: auto 1fr;
+    display: flex;
+    flex-direction: column;
     padding: 0 20px 20px 20px;
     overflow: auto;
   }

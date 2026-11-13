@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"fmt"
+
 	"github.com/spf13/cobra"
 )
 
@@ -30,7 +31,7 @@ var extensionCmd = &cobra.Command{
 	Use: "extension [install | uninstall | list] [options...]",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmd.SilenceUsage = true
-		return fmt.Errorf("No subcommand given.\n\nUsage: rdctl %s", cmd.Use)
+		return fmt.Errorf("no subcommand given.\n\nUsage: rdctl %s", cmd.Use)
 	},
 }
 

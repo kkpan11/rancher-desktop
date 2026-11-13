@@ -4,17 +4,19 @@
 
 'use strict';
 
-import childProcess from 'child_process';
-import events from 'events';
-import https from 'https';
+import childProcess from 'node:child_process';
+import events from 'node:events';
+import fs from 'node:fs';
+import https from 'node:https';
+import path from 'node:path';
+import util from 'node:util';
 
-import fetch from 'node-fetch';
 import psTree from 'ps-tree';
 
 import buildUtils from './lib/build-utils';
 
 interface RendererEnv {
-  home: string;
+  home:   string;
   agent?: https.Agent | undefined;
 }
 
@@ -34,18 +36,17 @@ class DevRunner extends events.EventEmitter {
     this.emit('error', newError);
   }
 
-  get rendererPort() {
-    return 8888;
-  }
+  readonly rendererPort = 8888;
 
   /**
    * Spawn a child process, set up to emit errors on unexpected exit.
    * @param title The title of the process to show in messages.
    * @param command The executable to run.
-   * @param args Any arguments to the executable.
+   * @param args Any arguments to the executable; the last argument may be
+   *                        an Object holding options for child_process.spawn().
    * @returns The new child process.
    */
-  spawn(title: string, command: string, ...args: string[]): childProcess.ChildProcess {
+  spawn(title: string, command: string, ...args: (string | childProcess.SpawnOptions)[]): childProcess.ChildProcess {
     const promise = buildUtils.spawn(command, ...args);
 
     promise
@@ -74,15 +75,19 @@ class DevRunner extends events.EventEmitter {
   async startMainProcess() {
     console.info('Main process: starting...');
     try {
+      const electronPath = await fs.promises.readFile('node_modules/electron/path.txt', 'utf-8');
+      const argv = process.argv.slice(2);
+
       await buildUtils.buildMain();
 
       this.#mainProcess = this.spawn(
         'Main process',
-        'node',
-        'node_modules/electron/cli.js',
+        path.join('node_modules/electron/dist', electronPath),
+        ...argv.filter(x => x.startsWith('--inspect')),
         buildUtils.rootDir,
         this.rendererPort.toString(),
-        ...process.argv,
+        '## Rancher Desktop Command Line Marker ##',
+        ...argv.filter(x => !x.startsWith('--inspect')),
       );
       this.#mainProcess.on('exit', (code: number, signal: string) => {
         if (code === 201) {
@@ -100,73 +105,81 @@ class DevRunner extends events.EventEmitter {
 
   #rendererProcess: null | childProcess.ChildProcess = null;
   /**
-   * Start the renderer process.
+   * Start the renderer process.  The function should return once the renderer
+   * is ready for connections, and the renderer process should continue after
+   * the function returns.
    */
   async startRendererProcess(): Promise<void> {
     await buildUtils.buildPreload();
+    let started = false;
+    let startError: Error | undefined;
 
-    return new Promise((resolve, reject) => {
-      console.info('Renderer process: starting...');
-      process.env.VUE_CLI_SERVICE_CONFIG_PATH = 'pkg/rancher-desktop/vue.config.js';
+    console.info('Renderer process: starting...');
+    process.env.VUE_CLI_SERVICE_CONFIG_PATH = 'pkg/rancher-desktop/vue.config.mjs';
 
-      this.#rendererProcess = this.spawn(
-        'Renderer process',
-        'node_modules/.bin/vue-cli-service',
-        'serve',
-        '--host',
-        'localhost',
-        '--port',
-        this.rendererPort.toString(),
-        '--skip-plugins',
-        'eslint',
-      );
+    this.#rendererProcess = this.spawn(
+      'Renderer process',
+      process.execPath,
+      '--stack-size=16384',
+      'node_modules/@vue/cli-service/bin/vue-cli-service.js',
+      'serve',
+      '--host',
+      'localhost',
+      '--port',
+      this.rendererPort.toString(),
+      '--skip-plugins',
+      'eslint',
+      {
+        env: {
+          ...process.env,
+          RD_DOCS_URL: await buildUtils.docsUrl,
+          RD_VERSION:  await buildUtils.version,
+        },
+      },
+    );
 
-      // Listen for the 'exit' event of the child process and resolve or reject the Promise accordingly.
-      this.#rendererProcess.on('exit', (code, _signal) => {
-        if (code === 0) {
-          resolve();
-        } else {
-          reject(new Error(`Renderer build failed with code ${ code }`));
-        }
-      });
-
-      // Wait for the renderer to finish, so that vue-cli output doesn't
-      // clobber debugging output.
-      const rendererEnv = this.rendererEnv();
-
-      const maxRetries = 30;
-      let retryCount = 0;
-      const retryInterval = 1000;
-
-      const checkDevServer = async() => {
-        try {
-          const response = await fetch(rendererEnv.home, { agent: rendererEnv.agent });
-
-          if (response.ok) {
-            console.info('Renderer process: dev server started');
-            resolve();
-          } else {
-            // Retry if response is not okay
-            retryCount++;
-            if (retryCount < maxRetries) {
-              setTimeout(checkDevServer, retryInterval);
-            } else {
-              reject(new Error(`Renderer process: failed to connect`));
-            }
-          }
-        } catch (error) {
-          // Retry if fetch throws an error
-          retryCount++;
-          if (retryCount < maxRetries) {
-            setTimeout(checkDevServer, retryInterval);
-          } else {
-            reject(new Error(`Renderer process: failed to connect`));
-          }
-        }
-      };
-
-      checkDevServer().catch(e => console.error(e));
+    // Listen for the 'exit' event of the child process and resolve or reject the Promise accordingly.
+    this.#rendererProcess.on('exit', (code, _signal) => {
+      if (!started) {
+        startError = new Error(`Renderer process exited prematurely with code ${ code }`);
+      } else if (code !== 0) {
+        this.emit('error', new Error(`Renderer process exited with code ${ code }`));
+      }
     });
+
+    // Wait for the renderer to finish, so that vue-cli output doesn't
+    // clobber debugging output.
+    const rendererEnv = this.rendererEnv();
+
+    const maxRetries = 30;
+    const retryInterval = 1000;
+
+    for (let retryCount = 0; retryCount < maxRetries;) {
+      if (startError) {
+        throw startError;
+      }
+      try {
+        const response = await fetch(rendererEnv.home);
+
+        if (response.ok && !startError) {
+          console.info('Renderer process: dev server started');
+          break;
+        }
+      } catch (ex) {
+        /* nothing */
+      }
+      if (startError) {
+        throw startError;
+      }
+      // Retry if response is not okay or fetch throws an error.
+      if (++retryCount < maxRetries) {
+        await util.promisify(setTimeout)(retryInterval);
+      } else {
+        throw new Error(`Renderer process: failed to connect`);
+      }
+    }
+
+    started = true;
   }
 
   /**
@@ -219,7 +232,7 @@ class DevRunner extends events.EventEmitter {
         this.on('error', reject);
       });
     } catch (err: any) {
-      if (typeof err === 'string' && /Main process error: Process exited with code 201/.test(err)) {
+      if (typeof err === 'string' && err.includes('Main process error: Process exited with code 201')) {
         // do nothing
       } else {
         console.error(err);

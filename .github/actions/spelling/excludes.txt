@@ -1,24 +1,26 @@
 # See https://github.com/check-spelling/check-spelling/wiki/Configuration-Examples:-excludes
 (?:^|/)(?i)COPYRIGHT
 (?:^|/)(?i)LICEN[CS]E
+(?:^|/)(?i)third[-_]?party/
 (?:^|/)3rdparty/
+(?:^|/)generated/
 (?:^|/)go\.(?:work\.)?sum$
 (?:^|/)package(?:-lock|)\.json$
 (?:^|/)Pipfile$
 (?:^|/)pyproject.toml
-(?:^|/)requirements(?:-dev|-doc|-test|)\.txt$
 (?:^|/)vendor/
+(?:^|/|\b)requirements(?:-dev|-doc|-test|)\.txt$
+-lock\.yaml$
 \.a$
 \.ai$
 \.all-contributorsrc$
 \.avi$
 \.bmp$
 \.bz2$
-\.cer$
+\.cert?$|\.crt$
 \.class$
 \.coveragerc$
 \.crl$
-\.crt$
 \.csr$
 \.dll$
 \.docx?$
@@ -89,12 +91,24 @@
 ^\QSECURITY.md\E$
 ^pkg/rancher-desktop/assets/scripts/logrotate-k3s$
 ^pkg/rancher-desktop/assets/scripts/logrotate-lima-guestagent$
+# Vendored from moby/profiles
+^\Qpkg/rancher-desktop/assets/scripts/seccomp.json\E$
+^pkg/rancher-desktop/sudo-prompt/
+^pkg/rancher-desktop/utils/processOutputInterpreters/__tests__/assets/trivy-image-postgres
 ignore$
 /translations/(?!en)
 ^\Qpkg/rancher-desktop/router.js\E$
-^\Qpkg/rancher-desktop/utils/_demo_marketplace_items.js\E$
-^\Qpkg/rancher-desktop/utils/_demo_metadata.js\E$
-(?:^|/)pkg/rancher-desktop/nuxt/
-^\Qsrc/disk-images/github-runner-linux/root/etc/sysconfig/network/ifcfg-\E
 ^\Qsrc/go/nerdctl-stub/nerdctl_commands_generated.go\E$
-^\Q.github/workflows/config/.golangci.yaml\E$
+^\Q.golangci.yaml\E$
+^\Qsrc/go/networking/.golangci.yml\E$
+# Generated file
+^\Qpkg/rancher-desktop/assets/extension-data.yaml\E$
+# Mostly image names
+^\Qscripts/assets/extension-data.yaml\E$
+# Test data
+^screenshots/test-data/
+# i18n tool tests use German sample translations
+^src/go/i18n-report/.*_test\.go$
+# i18n runtime tests use German sample translations
+^\Qpkg/rancher-desktop/main/__tests__/i18n.spec.ts\E$
+^\Qpkg/rancher-desktop/store/__tests__/i18n.spec.ts\E$

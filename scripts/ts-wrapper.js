@@ -1,22 +1,39 @@
 /**
- * This script is a wrapper to run TypeScript scripts via node.  This wrapper is
- * necessary as ts-node by default doesn't override the tsconfig.json at all,
- * which means that the `module` compiler option will be ESNext, which works
- * fine elsewhere, but not on the command line.
+ * This script is a wrapper to run TypeScript scripts via tsx.  This is mostly
+ * to set defaults for our tools, such as disabling BrowsersList updates and
+ * showing deprecations.
  */
 
-// Load tsconfig-paths so that ts-node can resolve files based on the 'paths'
-// compiler options key in tsconfig.json.
-require('tsconfig-paths/register');
-
-const { main: tsNodeMain } = require('ts-node/dist/bin');
+import { spawnSync } from 'node:child_process';
 
 function main(args) {
-  return tsNodeMain(args, { '--compiler-options': { module: 'commonjs' } });
+  const childArgs = [
+    'node_modules/tsx/dist/cli.mjs',
+    '--trace-warnings',
+    '--trace-deprecation',
+    '--max_old_space_size=4096',
+    '--stack-size=16384',
+  ];
+
+  const finalArgs = [...childArgs, ...args];
+
+  console.log(process.argv0, ...finalArgs);
+  const result = spawnSync(process.argv0, finalArgs, { stdio: 'inherit' });
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  if (typeof result.status === 'number') {
+    process.exit(result.status);
+  }
+
+  if (result.signal) {
+    console.log(`Process exited with signal ${ result.signal }`);
+    process.exit(-1);
+  }
 }
 
-if (require.main === module) {
-  // Silence BrowsersList warnings because they're pointless for us
-  process.env.BROWSERSLIST_IGNORE_OLD_DATA = 'true'; // spellcheck-ignore-line
-  main(process.argv.slice(2));
-}
+// Silence BrowsersList warnings because they're pointless for us
+process.env.BROWSERSLIST_IGNORE_OLD_DATA = 'true'; // spellcheck-ignore-line
+main(process.argv.slice(2));

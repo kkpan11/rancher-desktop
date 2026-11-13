@@ -1,6 +1,12 @@
 HTML, BODY {
   font-family: $body-font;
   font-size: 14px;
+
+  // The bundled Lato lacks most Vietnamese accented letters, and a per-letter
+  // fallback would mix two typefaces within one word.
+  &:lang(vi) {
+    font-family: $local-body-font;
+  }
 }
 
 H1, H2, H3, H4, H5, H6 {
@@ -63,6 +69,7 @@ code {
   border-radius: var(--border-radius);
 }
 
+.v-popper__popper code,
 pre code {
   background: transparent;
   padding: 0;

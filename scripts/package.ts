@@ -5,23 +5,22 @@
 
 'use strict';
 
-import childProcess from 'child_process';
 import fs from 'fs';
 import * as path from 'path';
 
 import { flipFuses, FuseV1Options, FuseVersion } from '@electron/fuses';
-import { LinuxPackager } from 'app-builder-lib/out/linuxPackager';
-import { LinuxTargetHelper } from 'app-builder-lib/out/targets/LinuxTargetHelper';
-import { executeAppBuilder, log } from 'builder-util';
+import { log } from 'builder-util';
 import {
   AfterPackContext, Arch, build, CliOptions, Configuration, LinuxTargetSpecificOptions,
 } from 'electron-builder';
 import _ from 'lodash';
+import * as plist from 'plist';
 import yaml from 'yaml';
 
 import buildUtils from './lib/build-utils';
 import buildInstaller, { buildCustomAction } from './lib/installer-win32';
 
+import { spawnFile } from '@pkg/utils/childProcess';
 import { ReadWrite } from '@pkg/utils/typeUtils';
 
 class Builder {
@@ -81,6 +80,8 @@ class Builder {
    * files.
    */
   protected async writeLinuxDesktopFile(context: AfterPackContext) {
+    const { LinuxPackager } = await import('app-builder-lib/out/linuxPackager');
+    const { LinuxTargetHelper } = await import('app-builder-lib/out/targets/LinuxTargetHelper');
     const config = context.packager.config.linux;
 
     if (!(context.packager instanceof LinuxPackager) || !config) {
@@ -98,9 +99,49 @@ class Builder {
     await helper.writeDesktopEntry(options, context.packager.executableName, destination);
   }
 
+  /**
+   * Edit the application's `Info.plist` file to remove the UsageDescription
+   * keys; there is no reason for the application to get any of those permissions.
+   */
+  protected async removeMacUsageDescriptions(context: AfterPackContext) {
+    const { MacPackager } = await import('app-builder-lib/out/macPackager');
+    const { packager } = context;
+    const config = packager.config.mac;
+
+    if (!(packager instanceof MacPackager) || !config) {
+      return;
+    }
+
+    const { productFilename } = packager.appInfo;
+    const appPath = path.join(context.appOutDir, `${ productFilename }.app`);
+    const plistPath = path.join(appPath, 'Contents', 'Info.plist');
+    const plistContents = await fs.promises.readFile(plistPath, 'utf-8');
+    const plistData = plist.parse(plistContents);
+
+    if (typeof plistData !== 'object' || !('CFBundleName' in plistData)) {
+      return;
+    }
+    const plistCopy: Record<string, plist.PlistValue> = structuredClone(plistData);
+
+    for (const key in plistData) {
+      if (/^NS.*UsageDescription$/.test(key)) {
+        delete plistCopy[key];
+      }
+    }
+    await fs.promises.writeFile(plistPath, plist.build(plistCopy), 'utf-8');
+
+    // Because we modified the Info.plist, we need to re-sign the app.  This is
+    // just using ad-hoc signing.  Note that this will fail on x86_64, so ignore
+    // it there.
+    if (context.arch !== Arch.x64) {
+      await spawnFile('codesign', ['--sign', '-', '--force', '--verbose', appPath], { stdio: 'inherit' });
+    }
+  }
+
   protected async afterPack(context: AfterPackContext) {
     await this.flipFuses(context);
     await this.writeLinuxDesktopFile(context);
+    await this.removeMacUsageDescriptions(context);
   }
 
   async package(): Promise<CliOptions> {
@@ -109,8 +150,8 @@ class Builder {
     // Build the electron builder configuration to include the version data
     const config: ReadWrite<Configuration> = yaml.parse(await fs.promises.readFile('packaging/electron-builder.yml', 'utf-8'));
     const configPath = path.join(buildUtils.distDir, 'electron-builder.yaml');
-    const fullBuildVersion = childProcess.execFileSync('git', ['describe', '--tags']).toString().trim();
-    const finalBuildVersion = fullBuildVersion.replace(/^v/, '');
+    const version = await buildUtils.version;
+
     const distDir = path.join(process.cwd(), 'dist');
     const electronPlatform = ({
       darwin: 'mac',
@@ -118,16 +159,42 @@ class Builder {
       linux:  'linux',
     } as const)[process.platform as string];
 
+    if (!electronPlatform) {
+      throw new Error(`Packaging for ${ process.platform } is not supported`);
+    }
+
     switch (electronPlatform) {
     case 'linux':
-      await this.createLinuxResources(finalBuildVersion);
+      await this.createLinuxResources(version);
       break;
     case 'win':
       await this.createWindowsResources(distDir);
       break;
     }
 
-    _.set(config, 'extraMetadata.version', finalBuildVersion);
+    // When there are files (e.g., extraFiles or extraResources) specified at both
+    // the top-level and platform-specific levels, we need to combine them
+    // and place the combined list at the top level. This approach enables us to have
+    // platform-specific exclusions, since the two lists are initially processed
+    // separately and then merged together afterward.
+    for (const key of ['files', 'extraFiles', 'extraResources'] as const) {
+      const section = config[electronPlatform];
+      const items = config[key];
+      const overrideItems = section?.[key];
+
+      if (!section || !Array.isArray(items) || !Array.isArray(overrideItems)) {
+        continue;
+      }
+      config[key] = items.concat(overrideItems);
+      delete section[key];
+    }
+
+    _.set(config, 'extraMetadata.version', version);
+
+    if (electronPlatform === 'mac') {
+      _.set(config, 'dmg.title', `Install Rancher Desktop ${ version }-${ buildUtils.arch }`);
+    }
+
     await fs.promises.writeFile(configPath, yaml.stringify(config), 'utf-8');
 
     config.afterPack = this.afterPack.bind(this);
@@ -174,17 +241,16 @@ class Builder {
   }
 
   protected async createWindowsResources(workDir: string) {
-    // Create stub executable with the correct icon (for the installer)
+    // Create the icon; the toolset always writes it as `icon.ico`.
+    const { runIconsTool } = await import('app-builder-lib/out/toolsets/icons');
     const imageFile = path.join(process.cwd(), 'resources', 'icons', 'logo-square-512.png');
-    const iconArgs = ['icon', '--format', 'ico', '--out', workDir, '--input', imageFile];
-    const iconResult = await this.executeAppBuilderAsJson(iconArgs);
-    const iconFile = iconResult.icons[0].file;
-    const executable = path.join(process.cwd(), 'resources', 'win32', 'bin', 'rdctl.exe');
-    const rceditArgs = [executable, '--set-icon', iconFile];
+    const iconFile = path.join(process.cwd(), 'resources', 'icons', 'icon.ico');
 
-    await executeAppBuilder(['rcedit', '--args', JSON.stringify(rceditArgs)], undefined, undefined, 3);
+    await runIconsTool({ inputFile: imageFile, outputFormat: 'ico', outDir: workDir });
+    await fs.promises.rename(path.join(workDir, 'icon.ico'), iconFile);
 
     // Create the custom action for the installer
+    log.info('building Windows Installer custom action...');
     const customActionFile = await buildCustomAction();
 
     // Wait for the virus scanner to be done with the new DLL file
@@ -196,16 +262,6 @@ class Builder {
         await buildUtils.sleep(5_000);
       }
     }
-  }
-
-  protected async executeAppBuilderAsJson(...args: Parameters<typeof executeAppBuilder>) {
-    const result = JSON.parse(await executeAppBuilder(...args));
-
-    if (result.error) {
-      throw new Error(result.error);
-    }
-
-    return result;
   }
 
   async run() {

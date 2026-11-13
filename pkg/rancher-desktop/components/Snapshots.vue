@@ -1,31 +1,23 @@
 <script lang="ts">
 import { Banner } from '@rancher/components';
-import dayjs from 'dayjs';
 import isEmpty from 'lodash/isEmpty';
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 import { mapGetters } from 'vuex';
 
 import EmptyState from '@pkg/components/EmptyState.vue';
 import SnapshotCard from '@pkg/components/SnapshotCard.vue';
 import { Snapshot, SnapshotEvent } from '@pkg/main/snapshots/types';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
+import { escapeHtml } from '@pkg/utils/string';
 
 interface Data {
-  snapshotEvent: SnapshotEvent | null;
+  snapshotEvent:            SnapshotEvent | null;
   snapshotsPollingInterval: ReturnType<typeof setInterval> | null;
-  isEmpty: boolean;
+  isEmpty:                  boolean;
 }
 
-interface Methods {
-  pollingStart: () => void,
-  currentTime: () => string,
-}
-
-interface Computed {
-  snapshots: Snapshot[],
-}
-
-export default Vue.extend<Data, Methods, Computed, never>({
+export default defineComponent({
+  name:       'snapshots',
   components: {
     Banner,
     EmptyState,
@@ -60,14 +52,16 @@ export default Vue.extend<Data, Methods, Computed, never>({
       return;
     }
 
-    const { type, result, snapshotName } = this.$route.params as SnapshotEvent;
+    const {
+      type, result, snapshotName, eventTime,
+    } = this.$route.params as SnapshotEvent;
 
     this.snapshotEvent = {
-      type, result, snapshotName,
+      type, result, snapshotName, eventTime,
     };
   },
 
-  beforeDestroy() {
+  beforeUnmount() {
     if (this.snapshotsPollingInterval) {
       clearInterval(this.snapshotsPollingInterval);
     }
@@ -80,11 +74,7 @@ export default Vue.extend<Data, Methods, Computed, never>({
         this.$store.dispatch('snapshots/fetch');
       }, 1500);
     },
-    currentTime() {
-      const date = dayjs(Date.now());
-
-      return date.format('YYYY-MM-DD HH:mm');
-    },
+    escapeHtml,
   },
 });
 </script>
@@ -99,14 +89,15 @@ export default Vue.extend<Data, Methods, Computed, never>({
         class="banner"
         :color="snapshotEvent.result"
         :closable="true"
-        @close="snapshotEvent=null"
+        @close="snapshotEvent = null"
       >
         <span
-          v-clean-html="t(`snapshots.info.${ snapshotEvent.type }.${ snapshotEvent.result }`, { snapshot: snapshotEvent.snapshotName, error: snapshotEvent.error }, true)"
+          v-clean-html="t(`snapshots.info.${snapshotEvent.type}.${snapshotEvent.result}`,
+                          { snapshot: escapeHtml(snapshotEvent.snapshotName), error: snapshotEvent.error })"
           class="event-message"
         />
         <span
-          v-clean-html="t('snapshots.info.when', { time: currentTime() })"
+          v-clean-html="t('snapshots.info.when', { time: snapshotEvent.eventTime })"
           class="event-message"
         />
       </Banner>
@@ -130,8 +121,7 @@ export default Vue.extend<Data, Methods, Computed, never>({
           :icon="t('snapshots.empty.icon')"
           :heading="t('snapshots.empty.heading')"
           :body="t('snapshots.empty.body')"
-        >
-        </empty-state>
+        />
       </div>
     </div>
   </div>
@@ -155,7 +145,7 @@ export default Vue.extend<Data, Methods, Computed, never>({
 
       .banner {
         margin: 0;
-        ::v-deep .banner__content {
+        :deep(.banner__content) {
           margin-top: 8px;
           margin-bottom: 15px;
 

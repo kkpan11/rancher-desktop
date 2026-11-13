@@ -1,7 +1,8 @@
-import { DiagnosticsCategory, DiagnosticsChecker, DiagnosticsCheckerResult } from './types';
+import { DiagnosticsCategory, DiagnosticsChecker, DiagnosticsCheckerResult, DiagnosticsCheckerSingleResult } from './types';
 
 import mainEvents from '@pkg/main/mainEvents';
 import Logging from '@pkg/utils/logging';
+import { send } from '@pkg/window';
 
 const console = Logging.diagnostics;
 
@@ -11,9 +12,9 @@ const console = Logging.diagnostics;
  */
 export type DiagnosticsResult = DiagnosticsCheckerResult & {
   /** The diagnostics checker that produced this result. */
-  id: string,
+  id:       string,
   /** Whether to avoid notifying the user about failures for this check. */
-  mute: boolean,
+  mute:     boolean,
   category: DiagnosticsCategory,
 };
 
@@ -21,10 +22,10 @@ export type DiagnosticsResult = DiagnosticsCheckerResult & {
  * DiagnosticsResultCollection is the data structure that will be returned to
  * clients over the HTTP API.
  */
-export type DiagnosticsResultCollection = {
+export interface DiagnosticsResultCollection {
   last_update: string,
-  checks: Array<DiagnosticsResult>,
-};
+  checks:      DiagnosticsResult[],
+}
 
 /**
  * DiagnosticsManager manages the collection of diagnostics checkers, and is
@@ -37,27 +38,44 @@ export class DiagnosticsManager {
   /** Time stamp of when the last check occurred. */
   lastUpdate = new Date(0);
 
+  /** Last known applicable state, for message limiting. */
+  applicable: Record<DiagnosticsChecker['id'], boolean> = {};
+
   /** Last known check results, indexed by the checker id. */
-  results: Record<DiagnosticsChecker['id'], DiagnosticsCheckerResult> = {};
+  results: Record<DiagnosticsChecker['id'], DiagnosticsCheckerResult | DiagnosticsCheckerSingleResult[]> = {};
+
+  updateTimeout: ReturnType<typeof setTimeout> | undefined;
 
   /** Mapping of category name to diagnostic ids */
   readonly checkerIdByCategory: Partial<Record<DiagnosticsCategory, string[]>> = {};
 
   constructor(diagnostics?: DiagnosticsChecker[]) {
-    this.checkers = diagnostics ? Promise.resolve(diagnostics) : (async() => {
-      const imports = (await Promise.all([
-        import('./testCheckers'),
-        import('./connectedToInternet'),
-        import('./dockerCliSymlinks'),
-        import('./rdBinInShell'),
-        import('./kubeContext'),
-        import('./wslFromStore'),
-        import('./mockForScreenshots'),
-        import('./limaDarwin'),
-      ])).map(obj => obj.default);
+    this.checkers = diagnostics
+      ? Promise.resolve(diagnostics)
+      : (async() => {
+        const imports = (await Promise.all([
+          import('./connectedToInternet'),
+          import('./dockerCliSymlinks'),
+          import('./dockerContext'),
+          import('./integrationsWindows'),
+          import('./kubeConfigSymlink'),
+          import('./kubeContext'),
+          import('./kubeVersionsAvailable'),
+          import('./limaDarwin'),
+          import('./limaOverrides'),
+          import('./mobyImageStore'),
+          import('./mockForScreenshots'),
+          import('./pathManagement'),
+          import('./rdBinInShell'),
+          import('./testCheckers'),
+          import('./wslDistros'),
+          import('./wslInfo'),
+        ])).map(obj => obj.default);
 
-      return (await Promise.all(imports)).flat();
-    })();
+        // Only some of the imports return promises.
+        // eslint-disable-next-line @typescript-eslint/await-thenable
+        return (await Promise.all(imports)).flat();
+      })();
     this.checkers.then((checkers) => {
       for (const checker of checkers) {
         this.checkerIdByCategory[checker.category] ??= [];
@@ -79,21 +97,22 @@ export class DiagnosticsManager {
   /**
    * Returns the list of currently known category names.
    */
-  getCategoryNames(): Array<string> {
+  getCategoryNames(): string[] {
     return Object.keys(this.checkerIdByCategory);
   }
 
   /**
    * Returns undefined if the categoryName isn't known, the list of IDs in that category otherwise.
    */
-  getIdsForCategory(categoryName: string): Array<string> | undefined {
+  getIdsForCategory(categoryName: string): string[] | undefined {
     return this.checkerIdByCategory[categoryName as DiagnosticsCategory];
   }
 
   protected async applicableCheckers(categoryName: string | null, id: string | null): Promise<DiagnosticsChecker[]> {
+    const checkerId = id?.split(':', 1)[0];
     const checkers = (await this.checkers)
       .filter(checker => categoryName ? checker.category === categoryName : true)
-      .filter(checker => id ? checker.id === id : true);
+      .filter(checker => checkerId ? checker.id === checkerId : true);
 
     return (await Promise.all(checkers.map(async(checker) => {
       try {
@@ -105,7 +124,11 @@ export class DiagnosticsManager {
       }
     })))
       .map(([checker, applicable]) => {
-        console.debug(`${ checker.id } is ${ applicable ? '' : 'not ' }applicable`);
+        if (applicable !== this.applicable[checker.id]) {
+          const verb = this.applicable[checker.id] === undefined ? 'is' : 'turned';
+          console.debug(`${ checker.id } ${ verb } ${ applicable ? '' : 'not ' }applicable`);
+          this.applicable[checker.id] = applicable;
+        }
 
         return [checker, applicable] as const;
       })
@@ -123,12 +146,25 @@ export class DiagnosticsManager {
     return {
       last_update: this.lastUpdate.toISOString(),
       checks:      checkers
-        .map(checker => ({
-          ...this.results[checker.id],
-          id:       checker.id,
-          category: checker.category,
-          mute:     false,
-        })),
+        .flatMap((checker) => {
+          const result = this.results[checker.id];
+
+          if (Array.isArray(result)) {
+            return result.map(result => ({
+              ...result,
+              id:       `${ checker.id }:${ result.id }`,
+              category: checker.category,
+              mute:     false,
+            }));
+          } else {
+            return {
+              ...result,
+              id:       checker.id,
+              category: checker.category,
+              mute:     false,
+            };
+          }
+        }),
     };
   }
 
@@ -138,11 +174,24 @@ export class DiagnosticsManager {
   protected async runChecker(checker: DiagnosticsChecker) {
     console.debug(`Running check ${ checker.id }`);
     try {
-      this.results[checker.id] = await checker.check();
-      console.debug(`Check ${ checker.id } result: ${ JSON.stringify(this.results[checker.id]) }`);
+      const result = await checker.check();
+
+      this.results[checker.id] = result;
+      if (Array.isArray(result)) {
+        for (const singleResult of result) {
+          console.debug(`Check ${ checker.id }:${ singleResult.id } result: ${ JSON.stringify(singleResult) }`);
+        }
+      } else {
+        console.debug(`Check ${ checker.id } result: ${ JSON.stringify(result) }`);
+      }
     } catch (e) {
       console.error(`ERROR checking ${ checker.id }`, { e });
     }
+
+    if (this.updateTimeout !== undefined) {
+      clearTimeout(this.updateTimeout);
+    }
+    this.updateTimeout = setTimeout(() => send('diagnostics/update'), 500);
   }
 
   /**

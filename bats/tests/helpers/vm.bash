@@ -1,6 +1,11 @@
 wait_for_shell() {
     if is_windows; then
-        try --max 48 --delay 5 rdctl shell true
+        try --max 48 --delay 5 rdctl shell grep ID= /etc/os-release
+        if using_systemd; then
+            try --max 24 --delay 5 rdctl shell test -f /var/run/lima-boot-done
+            try --max 24 --delay 5 rdctl shell systemctl is-active rancher-desktop.target
+            try --max 48 --delay 5 rdctl shell sudo systemctl is-system-running --wait
+        fi
     else
         # Be at the root directory to avoid issues with limactl automatic
         # changing to the current directory, which might not exist.
@@ -23,7 +28,7 @@ pkill_by_path() {
 clear_iptables_chain() {
     local chain=$1
     local rule
-    wsl sudo iptables -L | awk '/^Chain ${chain}/ {print $2}' | while IFS= read -r rule; do
+    wsl sudo iptables -L | awk "/^Chain ${chain}/ {print \$2}" | while IFS= read -r rule; do
         wsl sudo iptables -X "$rule"
     done
 }
@@ -136,8 +141,21 @@ factory_reset() {
         clear_iptables_chain "CNI"
         clear_iptables_chain "KUBE"
     fi
-    rdctl factory-reset "$@"
+    rdctl reset --factory "$@"
+    delete_pending_update
     setup_ramdisk
+}
+
+# An update that finished downloading is staged, and the next launch installs
+# it, so a leak lands in whichever test runs next. electron-updater names the
+# staging directory after the build: a `-updater` sibling of the cache when
+# packaged, the cache itself in dev mode, and the app home on Windows. Factory
+# reset removes the packaged and Windows ones, and the dev-mode one only along
+# with the cache.
+delete_pending_update() {
+    rm -rf "$PATH_CACHE/updater-longhorn.json" "$PATH_CACHE/pending" \
+        "$PATH_CACHE/update.zip" "$PATH_CACHE/current.blockmap" \
+        "${PATH_CACHE}-updater" "$PATH_APP_HOME/pending"
 }
 
 # Turn `rdctl start` arguments into `yarn dev` arguments
@@ -175,7 +193,8 @@ start_container_engine() {
             --application.admin-access="$admin_access"
             --application.path-management-strategy rcfiles
             --virtual-machine.memory-in-gb 6
-            --experimental.virtual-machine.mount.type="$RD_MOUNT_TYPE"
+            --virtual-machine.number-cpus="$RD_VM_CPUS"
+            --virtual-machine.mount.type="$RD_MOUNT_TYPE"
         )
     fi
     if [ "$RD_MOUNT_TYPE" = "9p" ]; then
@@ -186,13 +205,14 @@ start_container_engine() {
             --experimental.virtual-machine.mount.9p.security-model="$RD_9P_SECURITY_MODEL"
         )
     fi
-    if is_windows; then
-        args+=("--experimental.virtual-machine.networking-tunnel=$(bool using_networking_tunnel)")
-    fi
-    if using_vz_emulation; then
-        args+=(--experimental.virtual-machine.type vz)
-        if is_macos aarch64; then
-            args+=(--experimental.virtual-machine.use-rosetta)
+    if is_macos; then
+        if using_vz_emulation; then
+            args+=(--virtual-machine.type vz)
+            if is_macos aarch64; then
+                args+=(--virtual-machine.use-rosetta)
+            fi
+        else
+            args+=(--virtual-machine.type qemu)
         fi
     fi
 
@@ -243,7 +263,7 @@ EOF
 start_kubernetes() {
     start_container_engine \
         --kubernetes.enabled \
-        --kubernetes.version "$RD_KUBERNETES_PREV_VERSION" \
+        --kubernetes.version "$RD_KUBERNETES_VERSION" \
         "$@"
 }
 
@@ -305,7 +325,7 @@ EOF
 get_container_engine_info() {
     run ctrctl info
     echo "$output"
-    assert_success || return
+    assert_success
     assert_output --partial "Server Version:"
 }
 
@@ -315,19 +335,63 @@ docker_context_exists() {
         return
     fi
     run docker_exe context ls -q
-    assert_success || return
+    assert_success
     assert_line "$RD_DOCKER_CONTEXT"
     # Ensure that the context actually exists by reading from the file.
     run docker_exe context inspect "$RD_DOCKER_CONTEXT" --format '{{ .Name }}'
-    assert_success || return
+    assert_success
     assert_output "$RD_DOCKER_CONTEXT"
+}
+
+# Check if the VM is using systemd (instead of OpenRC).
+using_systemd() {
+    [[ -n ${_RD_USING_SYSTEMD:-} ]] || load_var _RD_USING_SYSTEMD || true
+    if [[ -z ${_RD_USING_SYSTEMD:-} ]]; then
+        # `systemctl whoami` contacts the systemd init to check things, so if
+        # it succeeds we're using systemd.  On alpine-based systems, the
+        # `systemctl` command would be missing so this still applies.
+        if rdctl shell /usr/bin/systemctl whoami &>/dev/null; then
+            _RD_USING_SYSTEMD=true
+        else
+            _RD_USING_SYSTEMD=false
+        fi
+        save_var _RD_USING_SYSTEMD
+    fi
+    is_true "${_RD_USING_SYSTEMD}"
+}
+
+# Manage a service in the vm.
+# service_control [--ifstarted] $SERVICE start|stop|restart
+service_control() {
+    local if_started
+    if [[ ${1:-} == "--ifstarted" ]]; then
+        if_started=$1
+        shift
+    fi
+    local service=$1 action=$2
+    if using_systemd; then
+        if [[ -n $ifstarted && $action == restart ]]; then
+            rdsudo systemctl try-restart "$service"
+        else
+            rdsudo systemctl "$action" "$service"
+        fi
+    else
+        # shellcheck disable=2086 # the argument may expand to nothing.
+        rdsudo rc-service ${if_started:-} "$service" "$action"
+    fi
 }
 
 get_service_pid() {
     local service_name=$1
-    RD_TIMEOUT=10s run rdshell sh -c "RC_SVCNAME=$service_name /lib/rc/bin/service_get_value pidfile"
-    assert_success || return
-    RD_TIMEOUT=10s rdshell cat "$output"
+    if using_systemd; then
+        RD_TIMEOUT=10s run rdshell systemctl show --property MainPID --value "$service_name.service"
+        assert_success
+        echo "$output"
+    else
+        RD_TIMEOUT=10s run rdshell sh -c "RC_SVCNAME=$service_name /usr/libexec/rc/bin/service_get_value pidfile"
+        assert_success
+        RD_TIMEOUT=10s rdshell cat "$output"
+    fi
 }
 
 assert_service_pid() {
@@ -353,12 +417,27 @@ assert_service_status() {
     local service_name=$1
     local expect=$2
 
-    RD_TIMEOUT=10s run rdsudo rc-service "$service_name" status
-    # rc-service report non-zero status (3) when the service is stopped
-    if [[ $expect == started ]]; then
-        assert_success || return
+    if using_systemd; then
+        local mapped_status
+        case $expect in
+        started) mapped_status=active ;;
+        stopped) mapped_status=inactive ;;
+        *) fail "Status $expect is unsupported" ;;
+        esac
+        RD_TIMEOUT=10s run rdsudo systemctl is-active "$service_name"
+        # `systemctl is-active` returns 0 on active, and non-0 on non-active.
+        if [[ $expect == started ]]; then
+            assert_success
+        fi
+        assert_line "$mapped_status"
+    else
+        RD_TIMEOUT=10s run rdsudo rc-service "$service_name" status
+        # rc-service report non-zero status (3) when the service is stopped
+        if [[ $expect == started ]]; then
+            assert_success
+        fi
+        assert_output --partial "status: ${expect}"
     fi
-    assert_output --partial "status: ${expect}"
 }
 
 wait_for_service_status() {
@@ -395,7 +474,7 @@ wait_for_container_engine() {
 wait_for_extension_manager() {
     trace "waiting for extension manager to be ready"
     # We want to match specific error strings, so we can't use try() directly.
-    local count=0 max=30 message
+    local count=0 max=$((30 * RD_WAIT_FACTOR)) message
     while true; do
         run --separate-stderr rdctl api /extensions
         if ((status == 0 || ++count >= max)); then

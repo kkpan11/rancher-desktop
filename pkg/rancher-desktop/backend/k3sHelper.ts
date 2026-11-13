@@ -8,11 +8,11 @@ import tls from 'tls';
 import util from 'util';
 
 import {
-  CustomObjectsApi, KubeConfig, V1ObjectMeta, findHomeDir, HttpError,
+  CustomObjectsApi, KubeConfig, V1ObjectMeta, findHomeDir, ApiException,
 } from '@kubernetes/client-node';
 import { ActionOnInvalid } from '@kubernetes/client-node/dist/config_types';
+import { net } from 'electron';
 import _ from 'lodash';
-import { Response } from 'node-fetch';
 import semver from 'semver';
 import yaml from 'yaml';
 
@@ -21,18 +21,19 @@ import { Architecture, VMExecutor } from './backend';
 import * as K8s from '@pkg/backend/k8s';
 import { KubeClient } from '@pkg/backend/kube/client';
 import { loadFromString, exportConfig } from '@pkg/backend/kubeconfig';
-import { checkConnectivity } from '@pkg/main/networking';
-import { isUnixError } from '@pkg/typings/unix.interface';
+import { ContainerEngine } from '@pkg/config/settings';
+import { t } from '@pkg/main/i18n';
+import mainEvents from '@pkg/main/mainEvents';
 import DownloadProgressListener from '@pkg/utils/DownloadProgressListener';
 import * as childProcess from '@pkg/utils/childProcess';
-import fetch from '@pkg/utils/fetch';
+import { SemanticVersionEntry } from '@pkg/utils/kubeVersions';
 import Latch from '@pkg/utils/latch';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
 import { executable } from '@pkg/utils/resources';
 import safeRename from '@pkg/utils/safeRename';
 import { jsonStringifyWithWhiteSpace } from '@pkg/utils/stringify';
-import { defined, RecursivePartial, RecursiveTypes } from '@pkg/utils/typeUtils';
+import { defined, RecursivePartial, RecursiveReadonly, RecursiveTypes } from '@pkg/utils/typeUtils';
 import { showMessageBox } from '@pkg/window';
 
 import type Electron from 'electron';
@@ -40,16 +41,22 @@ import type Electron from 'electron';
 const console = Logging.k8s;
 
 /**
- * ShortVersion is the version string without any k3s suffixes; this is the
- * version we present to the user.
+ * ShortVersion is the version string without any k3s suffixes, nor a "v"
+ * prefix; this is the version we present to the user.
  */
 export type ShortVersion = string;
+
+let isOnline = true;
+
+mainEvents.on('update-network-status', (connected) => {
+  isOnline = connected;
+});
 
 export interface ReleaseAPIEntry {
   tag_name: string;
   assets: {
     browser_download_url: string;
-    name: string;
+    name:                 string;
   }[];
 }
 
@@ -59,21 +66,37 @@ export class NoCachedK3sVersionsError extends Error {
 const CURRENT_CACHE_VERSION = 2 as const;
 
 /** cacheData describes the JSON data we write to the cache. */
-type cacheData = {
+interface cacheData {
   cacheVersion?: typeof CURRENT_CACHE_VERSION;
   /** List of available versions; includes build information. */
-  versions: string[];
+  versions:      string[];
   /** Mapping of channel labels to current version (excluding build information). */
-  channels: Record<string, string>;
-};
+  channels:      Record<string, ShortVersion>;
+}
+
+function isErrorWithCode(error: unknown): error is { code: string | number } {
+  if (typeof error !== 'object' || error === null || !('code' in error)) {
+    return false;
+  }
+
+  return typeof error.code === 'string' || typeof error.code === 'number';
+}
 
 /**
  * RequiresRestartSeverityChecker is a function that will be used to determine
  * whether a given settings change will require a reset (i.e. deleting user
  * workloads).
+ * @param currentValue The current value of the setting.
+ * @param desiredValue The desired value of the setting.
+ * @param allSettings The full merged settings object.
+ * @returns 'restart' if a restart is required, 'reset' if a reset is required,
+ *         or false if no restart is required.
  */
-type RequiresRestartSeverityChecker<K extends keyof RecursiveTypes<K8s.BackendSettings>> =
-  (currentValue: RecursiveTypes<K8s.BackendSettings>[K], desiredValue: RecursiveTypes<K8s.BackendSettings>[K]) => 'restart' | 'reset';
+type RequiresRestartSeverityChecker<K extends keyof RecursiveTypes<K8s.BackendSettings>> = (
+  currentValue: RecursiveTypes<K8s.BackendSettings>[K],
+  desiredValue: RecursiveTypes<K8s.BackendSettings>[K],
+  allSettings: RecursiveReadonly<K8s.BackendSettings>,
+) => 'restart' | 'reset' | false;
 
 /**
  * RequiresRestartCheckers defines a mapping of settings (in dot-separated form)
@@ -90,7 +113,7 @@ type RequiresRestartCheckers = {
  */
 export type ExtraRequiresReasons = {
   [K in keyof RecursiveTypes<K8s.BackendSettings>]?: {
-    current: RecursiveTypes<K8s.BackendSettings>[K];
+    current:   RecursiveTypes<K8s.BackendSettings>[K];
     severity?: RequiresRestartSeverityChecker<K>;
   }
 };
@@ -112,31 +135,6 @@ export class ChannelMapping {
 }
 
 /**
- * VersionEntry implements K8s.VersionEntry.
- *
- * This only exists to aid in debugging (by implementing util.debug.custom).
- * This is only exported for tests.
- */
-export class VersionEntry implements K8s.VersionEntry {
-  version: semver.SemVer;
-  channels?: string[];
-
-  constructor(version: semver.SemVer, channels: string[] = []) {
-    this.version = version;
-    if (channels.length > 0) {
-      this.channels = channels;
-    }
-  }
-
-  [util.inspect.custom](depth: number, options: util.InspectOptionsStylized) {
-    return util.inspect({
-      ...this,
-      version: this.version.raw,
-    }, { ...options, depth });
-  }
-}
-
-/**
  * Given a version, return the K3s build version.
  *
  * Note that this is only exported for testing.
@@ -154,9 +152,14 @@ export default class K3sHelper extends events.EventEmitter {
   protected readonly channelApiAccept = 'application/json';
   protected readonly releaseApiUrl = 'https://api.github.com/repos/k3s-io/k3s/releases?per_page=100';
   protected readonly releaseApiAccept = 'application/vnd.github.v3+json';
+  protected readonly resourcesPath = path.join(paths.resources, 'k3s-versions.json');
   protected readonly cachePath = path.join(paths.cache, 'k3s-versions.json');
-  protected readonly minimumVersion = new semver.SemVer('1.15.0');
-  protected versionFromChannel: Record<string, string> = {};
+  protected readonly minimumVersion = new semver.SemVer('1.25.3');
+  /**
+   * versionFromChannel is a mapping from the channel name to the latest (short)
+   * version in that channel.
+   */
+  protected versionFromChannel: Record<string, ShortVersion> = {};
 
   constructor(arch: Architecture) {
     super();
@@ -168,7 +171,7 @@ export default class K3sHelper extends events.EventEmitter {
    * without any build information (since we only ever take the latest build).
    * Note that the key is in the form `1.0.0` (i.e. without the `v` prefix).
    */
-  protected versions: Record<ShortVersion, VersionEntry> = {};
+  protected versions: Record<ShortVersion, SemanticVersionEntry> = {};
 
   protected pendingNetworkSetup = Latch();
   protected pendingInitialize: Promise<void> | undefined;
@@ -182,8 +185,17 @@ export default class K3sHelper extends events.EventEmitter {
    */
   protected async readCache() {
     try {
-      const cacheData: cacheData =
-        JSON.parse(await fs.promises.readFile(this.cachePath, 'utf-8'));
+      let cacheData: cacheData;
+
+      try {
+        cacheData = JSON.parse(await fs.promises.readFile(this.cachePath, 'utf-8'));
+        if (cacheData.cacheVersion !== CURRENT_CACHE_VERSION) {
+          throw new Error(`Invalid cache version ${ cacheData.cacheVersion }`);
+        }
+      } catch (ex) {
+        console.debug('Failed to read cached k3s versions; falling back to bundled versions list:', ex);
+        cacheData = JSON.parse(await fs.promises.readFile(this.resourcesPath, 'utf-8'));
+      }
 
       if (cacheData.cacheVersion !== CURRENT_CACHE_VERSION) {
         // If the cache format version is different, ignore the cache.
@@ -195,8 +207,8 @@ export default class K3sHelper extends events.EventEmitter {
       for (const versionString of cacheData.versions) {
         const version = semver.parse(versionString);
 
-        if (version) {
-          this.versions[version.version] = new VersionEntry(version);
+        if (version && semver.gte(version, this.minimumVersion)) {
+          this.versions[version.version] = new SemanticVersionEntry(version);
         }
       }
 
@@ -287,7 +299,7 @@ export default class K3sHelper extends events.EventEmitter {
 
       return true;
     }
-    if (version < this.minimumVersion) {
+    if (version.compare(this.minimumVersion) < 0) {
       console.log(`Version ${ version } is less than the minimum ${ this.minimumVersion }, skipping.`);
 
       // We may have new patch versions for really old releases; fetch more.
@@ -329,7 +341,7 @@ export default class K3sHelper extends events.EventEmitter {
       const foundImage = this.filenames.images.find(name => entry.assets.some(v => v.name === name));
 
       if (foundImage) {
-        this.versions[version.version] = new VersionEntry(version);
+        this.versions[version.version] = new SemanticVersionEntry(version);
         console.log(`Adding version ${ version.raw } - ${ foundImage }`);
       } else {
         console.debug(`Skipping version ${ version.raw } due to missing image`);
@@ -345,10 +357,10 @@ export default class K3sHelper extends events.EventEmitter {
    * Produce a promise that is resolved after a short delay, used for retrying
    * API requests when GitHub API requests are being rate-limited.
    */
-  protected async delayForWaitLimiting(): Promise<void> {
+  protected async delayForWaitLimiting(duration = 1_000): Promise<void> {
     // This is a separate method so that we could override it in the tests.
     // Jest cannot override setTimeout: https://stackoverflow.com/q/52727220/
-    await util.promisify(setTimeout)(1_000);
+    await util.promisify(setTimeout)(duration);
   }
 
   /**
@@ -372,6 +384,10 @@ export default class K3sHelper extends events.EventEmitter {
     return a.localeCompare(b);
   }
 
+  /**
+   * Fetch the list of available Kubernetes versions.
+   * @throws If there were issues fetching the list of versions.
+   */
   protected async updateCache(): Promise<void> {
     try {
       let wantMoreVersions = true;
@@ -384,15 +400,11 @@ export default class K3sHelper extends events.EventEmitter {
       let channelResponse: Response;
 
       try {
-        const headers: HeadersInit = { Accept: this.channelApiAccept };
-
-        if (process.env.GITHUB_TOKEN) {
-          headers.Authorization = `Bearer ${ process.env.GITHUB_TOKEN }`;
-        }
-        channelResponse = await fetch(this.channelApiUrl, { headers });
+        channelResponse = await net.fetch(this.channelApiUrl,
+          { headers: { Accept: this.channelApiAccept } });
       } catch (ex: any) {
         console.log(`updateCache: error: ${ ex }`);
-        if (!(await checkConnectivity('k3s.io'))) {
+        if (!isOnline) {
           return;
         }
 
@@ -400,10 +412,30 @@ export default class K3sHelper extends events.EventEmitter {
       }
 
       if (channelResponse.ok) {
-        const channels = (await channelResponse.json()) as { data?: { name: string, latest: string }[] };
+        const ValidResourceTypes = ['channel', 'channels'];
+        const DataTypeChannel = 'channel';
+
+        interface ChannelResponse {
+          resourceType: string;
+          data?: {
+            type:   typeof DataTypeChannel;
+            name:   string;
+            latest: string;
+          }[];
+        }
+        const channels: ChannelResponse = await channelResponse.json();
 
         console.debug(`Got K3s update channel data: ${ channels.data?.map(ch => ch.name) }`);
+        if (!ValidResourceTypes.includes(channels.resourceType)) {
+          throw new Error(`Channel response does not have correct resource type: ${ channels.resourceType }`);
+        }
+
         for (const channel of channels.data ?? []) {
+          if (channel.type !== DataTypeChannel) {
+            // The channel entry is invalid; ignore it.
+            continue;
+          }
+
           const version = semver.parse(channel.latest);
 
           if (version) {
@@ -419,13 +451,15 @@ export default class K3sHelper extends events.EventEmitter {
         if (process.env.GITHUB_TOKEN) {
           headers.Authorization = `Bearer ${ process.env.GITHUB_TOKEN }`;
         }
-        const response = await fetch(url, { headers });
+        const response = await net.fetch(url, { headers });
 
         console.debug(`Fetching releases from ${ url } -> ${ response.statusText }`);
         if (!response.ok) {
           if (response.status === 403 && response.headers.get('X-RateLimit-Remaining') === '0') {
             // We hit the rate limit; try again after a delay.
-            await this.delayForWaitLimiting();
+            // If given, the rate limit reset time is in seconds since UTC epoch.
+            const resetTime = parseInt(response.headers.get('X-RateLimit-Reset') ?? '0', 10);
+            await this.delayForWaitLimiting(Math.min(1_000, resetTime * 1_000 - Date.now()));
             continue;
           }
           throw new Error(`Could not fetch releases: ${ response.statusText }`);
@@ -470,6 +504,7 @@ export default class K3sHelper extends events.EventEmitter {
             entry.channels.push(channel);
             entry.channels.sort(this.compareChannels);
           }
+          this.versionFromChannel[channel] = version.version;
         }
       }
 
@@ -506,6 +541,7 @@ export default class K3sHelper extends events.EventEmitter {
    */
   initialize(): Promise<void> {
     if (!this.pendingInitialize) {
+      this.versionFromChannel = {};
       this.pendingInitialize = (async() => {
         await this.readCache();
         if (Object.keys(this.versions).length > 0) {
@@ -516,10 +552,14 @@ export default class K3sHelper extends events.EventEmitter {
 
           return;
         }
-        await this.updateCache();
+        try {
+          await this.updateCache();
+        } catch (ex) {
+          console.log(`Ignoring failure to get initial versions list: ${ ex }`);
+          // At this point this.versions is still empty.
+        }
       })();
     }
-    this.versionFromChannel = {};
 
     return this.pendingInitialize;
   }
@@ -538,7 +578,7 @@ export default class K3sHelper extends events.EventEmitter {
       return undefined;
     }
 
-    const line = stdout.split('/\r?\n/').find(line => /^k3s version /.test(line));
+    const line = stdout.split('/\r?\n/').find(line => line.startsWith('k3s version '));
 
     if (!line) {
       console.debug(`K3s version not in --version output.`);
@@ -561,23 +601,24 @@ export default class K3sHelper extends events.EventEmitter {
 
   /**
    * The versions that are available to install.
+   * @note The list will be empty if the machine is offline and we have no
+   * cached versions.
    */
-  get availableVersions(): Promise<K8s.VersionEntry[]> {
+  get availableVersions(): Promise<SemanticVersionEntry[]> {
     return (async() => {
       await this.initialize();
-      const upstreamSeemsReachable = await checkConnectivity('k3s.io');
       const wrappedVersions = Object.values(this.versions);
-      const finalOptions = upstreamSeemsReachable ? wrappedVersions : await K3sHelper.filterVersionsAgainstCache(wrappedVersions);
+      const finalOptions = isOnline ? wrappedVersions : await K3sHelper.filterVersionsAgainstCache(wrappedVersions);
 
       return finalOptions.sort((a, b) => b.version.compare(a.version));
     })();
   }
 
-  static async cachedVersionsOnly(): Promise<boolean> {
-    return !(await checkConnectivity('k3s.io'));
+  static cachedVersionsOnly(): Promise<boolean> {
+    return Promise.resolve(!isOnline);
   }
 
-  static async filterVersionsAgainstCache(fullVersionList: K8s.VersionEntry[]): Promise<K8s.VersionEntry[]> {
+  static async filterVersionsAgainstCache(fullVersionList: SemanticVersionEntry[]): Promise<SemanticVersionEntry[]> {
     try {
       const cacheDir = path.join(paths.cache, 'k3s');
       const k3sFilenames = (await fs.promises.readdir(cacheDir))
@@ -629,14 +670,14 @@ export default class K3sHelper extends events.EventEmitter {
    * that is considered closest to the desired version:
    *
    * @precondition the desired version wasn't found
-   * @param desiredVersion: a semver for the version currently specified in the config
-   * @param k3sNames: typically a list of names like 'v1.2.3+k3s4'
+   * @param desiredVersion a semver for the version currently specified in the config
+   * @param k3sNames typically a list of names like 'v1.2.3+k3s4'
    * @returns {semver.SemVer} the oldest version newer than the desired version
    *      If there is more than one such version, favor the one with the highest '+k3s' build version
    *      If there are none, the newest version older than the desired version
    * @throws {NoCachedK3sVersionsError} if no names are suitable
    */
-  protected static selectClosestSemVer(desiredVersion: semver.SemVer, k3sNames: Array<string>): semver.SemVer {
+  protected static selectClosestSemVer(desiredVersion: semver.SemVer, k3sNames: string[]): semver.SemVer {
     const existingVersions = k3sNames.map(filename => semver.parse(filename)).filter(defined);
 
     if (existingVersions.length === 0) {
@@ -658,7 +699,7 @@ export default class K3sHelper extends events.EventEmitter {
 
   protected static k3sValue(v: semver.SemVer): number {
     try {
-      return parseInt((v.build[0] as string).replace('k3s', ''), 10) || 0;
+      return parseInt((v.build[0]).replace('k3s', ''), 10) || 0;
     } catch {
       return 0;
     }
@@ -673,7 +714,7 @@ export default class K3sHelper extends events.EventEmitter {
    * @returns {Array<semver.SemVer>}: existingVersions,
    *          with lower-build versions culled out as described above.
    */
-  protected static keepHighestBuildVersion(existingVersions: Array<semver.SemVer>): Array<semver.SemVer> {
+  protected static keepHighestBuildVersion(existingVersions: semver.SemVer[]): semver.SemVer[] {
     // Keep only the highest build for each version
     return existingVersions.filter((v, i) => {
       const next = existingVersions[i + 1];
@@ -765,14 +806,14 @@ export default class K3sHelper extends events.EventEmitter {
         const namearray = Array.isArray(filename) ? filename : [filename];
 
         let outPath;
-        let response;
+        let response: Response | undefined;
 
         for (const name of namearray) {
           const fileURL = `${ this.downloadUrl }/${ version.raw }/${ name }`;
 
           outPath = path.join(workDir, name);
           console.log(`Will attempt to download ${ filekey } ${ fileURL } to ${ outPath }`);
-          response = await fetch(fileURL);
+          response = await net.fetch(fileURL);
           if (response.ok) {
             break;
           }
@@ -780,6 +821,14 @@ export default class K3sHelper extends events.EventEmitter {
 
         if (!response || !outPath) {
           throw new Error(`Error downloading ${ filename } ${ version }: No ${ filekey }s found`);
+        }
+
+        // response.body implements ReadableStream, but it uses a different set
+        // of typings so TypeScript doesn't understand it natively.
+        const body: NodeJS.ReadableStream | null = response.body as any;
+
+        if (!body) {
+          throw new Error(`Error downloading ${ filename } ${ version }: No response body`);
         }
 
         const progresskey = filekey as keyof typeof K3sHelper.prototype.filenames;
@@ -790,7 +839,7 @@ export default class K3sHelper extends events.EventEmitter {
         const writeStream = fs.createWriteStream(outPath);
 
         status.max = parseInt(response.headers.get('Content-Length') || '0');
-        await util.promisify(stream.pipeline)(response.body, progress, writeStream);
+        await util.promisify(stream.pipeline)(body, progress, writeStream);
       }));
 
       const error = await verifyChecksums(workDir);
@@ -822,6 +871,7 @@ export default class K3sHelper extends events.EventEmitter {
    */
   async waitForServerReady(getHost: () => Promise<string | undefined>, port: number): Promise<void> {
     let host: string | undefined;
+    let waitingForHost = false;
 
     console.log(`Waiting for K3s server to be ready on port ${ port }...`);
     while (true) {
@@ -829,6 +879,10 @@ export default class K3sHelper extends events.EventEmitter {
         host = await getHost();
 
         if (typeof host === 'undefined') {
+          if (!waitingForHost) {
+            console.log('Server host address is not known yet; waiting...');
+            waitingForHost = true;
+          }
           await util.promisify(setTimeout)(500);
           continue;
         }
@@ -866,7 +920,7 @@ export default class K3sHelper extends events.EventEmitter {
         });
         break;
       } catch (error) {
-        if (!isUnixError(error)) {
+        if (!isErrorWithCode(error)) {
           console.error(error);
 
           return;
@@ -999,7 +1053,7 @@ export default class K3sHelper extends events.EventEmitter {
       const userYAML = this.ensureContentsAreYAML(exportConfig(userConfig));
       const writeStream = fs.createWriteStream(workPath, { mode: 0o600 });
 
-      await new Promise((resolve, reject) => {
+      await new Promise<void>((resolve, reject) => {
         writeStream.on('error', reject);
         writeStream.on('finish', resolve);
         writeStream.end(userYAML, 'utf-8');
@@ -1058,28 +1112,45 @@ export default class K3sHelper extends events.EventEmitter {
     while (Date.now() < deadline) {
       try {
         const customApi = client.k8sClient.makeApiClient(CustomObjectsApi);
-        const { body: response } = await customApi.listNamespacedCustomObject('helm.cattle.io', 'v1', 'kube-system', 'helmcharts');
-        const charts: V1HelmChart[] = (response as any)?.items ?? [];
+        const response = await customApi.listNamespacedCustomObject({
+          group:     'helm.cattle.io',
+          version:   'v1',
+          namespace: 'kube-system',
+          plural:    'helmcharts',
+        });
+        const charts: V1HelmChart[] = response?.items ?? [];
 
         await Promise.all(charts.filter((chart) => {
           const annotations = chart.metadata?.annotations ?? {};
+          const name = chart.metadata?.name;
 
-          return chart.metadata?.name && (annotations['objectset.rio.cattle.io/owner-name'] === ownerName);
+          // Leave `-crd` charts to k3s, whose `--disable` pass deletes them soon
+          // after. That gives Helm time to uninstall the release, because once
+          // the CRDs are gone the uninstall fails and traefik keeps running.
+          return name && !name.endsWith('-crd') && (annotations['objectset.rio.cattle.io/owner-name'] === ownerName);
         }).map((chart) => {
           const name = chart.metadata?.name;
 
           if (name) {
             console.debug(`Will delete helm chart ${ name }`);
 
-            return customApi.deleteNamespacedCustomObject('helm.cattle.io', 'v1', 'kube-system', 'helmcharts', name);
+            return customApi.deleteNamespacedCustomObject({
+              group:     'helm.cattle.io',
+              version:   'v1',
+              namespace: 'kube-system',
+              plural:    'helmcharts',
+              name,
+            });
           }
-        }));
+        }).filter(defined));
 
         return;
       } catch (ex) {
-        if (ex instanceof HttpError && ex.statusCode === 503) {
-          console.debug(`Got Service Unavailable (${ ex.body.message }), retrying...`);
-          await util.promisify(setTimeout)(1_000);
+        if (ex instanceof ApiException && [429, 503].includes(ex.code)) {
+          const body = typeof ex.body === 'string' ? JSON.parse(ex.body) : ex.body;
+          const delay = body?.details?.retryAfterSeconds || 1;
+          console.debug(`Got Service Unavailable (${ body.reason }: ${ body.message }), retrying...`);
+          await util.promisify(setTimeout)(delay * 1_000);
           continue;
         }
         console.error(`Error uninstalling ${ ownerName }`, ex);
@@ -1129,40 +1200,17 @@ export default class K3sHelper extends events.EventEmitter {
         const homeDirName = os.platform().startsWith('win') ? (findHomeDir() ?? '%HOME%') : '~';
         const kuberlrCacheDirName = `${ os.platform() }-${ process.env.M1 ? 'arm64' : 'amd64' }`;
         const options: Electron.MessageBoxOptions = {
-          message: "Can't download a compatible version of kubectl in offline-mode",
-          detail:  `Please acquire a version in the range ${ major }.${ lowMinor } - ${ major }.${ highMinor } and install in '${ path.join(homeDirName, '.kuberlr', kuberlrCacheDirName) }'`,
+          message: t('dialog.networkFailure.message'),
+          detail:  t('dialog.networkFailure.detail', { range: `${ major }.${ lowMinor } - ${ major }.${ highMinor }`, path: path.join(homeDirName, '.kuberlr', kuberlrCacheDirName) }),
           type:    'error',
-          buttons: ['OK'],
-          title:   'Network failure',
+          buttons: [t('generic.ok')],
+          title:   t('dialog.networkFailure.title'),
         };
 
         await showMessageBox(options, true);
       } else {
         console.log('Failed to match a kuberlr network access issue.');
       }
-    }
-  }
-
-  /**
-   * Check if the given Kubernetes version requires the port forwarding fix
-   * (where we listen on a local port).
-   *
-   * @param version Kubernetes version; null if no Kubernetes will run.
-   */
-  static requiresPortForwardingFix(version: semver.SemVer | undefined): boolean {
-    if (!version) {
-      // When Kubernetes is disabled, don't try to do NodePort forwarding.
-      return false;
-    }
-    switch (true) {
-    case version.major !== 1: return true;
-    case version.minor < 21: return false;
-    case version.minor === 21: return version.patch >= 12;
-    case version.minor === 22: return version.patch >= 10;
-    case version.minor === 23: return version.patch >= 7;
-    case version.minor >= 24: return true;
-    default:
-      throw new Error(`Unexpected Kubernetes version ${ version }`);
     }
   }
 
@@ -1177,6 +1225,36 @@ export default class K3sHelper extends events.EventEmitter {
   ): K8s.RestartReasons {
     const results: K8s.RestartReasons = {};
     const NotFound = Symbol('not-found');
+    const mergedSettings = _.merge({}, currentSettings, desiredSettings);
+
+    function restartIfKubernetesEnabled() {
+      return mergedSettings.kubernetes.enabled ? 'restart' : false;
+    }
+
+    /**
+     * defaultRestartReasonCheckers contains the restart reason checkers shared
+     * between backends.
+     */
+    const defaultRestartReasonCheckers: RequiresRestartCheckers = {
+      'containerEngine.mobyStorageDriver': (current, desired, allSettings) => {
+        // We only need to restart if running moby.
+        return allSettings.containerEngine.name === ContainerEngine.MOBY ? 'restart' : false;
+      },
+      'kubernetes.version': (current, desired, allSettings) => {
+        if (!allSettings.kubernetes.enabled) {
+          return false;
+        }
+        return semver.gt(current || '0.0.0', desired) ? 'reset' : 'restart';
+      },
+      'containerEngine.allowedImages.enabled':            undefined,
+      'containerEngine.name':                             undefined,
+      'experimental.containerEngine.webAssembly.enabled': undefined,
+      'experimental.kubernetes.options.spinkube':         undefined,
+      'kubernetes.enabled':                               undefined,
+      'kubernetes.options.flannel':                       restartIfKubernetesEnabled,
+      'kubernetes.options.traefik':                       restartIfKubernetesEnabled,
+      'kubernetes.port':                                  restartIfKubernetesEnabled,
+    };
 
     /**
      * Check the given settings against the last-applied settings to see if we
@@ -1195,13 +1273,19 @@ export default class K3sHelper extends events.EventEmitter {
         return;
       }
       if (!_.isEqual(current, desired)) {
-        results[key] = {
-          current, desired, severity: checker ? checker(current, desired) : 'restart',
-        };
+        const severity = checker ? checker(current, desired, mergedSettings) : 'restart';
+
+        if (severity) {
+          results[key] = { current, desired, severity };
+        }
       }
     }
 
-    for (const [key, checker] of Object.entries(checkers)) {
+    for (const [key, checker] of Object.entries({ ...defaultRestartReasonCheckers, ...checkers })) {
+      if (checker === null) {
+        // The custom checker wants to delete a default checker.
+        continue;
+      }
       // We need the casts here because TypeScript can't match up the key with
       // its corresponding checker.
       cmp(key as any, checker as any);
@@ -1229,6 +1313,6 @@ export default class K3sHelper extends events.EventEmitter {
 
 interface V1HelmChart {
   apiVersion?: 'helm.cattle.io/v1';
-  kind?: 'HelmChart';
-  metadata?: V1ObjectMeta;
+  kind?:       'HelmChart';
+  metadata?:   V1ObjectMeta;
 }

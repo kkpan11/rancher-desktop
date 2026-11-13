@@ -1,7 +1,7 @@
 <script lang="ts">
 import os from 'os';
 
-import Vue, { VueConstructor } from 'vue';
+import { defineComponent } from 'vue';
 import { mapGetters, mapState } from 'vuex';
 
 import EmptyState from '@pkg/components/EmptyState.vue';
@@ -9,18 +9,13 @@ import PreferencesBody from '@pkg/components/Preferences/ModalBody.vue';
 import PreferencesFooter from '@pkg/components/Preferences/ModalFooter.vue';
 import PreferencesHeader from '@pkg/components/Preferences/ModalHeader.vue';
 import PreferencesNav from '@pkg/components/Preferences/ModalNav.vue';
-import type { NavItemName, TransientSettings } from '@pkg/config/transientSettings';
+import type { TransientSettings } from '@pkg/config/transientSettings';
 import type { ServerState } from '@pkg/main/commandServer/httpCommandServer';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
 import { Direction, RecursivePartial } from '@pkg/utils/typeUtils';
 import { preferencesNavItems } from '@pkg/window/preferenceConstants';
 
-interface VuexBindings {
-  credentials: Omit<ServerState, 'pid'>;
-  getCurrentNavItem: NavItemName;
-}
-
-export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
+export default defineComponent({
   name:       'preferences-modal',
   components: {
     PreferencesHeader, PreferencesNav, PreferencesBody, PreferencesFooter, EmptyState,
@@ -29,11 +24,19 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
   data() {
     return { preferencesLoaded: false };
   },
-  async fetch() {
+  computed: {
+    ...mapGetters('preferences', ['getPreferences', 'hasError']),
+    ...mapGetters('transientSettings', ['getCurrentNavItem']),
+    ...mapState('credentials', ['credentials']),
+    navItems(): { name: string; labelKey: string }[] {
+      return preferencesNavItems.map(({ name, labelKey }) => ({ name, labelKey }));
+    },
+  },
+  async beforeMount() {
     await this.$store.dispatch('credentials/fetchCredentials');
-    await this.$store.dispatch('preferences/fetchPreferences', this.credentials as ServerState);
-    await this.$store.dispatch('preferences/fetchLocked', this.credentials as ServerState);
-    await this.$store.dispatch('transientSettings/fetchTransientSettings', this.credentials as ServerState);
+    await this.$store.dispatch('preferences/fetchPreferences');
+    await this.$store.dispatch('preferences/fetchLocked');
+    await this.$store.dispatch('transientSettings/fetchTransientSettings');
     this.preferencesLoaded = true;
 
     ipcRenderer.on('k8s-integrations', (_, integrations: Record<string, string | boolean>) => {
@@ -43,16 +46,7 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
     ipcRenderer.send('k8s-integrations');
 
     this.$store.dispatch('preferences/setPlatformWindows', os.platform().startsWith('win'));
-  },
-  computed: {
-    ...mapGetters('preferences', ['getPreferences', 'hasError']),
-    ...mapGetters('transientSettings', ['getCurrentNavItem']),
-    ...mapState('credentials', ['credentials']),
-    navItems(): string[] {
-      return preferencesNavItems.map(({ name }) => name);
-    },
-  },
-  beforeMount() {
+
     ipcRenderer.on('route', async(event, args) => {
       await this.navigateToTab(args);
     });
@@ -65,7 +59,7 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
       this.$store.dispatch('transientSettings/setIsArm', isArm);
     });
   },
-  beforeDestroy() {
+  beforeUnmount() {
     /**
      * Removing the listeners resolves the issue of receiving duplicated messages from 'route' channel.
      * Originated by: https://github.com/rancher-sandbox/rancher-desktop/issues/3232
@@ -79,10 +73,7 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
     async commitNavItem(current: string) {
       await this.$store.dispatch(
         'transientSettings/commitPreferences',
-        {
-          ...this.credentials as ServerState,
-          payload: { preferences: { navItem: { current } } } as RecursivePartial<TransientSettings>,
-        },
+        { payload: { preferences: { navItem: { current } } } },
       );
     },
     closePreferences() {
@@ -95,20 +86,11 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
         return;
       }
 
-      await this.$store.dispatch(
-        'preferences/commitPreferences',
-        { ...this.credentials as ServerState },
-      );
+      await this.$store.dispatch('preferences/commitPreferences');
       this.closePreferences();
     },
     async proposePreferences() {
-      const { port, user, password } = this.credentials as ServerState;
-      const { reset } = await this.$store.dispatch(
-        'preferences/proposePreferences',
-        {
-          port, user, password,
-        },
-      );
+      const { reset } = await this.$store.dispatch('preferences/proposePreferences');
 
       if (!reset) {
         return true;
@@ -117,14 +99,14 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
       const cancelPosition = 1;
 
       const result = await ipcRenderer.invoke('show-message-box', {
-        title:    'Rancher Desktop - Reset Kubernetes',
+        title:    this.t('preferences.resetDialog.title'),
         type:     'warning',
-        message:  'Apply preferences and reset Kubernetes?',
-        detail:   'These changes will reset the Kubernetes cluster, which will result in a loss of workloads and container images.',
+        message:  this.t('preferences.resetDialog.message'),
+        detail:   this.t('preferences.resetDialog.detail'),
         cancelId: cancelPosition,
         buttons:  [
-          'Apply and reset',
-          'Cancel',
+          this.t('preferences.resetDialog.apply'),
+          this.t('generic.cancel'),
         ],
       });
 
@@ -133,7 +115,7 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
     reloadPreferences() {
       window.location.reload();
     },
-    async navigateToTab(args: { name?: string, direction?: Direction}) {
+    async navigateToTab(args: { name?: string, direction?: Direction }) {
       const { name, direction } = args;
 
       if (name) {
@@ -144,9 +126,10 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
 
       if (direction) {
         const dir = (direction === 'forward' ? 1 : -1);
-        const idx = (this.navItems.length + this.navItems.indexOf(this.getCurrentNavItem) + dir) % this.navItems.length;
+        const currentIdx = this.navItems.findIndex(item => item.name === this.getCurrentNavItem);
+        const idx = (this.navItems.length + currentIdx + dir) % this.navItems.length;
 
-        await this.commitNavItem(this.navItems[idx]);
+        await this.commitNavItem(this.navItems[idx].name);
       }
     },
   },
@@ -169,10 +152,10 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
       @nav-changed="navChanged"
     />
     <preferences-body
+      v-bind="$attrs"
       class="preferences-body"
       :current-nav-item="getCurrentNavItem"
       :preferences="getPreferences"
-      v-on="$listeners"
     >
       <div
         v-if="hasError"
@@ -180,15 +163,15 @@ export default (Vue as VueConstructor<Vue & VuexBindings>).extend({
       >
         <empty-state
           icon="icon-warning"
-          heading="Unable to fetch preferences"
-          body="Reload Preferences to try again."
+          :heading="t('preferences.error.heading')"
+          :body="t('preferences.error.body')"
         >
           <template #primary-action>
             <button
               class="btn role-primary"
               @click="reloadPreferences"
             >
-              Reload preferences
+              {{ t('preferences.error.reload') }}
             </button>
           </template>
         </empty-state>

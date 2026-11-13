@@ -1,19 +1,20 @@
 <script lang="ts">
-import Vue from 'vue';
-import { mapGetters } from 'vuex';
+import { defineComponent } from 'vue';
 
 import { State as K8sState } from '@pkg/backend/backend';
+import { mapTypedGetters, mapTypedState } from '@pkg/entry/store';
 
-export default Vue.extend({
-  name:     'dashboard-button',
+export default defineComponent({
+  name:     'dashboard-open',
   computed: {
-    ...mapGetters('preferences', ['getPreferences']),
-    ...mapGetters('k8sManager', { k8sState: 'getK8sState' }),
+    ...mapTypedGetters('preferences', ['getPreferences']),
+    ...mapTypedGetters('k8sManager', { k8sState: 'getK8sState' }),
+    ...mapTypedState('steve', ['port']),
     kubernetesEnabled(): boolean {
       return this.getPreferences.kubernetes.enabled;
     },
-    kubernetesStarted(): boolean {
-      return this.k8sState === K8sState.STARTED;
+    dashboardReady(): boolean {
+      return this.k8sState === K8sState.STARTED && this.port > 0;
     },
   },
   methods: {
@@ -27,7 +28,7 @@ export default Vue.extend({
 <template>
   <button
     v-if="kubernetesEnabled"
-    :disabled="!kubernetesStarted"
+    :disabled="!dashboardReady"
     class="btn role-secondary btn-icon-text"
     @click="openDashboard"
   >

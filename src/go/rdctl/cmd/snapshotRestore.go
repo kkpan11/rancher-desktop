@@ -7,9 +7,10 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/spf13/cobra"
+
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/runner"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/snapshot"
-	"github.com/spf13/cobra"
 )
 
 var snapshotRestoreCmd = &cobra.Command{
@@ -18,16 +19,16 @@ var snapshotRestoreCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmd.SilenceUsage = true
-		return exitWithJsonOrErrorCondition(restoreSnapshot(cmd, args))
+		return exitWithJSONOrErrorCondition(restoreSnapshot(args[0]))
 	},
 }
 
 func init() {
 	snapshotCmd.AddCommand(snapshotRestoreCmd)
-	snapshotRestoreCmd.Flags().BoolVarP(&outputJsonFormat, "json", "", false, "output json format")
+	snapshotRestoreCmd.Flags().BoolVarP(&outputJSONFormat, "json", "", false, "output json format")
 }
 
-func restoreSnapshot(cmd *cobra.Command, args []string) error {
+func restoreSnapshot(name string) error {
 	manager, err := snapshot.NewManager()
 	if err != nil {
 		return fmt.Errorf("failed to create snapshot manager: %w", err)
@@ -39,14 +40,14 @@ func restoreSnapshot(cmd *cobra.Command, args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGHUP, syscall.SIGTERM)
 	defer stop()
 	stopAfterFunc := context.AfterFunc(ctx, func() {
-		if !outputJsonFormat {
+		if !outputJSONFormat {
 			fmt.Println("Cancelling snapshot restoration...")
 		}
 	})
 	defer stopAfterFunc()
-	err = manager.Restore(ctx, args[0])
+	err = manager.Restore(ctx, name)
 	if err != nil && !errors.Is(err, runner.ErrContextDone) {
-		return fmt.Errorf("failed to restore snapshot %q: %w", args[0], err)
+		return fmt.Errorf("failed to restore snapshot %q: %w", name, err)
 	}
 	return nil
 }

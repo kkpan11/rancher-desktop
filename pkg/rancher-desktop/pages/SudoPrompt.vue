@@ -6,15 +6,15 @@
 <template>
   <div class="contents">
     <h2>{{ t('sudoPrompt.title') }}</h2>
-    <p>{{ t('sudoPrompt.message', { }, true) }}</p>
+    <p>{{ t('sudoPrompt.message') }}</p>
     <ul class="reasons">
       <li
         v-for="(paths, reason) in explanations"
         :key="reason"
       >
         <details>
-          <summary>{{ SUDO_REASON_DESCRIPTION[reason].title }}</summary>
-          <p>{{ SUDO_REASON_DESCRIPTION[reason].description.replace(/\s+/g, ' ') }}</p>
+          <summary>{{ reasonTitle(reason) }}</summary>
+          <p>{{ reasonDescription(reason) }}</p>
           <p>{{ t('sudoPrompt.explanation') }}</p>
           <code>
             <ul>
@@ -32,8 +32,8 @@
     <p>{{ t('sudoPrompt.messageSecondPart') }}</p>
     <checkbox
       id="suppress"
-      v-model="suppress"
-      label="Always run without administrative access"
+      v-model:value="suppress"
+      :label="t('sudoPrompt.alwaysRunWithout')"
     />
     <button
       ref="accept"
@@ -47,38 +47,27 @@
 
 <script lang="ts">
 import { Checkbox } from '@rancher/components';
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
 
 type SudoReason = 'networking' | 'docker-socket';
 
-/**
- * SUDO_REASON_DESCRIPTION contains text on why we want sudo access.
- * @todo Put this in i18n
- */
-const SUDO_REASON_DESCRIPTION: Record<SudoReason, {title: string, description: string}> = {
-  networking: {
-    title:       'Configure networking',
-    description: `Provides bridged networking so that it is easier to access your
-                  containers.  If this is not allowed, containers will only be accessible via
-                  port forwarding.`,
-  },
-  'docker-socket': {
-    title:       'Set up default docker socket',
-    description: 'Provides compatibility with tools that use the docker socket without the ability to use docker contexts.',
-  },
+/** Maps SudoReason values to translation key segments. */
+const REASON_KEY: Record<SudoReason, string> = {
+  networking:      'networking',
+  'docker-socket': 'dockerSocket',
 };
 
-export default Vue.extend({
+export default defineComponent({
+  name:       'sudo-prompt-dialog',
   components: { Checkbox },
   layout:     'dialog',
   data() {
     return {
-      explanations: {} as Partial<Record<SudoReason, string[]>>,
+      explanations: {},
       sized:        false,
       suppress:     false,
-      SUDO_REASON_DESCRIPTION,
     };
   },
   mounted() {
@@ -95,6 +84,12 @@ export default Vue.extend({
       // Manually send the result, because we won't get an event here.
       ipcRenderer.send('sudo-prompt/closed', this.suppress);
       window.close();
+    },
+    reasonTitle(reason: SudoReason): string {
+      return this.t(`sudoPrompt.reasons.${ REASON_KEY[reason] }.title`);
+    },
+    reasonDescription(reason: SudoReason): string {
+      return this.t(`sudoPrompt.reasons.${ REASON_KEY[reason] }.description`);
     },
   },
 });

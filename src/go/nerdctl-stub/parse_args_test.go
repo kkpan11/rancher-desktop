@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -202,7 +203,7 @@ func TestParse(t *testing.T) {
 		result, err := c.parse([]string{"hello", "world"})
 		assert.NoError(t, err)
 		if assert.NotNil(t, result) {
-			assert.Equal(t, []string{"hello", "world"}, result.args)
+			assert.Equal(t, []string{"--", "hello", "world"}, result.args)
 		}
 	})
 	t.Run("subcommand handler", func(t *testing.T) {
@@ -211,6 +212,9 @@ func TestParse(t *testing.T) {
 		localCommands := make(map[string]commandDefinition)
 		localCommands[""] = commandDefinition{
 			commands: &localCommands,
+			subcommands: map[string]struct{}{
+				"subcommand": {},
+			},
 		}
 		localCommands["subcommand"] = commandDefinition{
 			commands: &localCommands,
@@ -224,4 +228,126 @@ func TestParse(t *testing.T) {
 		assert.NoError(t, err)
 		assert.True(t, run)
 	})
+	t.Run("subcommand with mixed arguments", func(t *testing.T) {
+		t.Parallel()
+		var seenArgs []string
+		localCommands := make(map[string]commandDefinition)
+		localCommands[""] = commandDefinition{
+			commands: &localCommands,
+			subcommands: map[string]struct{}{
+				"subcommand": {},
+			},
+			options: map[string]argHandler{
+				"--foo": ignoredArgHandler,
+			},
+		}
+		localCommands["subcommand"] = commandDefinition{
+			commandPath: "subcommand",
+			commands:    &localCommands,
+			options: map[string]argHandler{
+				"--bar": ignoredArgHandler,
+			},
+			handler: func(cd *commandDefinition, s []string, argHandlers argHandlersType) (*parsedArgs, error) {
+				seenArgs = s
+				return &parsedArgs{}, nil
+			},
+		}
+		result, err := localCommands[""].parse([]string{"subcommand", "--foo", "FOO", "qq", "--bar", "BAR", "zz"})
+		if assert.NoError(t, err) {
+			assert.Equal(t, []string{"qq", "zz"}, seenArgs)
+			// Because we have a custom handler, they don't show up in result.args
+			assert.Equal(t, []string{"subcommand", "--foo", "FOO", "--bar", "BAR"}, result.args)
+		}
+	})
+	t.Run("subcommand with foreign flags", func(t *testing.T) {
+		t.Parallel()
+		var seenArgs []string
+		localCommands := make(map[string]commandDefinition)
+		localCommands[""] = commandDefinition{
+			commands: &localCommands,
+			subcommands: map[string]struct{}{
+				"subcommand": {},
+			},
+			options: map[string]argHandler{
+				"--foo": ignoredArgHandler,
+			},
+		}
+		localCommands["subcommand"] = commandDefinition{
+			commandPath: "subcommand",
+			commands:    &localCommands,
+			options: map[string]argHandler{
+				"--bar": ignoredArgHandler,
+			},
+			hasForeignFlags: true,
+			handler: func(cd *commandDefinition, s []string, argHandlers argHandlersType) (*parsedArgs, error) {
+				seenArgs = s
+				return &parsedArgs{}, nil
+			},
+		}
+		result, err := localCommands[""].parse([]string{"subcommand", "--foo", "FOO", "qq", "--bar", "BAR", "zz"})
+		if assert.NoError(t, err) {
+			assert.Equal(t, []string{"qq", "--bar", "BAR", "zz"}, seenArgs)
+			// Because we have a custom handler, they don't show up in result.args
+			assert.Equal(t, []string{"subcommand", "--foo", "FOO"}, result.args)
+		}
+	})
+	t.Run("compose down volumes flag is boolean", func(t *testing.T) {
+		t.Parallel()
+		for _, flag := range []string{"--volumes", "-v"} {
+			t.Run(flag, func(t *testing.T) {
+				t.Parallel()
+				result, err := commands[""].parse([]string{"compose", "down", flag})
+				if assert.NoError(t, err) {
+					assert.Equal(t, []string{"compose", "down", flag}, result.args)
+				}
+			})
+		}
+		t.Run("--volumes=false", func(t *testing.T) {
+			t.Parallel()
+			result, err := commands[""].parse([]string{"compose", "down", "--volumes=false"})
+			if assert.NoError(t, err) {
+				assert.Equal(t, []string{"compose", "down", "--volumes=false"}, result.args)
+			}
+		})
+	})
+}
+
+// TestPathArgHandlers checks that options whose values contain host paths are
+// registered with the matching path handler instead of the default
+// ignoredArgHandler that leaves the value untranslated.
+func TestPathArgHandlers(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		command string
+		option  string
+		handler argHandler
+	}{
+		{"builder build", "--output", argHandlers.builderCacheArgHandler},
+		{"builder build", "-o", argHandlers.builderCacheArgHandler},
+		{"builder build", "--secret", argHandlers.builderCacheArgHandler},
+		{"builder debug", "--secret", argHandlers.builderCacheArgHandler},
+		{"container exec", "--env-file", argHandlers.filePathArgHandler},
+		{"image convert", "--zstdchunked-record-in", argHandlers.filePathArgHandler},
+		{"image decrypt", "--key", argHandlers.filePathArgHandler},
+		{"image encrypt", "--key", argHandlers.filePathArgHandler},
+		{"image pull", "--cosign-key", argHandlers.filePathArgHandler},
+		{"image push", "--cosign-key", argHandlers.filePathArgHandler},
+	}
+	for _, tc := range cases {
+		t.Run(tc.command+" "+tc.option, func(t *testing.T) {
+			t.Parallel()
+			def, ok := commands[tc.command]
+			if !assert.True(t, ok, "command %q not found", tc.command) {
+				return
+			}
+			handler, ok := def.options[tc.option]
+			if !assert.True(t, ok, "option %q of %q not found", tc.option, tc.command) {
+				return
+			}
+			assert.Equal(t,
+				reflect.ValueOf(tc.handler).Pointer(),
+				reflect.ValueOf(handler).Pointer(),
+				"option %s of %q has the wrong handler", tc.option, tc.command)
+		})
+	}
 }

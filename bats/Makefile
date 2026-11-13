@@ -9,19 +9,20 @@ containers:
 # https://www.shellcheck.net/wiki/SC1091 -- Not following: xxx was not specified as input (see shellcheck -x)
 # https://www.shellcheck.net/wiki/SC2034 -- xxx appears unused. Verify use (or export if used externally)
 # https://www.shellcheck.net/wiki/SC2154 -- xxx is referenced but not assigned
+# https://www.shellcheck.net/wiki/SC2218 -- This function is only defined later. Move the definition up.
 
-SC_EXCLUDES ?= SC1091,SC2034,SC2154
+SC_EXCLUDES ?= SC1091,SC2034,SC2154,SC2218
 
 .PHONY: lint
 lint:
 	find tests -name '*.bash' | xargs ./scripts/bats-lint.pl
 	find tests -name '*.bats' | xargs ./scripts/bats-lint.pl
-	find tests -name '*.bash' | xargs shellcheck -s bash -e $(SC_EXCLUDES)
-	find tests -name '*.bats' | xargs shellcheck -s bash -e $(SC_EXCLUDES)
-	find scripts -name '*.sh' | xargs shellcheck -s bash -e $(SC_EXCLUDES)
-	find tests -name '*.bash' | xargs shfmt -s -d
-	find tests -name '*.bats' | xargs shfmt -s -d
-	find scripts -name '*.sh' | xargs shfmt -s -d
+	find tests -name '*.bash' | xargs shellcheck -s bats -e $(SC_EXCLUDES)
+	find tests -name '*.bats' | xargs shellcheck -s bats -e $(SC_EXCLUDES)
+	find scripts ../.github/workflows/bats -name '*.sh' | xargs shellcheck -s bash -e $(SC_EXCLUDES)
+	find tests -name '*.bash' | xargs shfmt --diff
+	find tests -name '*.bats' | xargs shfmt --diff
+	find scripts ../.github/workflows/bats -name '*.sh' | xargs shfmt --diff
 
 DEPS = bin/darwin/jq bin/linux/jq
 

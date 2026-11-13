@@ -17,16 +17,21 @@ limitations under the License.
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/options/generated"
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/utils"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+
+	options "github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/options/generated"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/paths"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/startwait"
 )
 
 // startCmd represents the start command
@@ -46,19 +51,30 @@ If it's running, behaves the same as 'rdctl set ...'.
 
 var applicationPath string
 var noModalDialogs bool
+var waitForStart bool
+var waitTimeout time.Duration
+
+// startPollInterval paces the backend_state polling done by --wait, and
+// defaultWaitTimeout bounds how long that polling continues.
+const (
+	startPollInterval  = 2 * time.Second
+	defaultWaitTimeout = 10 * time.Minute
+)
 
 func init() {
 	rootCmd.AddCommand(startCmd)
 	options.UpdateCommonStartAndSetCommands(startCmd)
 	startCmd.Flags().StringVarP(&applicationPath, "path", "p", "", "path to main executable")
 	startCmd.Flags().BoolVarP(&noModalDialogs, "no-modal-dialogs", "", false, "avoid displaying dialog boxes")
+	startCmd.Flags().BoolVar(&waitForStart, "wait", false, "wait until the backend has finished starting")
+	startCmd.Flags().DurationVar(&waitTimeout, "wait-timeout", defaultWaitTimeout, "how long to wait for start before giving up")
 }
 
 /**
  * If Rancher Desktop is currently running, treat this like a `set` command, and pass all the args to that.
  */
 func doStartOrSetCommand(cmd *cobra.Command) error {
-	_, err := getListSettings()
+	_, err := getListSettings(cmd.Context())
 	if err == nil {
 		// Unavoidable race condition here.
 		// There's no system-wide mutex that will let us guarantee that if rancher desktop is running when
@@ -68,10 +84,34 @@ func doStartOrSetCommand(cmd *cobra.Command) error {
 			// `--path | -p` is not a valid option for `rdctl set...`
 			return fmt.Errorf("--path %q specified but Rancher Desktop is already running", applicationPath)
 		}
-		return doSetCommand(cmd)
+		if err := doSetCommand(cmd); err != nil {
+			return err
+		}
+	} else {
+		cmd.SilenceUsage = true
+		if err := doStartCommand(cmd); err != nil {
+			return err
+		}
 	}
-	cmd.SilenceUsage = true
-	return doStartCommand(cmd)
+	if waitForStart {
+		return waitForBackendStart(cmd.Context())
+	}
+	return nil
+}
+
+// waitForBackendStart blocks until the backend is ready or waitTimeout elapses.
+func waitForBackendStart(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, waitTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(startPollInterval)
+	defer ticker.Stop()
+
+	err := startwait.Wait(ctx, ticker.C, startwait.LiveState)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("timed out after %s waiting for Rancher Desktop to start", waitTimeout)
+	}
+	return err
 }
 
 func doStartCommand(cmd *cobra.Command) error {
@@ -80,7 +120,7 @@ func doStartCommand(cmd *cobra.Command) error {
 		return err
 	}
 	if !cmd.Flags().Changed("path") {
-		applicationPath, err = utils.GetRDPath()
+		applicationPath, err = paths.GetRDLaunchPath(cmd.Context())
 		if err != nil {
 			return fmt.Errorf("failed to locate main Rancher Desktop executable: %w\nplease retry with the --path option", err)
 		}
@@ -88,10 +128,10 @@ func doStartCommand(cmd *cobra.Command) error {
 	if noModalDialogs {
 		commandLineArgs = append(commandLineArgs, "--no-modal-dialogs")
 	}
-	return launchApp(applicationPath, commandLineArgs)
+	return launchApp(cmd.Context(), applicationPath, commandLineArgs)
 }
 
-func launchApp(applicationPath string, commandLineArgs []string) error {
+func launchApp(ctx context.Context, applicationPath string, commandLineArgs []string) error {
 	var commandName string
 	var args []string
 
@@ -109,7 +149,7 @@ func launchApp(applicationPath string, commandLineArgs []string) error {
 	// Include this output because there's a delay before the UI comes up.
 	// Without this line, it might look like the command doesn't work.
 	logrus.Infof("About to launch %s %s ...\n", commandName, strings.Join(args, " "))
-	cmd := exec.Command(commandName, args...)
+	cmd := exec.CommandContext(ctx, commandName, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Start()

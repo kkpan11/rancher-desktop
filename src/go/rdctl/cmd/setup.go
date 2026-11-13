@@ -3,8 +3,9 @@ package cmd
 import (
 	"errors"
 
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/autostart"
 	"github.com/spf13/cobra"
+
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/autostart"
 )
 
 var setupSettings struct {
@@ -17,7 +18,7 @@ var setupCmd = &cobra.Command{
 	Short:  "Configure the system without modifying settings",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if cmd.Flags().Changed("auto-start") {
-			return autostart.EnsureAutostart(setupSettings.AutoStart)
+			return autostart.EnsureAutostart(cmd.Context(), setupSettings.AutoStart)
 		}
 		return errors.New("no changes were specified")
 	},

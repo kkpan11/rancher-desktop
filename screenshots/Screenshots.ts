@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 
 import { expect } from '@playwright/test';
+import which from 'which';
 
 import { NavPage } from '../e2e/pages/nav-page';
 import { PreferencesPage } from '../e2e/pages/preferences';
@@ -14,7 +15,7 @@ import type { Page } from '@playwright/test';
 
 interface ScreenshotsOptions {
   directory: string;
-  log: Log;
+  log:       Log;
 }
 
 export class Screenshots {
@@ -23,15 +24,15 @@ export class Screenshots {
 
   protected windowTitle = '';
   private static screenshotIndex = 0;
-  readonly page: Page;
+  readonly page:      Page;
   readonly directory: string;
-  readonly log: Log;
+  readonly log:       Log;
 
   constructor(page: Page, opt: ScreenshotsOptions) {
     this.page = page;
     const { directory, log } = opt;
 
-    this.directory = path.resolve(__dirname, 'output', os.platform(), directory);
+    this.directory = path.resolve(import.meta.dirname, 'output', os.platform(), directory);
     this.log = log;
   }
 
@@ -76,19 +77,21 @@ export class Screenshots {
     if (!windowId) {
       throw new Error(`Failed to find window ID for ${ this.windowTitle }: ${ stderr || '(no stderr)' }`);
     }
-    await spawnFile('screencapture', ['-o', '-l', windowId.trim(), outPath], { stdio: this.log });
+
+    await spawnFile('screencapture', ['-a', '-o', '-l', windowId.trim(), outPath], { stdio: this.log });
   }
 
   protected async screenshotWindows(outPath: string) {
-    const script = path.resolve(__dirname, 'screenshot.ps1');
+    const script = path.resolve(import.meta.dirname, 'screenshot.ps1');
+    const args = ['-ExecutionPolicy', 'Bypass', script, '-FilePath', outPath, '-Title', `'${ this.windowTitle }'`, '-Foreground'];
 
-    await spawnFile('powershell.exe', [script, '-FilePath', outPath, '-Title', `'${ this.windowTitle }'`], { stdio: this.log });
+    await spawnFile('powershell.exe', args, { stdio: this.log });
   }
 
   protected async screenshotLinux(outPath: string) {
     // Find the target window; note that this is a child window of the window
     // frame, so we can't use it directly.
-    let windowId = '';
+    let windowId;
     let { stdout } = await spawnFile('xwininfo', ['-name', this.windowTitle, '-tree'], { stdio: 'pipe' });
 
     // Walk up the parents of the current window, until the parent is the root window.
@@ -105,7 +108,14 @@ export class Screenshots {
     if (!windowId) {
       throw new Error(`Failed to find window ID for ${ this.windowTitle }`);
     }
-    await spawnFile('import', ['-window', windowId, outPath], { stdio: this.log });
+    // If `gm` is available, use `gm import`; otherwise, use `import`.
+    const args = ['-window', windowId, outPath];
+
+    if (await (which('gm', { nothrow: true }))) {
+      await spawnFile('gm', ['import', ...args], { stdio: this.log });
+    } else {
+      await spawnFile('import', args, { stdio: this.log });
+    }
   }
 }
 
@@ -115,9 +125,7 @@ export class MainWindowScreenshots extends Screenshots {
     this.windowTitle = 'Rancher Desktop';
   }
 
-  async take(tabName: Parameters<NavPage['navigateTo']>[0], navPage?: NavPage, timeout?: number): Promise<void>;
-  async take(screenshotName: string): Promise<void>;
-  async take(name: string, navPage?: NavPage, timeout = 200) {
+  async take(name: Parameters<NavPage['navigateTo']>[0] | string, navPage?: NavPage, timeout = 200) {
     if (navPage) {
       await navPage.navigateTo(name as Parameters<NavPage['navigateTo']>[0]);
       await this.page.waitForTimeout(timeout);
@@ -148,3 +156,19 @@ export class PreferencesScreenshots extends Screenshots {
     await this.screenshot(path);
   }
 }
+
+// If needed, set the screen resolution in CI.
+await (async function() {
+  if (!process.env.CI) {
+    return;
+  }
+  switch (process.platform) {
+  case 'win32': {
+    const script = path.resolve(import.meta.dirname, 'set-display-resolution.ps1');
+    await spawnFile(
+      'powershell.exe',
+      ['-ExecutionPolicy', 'Bypass', script],
+      { stdio: 'inherit' });
+  }
+  }
+})();

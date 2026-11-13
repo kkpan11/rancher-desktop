@@ -24,9 +24,10 @@ import (
 	"os"
 	"regexp"
 
+	"github.com/spf13/cobra"
+
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/client"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/config"
-	"github.com/spf13/cobra"
 )
 
 var apiSettings struct {
@@ -50,9 +51,7 @@ Two ways of specifying a body:
 The API is currently at version 1, but is still considered internal and experimental, and
 is subject to change without any advance notice.
 `,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return doAPICommand(cmd, args)
-	},
+	RunE: doAPICommand,
 }
 
 func init() {
@@ -74,7 +73,7 @@ func doAPICommand(cmd *cobra.Command, args []string) error {
 	}
 	rdClient := client.NewRDClient(connectionInfo)
 
-	if len(args) == 0 || len(args[0]) == 0 {
+	if len(args) == 0 || args[0] == "" {
 		return fmt.Errorf("api command: no endpoint specified")
 	}
 	if len(args) > 1 {
@@ -82,7 +81,7 @@ func doAPICommand(cmd *cobra.Command, args []string) error {
 	}
 	endpoint := args[0]
 	if endpoint != "/" && regexp.MustCompile(`^/v\d+(?:/|$)`).FindString(endpoint) == "" {
-		endpoint = fmt.Sprintf("/%s", client.VersionCommand(client.ApiVersion, endpoint))
+		endpoint = fmt.Sprintf("/%s", client.VersionCommand(client.APIVersion, endpoint))
 	}
 	if apiSettings.InputFile != "" && apiSettings.Body != "" {
 		return fmt.Errorf("api command: --body and --input options cannot both be specified")
@@ -101,19 +100,21 @@ func doAPICommand(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		response, err := rdClient.DoRequestWithPayload(apiSettings.Method, endpoint, bytes.NewBuffer(contents))
-		result, errorPacket, err = client.ProcessRequestForAPI(response, err)
+		method := apiSettings.Method
+		payload := bytes.NewBuffer(contents)
+		result, errorPacket, err = client.ProcessRequestForAPI(rdClient.DoRequestWithPayload(cmd.Context(), method, endpoint, payload))
 	} else if apiSettings.Body != "" {
 		if apiSettings.Method == "" {
 			apiSettings.Method = "PUT"
 		}
-		response, err := rdClient.DoRequestWithPayload(apiSettings.Method, endpoint, bytes.NewBufferString(apiSettings.Body))
-		result, errorPacket, err = client.ProcessRequestForAPI(response, err)
+		method := apiSettings.Method
+		payload := bytes.NewBufferString(apiSettings.Body)
+		result, errorPacket, err = client.ProcessRequestForAPI(rdClient.DoRequestWithPayload(cmd.Context(), method, endpoint, payload))
 	} else {
 		if apiSettings.Method == "" {
 			apiSettings.Method = "GET"
 		}
-		result, errorPacket, err = client.ProcessRequestForAPI(rdClient.DoRequest(apiSettings.Method, endpoint))
+		result, errorPacket, err = client.ProcessRequestForAPI(rdClient.DoRequest(cmd.Context(), apiSettings.Method, endpoint))
 	}
 	return displayAPICallResult(result, errorPacket, err)
 }

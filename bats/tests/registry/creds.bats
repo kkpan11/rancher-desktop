@@ -39,8 +39,7 @@ local_setup() {
         # Essentially localhost, but needs to be a routable IP that also works
         # from inside a container. Will be turned into a DNS name using sslip.io.
         if is_windows; then
-            # In WSL all distros have the same IP address
-            ipaddr="$(ip a show eth0 | awk '/inet / {sub("/.*",""); print $2}')"
+            ipaddr="192.168.143.1"
         else
             # Lima uses a fixed hard-coded IP address
             ipaddr="192.168.5.15"
@@ -69,8 +68,9 @@ create_registry() {
 }
 
 wait_for_registry() {
+    trace "$(ctrctl ps -a)"
     # registry port is forwarded to host
-    try --max 10 --delay 5 curl -k --silent --show-error "https://localhost:$REGISTRY_PORT/v2/_catalog"
+    try --max 20 --delay 5 curl -k --silent --show-error "https://localhost:$REGISTRY_PORT/v2/_catalog"
 }
 
 using_insecure_registry() {
@@ -120,8 +120,7 @@ verify_default_credStore() {
 @test 'verify allowed-images config' {
     run ctrctl pull --quiet "$IMAGE_BUSYBOX"
     if using_image_allow_list; then
-        assert_failure
-        assert_output --regexp "(unauthorized|Forbidden)"
+        assert_refused_by_allow_list
     else
         assert_success
     fi
@@ -162,16 +161,34 @@ verify_default_credStore() {
     rdsudo update-ca-certificates
 }
 
+restart_container_engine() {
+    # BUG BUG BUG
+    # When using containerd, sometimes the container would get wedged on a
+    # restart; however, restarting containerd again seems to fix this.
+    # So we need to keep trying until the registry container is not `created`.
+    # BUG BUG BUG
+    service_control "$CONTAINER_ENGINE_SERVICE" restart
+
+    service_control --ifstarted rd-openresty restart
+
+    wait_for_container_engine
+
+    trace "$(ctrctl ps -a)"
+    if using_containerd; then
+        run ctrctl ps --filter status=created,name=registry --format '{{.Names}}'
+        assert_success
+        refute_output registry
+    fi
+}
+
 @test 'restart container engine to refresh certs' {
     skip_for_insecure_registry
 
-    rdsudo rc-service "$CONTAINER_ENGINE_SERVICE" restart
-    rdsudo rc-service --ifstarted rd-openresty restart
-    wait_for_container_engine
-    # when Moby is stopped, the containers are stopped as well
-    if using_docker; then
-        wait_for_registry
-    fi
+    # Each attempt runs wait_for_container_engine, whose waits already
+    # scale, so scaling the retry as well would square RD_WAIT_FACTOR.
+    try --no-scale restart_container_engine
+
+    wait_for_registry
 }
 
 @test 'expect push image to registry to succeed now' {
@@ -236,7 +253,7 @@ verify_default_credStore() {
 
 @test 'verify the docker-desktop credential helper is replaced with the rancher-desktop default' {
     factory_reset
-    echo '{ "credsStore": "desktop" }' >|"$DOCKER_CONFIG_FILE"
+    create_file "$DOCKER_CONFIG_FILE" <<<'{ "credsStore": "desktop" }'
     start_container_engine
     wait_for_container_engine
     verify_default_credStore

@@ -5,18 +5,17 @@ import { URL } from 'url';
 
 import runCredentialHelper from './credentialUtils';
 
-import { getVtunnelInstance } from '@pkg/main/networking/vtunnel';
 import * as serverHelper from '@pkg/main/serverHelper';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
 import { jsonStringifyWithWhiteSpace } from '@pkg/utils/stringify';
 
-export type ServerState = {
-  user: string;
+export interface ServerState {
+  user:     string;
   password: string;
-  port: number;
-  pid: number;
-};
+  port:     number;
+  pid:      number;
+}
 
 const SERVER_PORT = 6109;
 const console = Logging.server;
@@ -50,11 +49,10 @@ export function getServerCredentialsPath(): string {
 }
 
 function ensureEndsWithNewline(s: string) {
-  return !s || /\n$/.test(s) ? s : `${ s }\n`;
+  return !s || s.endsWith('\n') ? s : `${ s }\n`;
 }
 
 export class HttpCredentialHelperServer {
-  protected vtun = getVtunnelInstance();
   protected server = http.createServer();
   protected password = serverHelper.randomStr();
   protected stateInfo: ServerState = {
@@ -67,16 +65,6 @@ export class HttpCredentialHelperServer {
   protected listenAddr = '127.0.0.1';
 
   async init() {
-    if (process.platform === 'win32') {
-      this.vtun.addTunnel({
-        name:                  'Credential Server',
-        handshakePort:         17362,
-        vsockHostPort:         17361,
-        peerAddress:           this.listenAddr,
-        peerPort:              3030,
-        upstreamServerAddress: `${ this.listenAddr }:${ SERVER_PORT }`,
-      });
-    }
     const statePath = getServerCredentialsPath();
 
     await fs.promises.writeFile(statePath,
@@ -165,7 +153,7 @@ export class HttpCredentialHelperServer {
       erase: requireNoOutput,
       store: requireNoOutput,
     };
-    const checkerFn: checkerFnType|undefined = checkers[commandName];
+    const checkerFn: checkerFnType | undefined = checkers[commandName];
 
     if (request.method !== 'POST') {
       requestCheckError = `Expecting a POST method for the credential-server list request, received ${ request.method }`;

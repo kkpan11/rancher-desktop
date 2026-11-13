@@ -238,7 +238,7 @@ func (b *bindManager) mungeContainersCreateRequest(req *http.Request, contextVal
 
 	for _, mount := range body.HostConfig.Mounts {
 		logEntry := logrus.WithField("mount", fmt.Sprintf("%+v", mount))
-		if mount.Type != "bind" {
+		if mount.Type != models.MountTypeBind {
 			logEntry.Trace("skipping mount of unsupported type")
 			continue
 		}
@@ -332,6 +332,9 @@ func (b *bindManager) mungeContainersCreateResponse(resp *http.Response, context
 // munge incoming request to activate the mount, on
 // POST /containers/{id}/start
 // POST /containers/{id}/restart
+// HEAD /containers/{id}/archive
+// GET /containers/{id}/archive
+// PUT /containers/{id}/archive
 func (b *bindManager) mungeContainersStartRequest(req *http.Request, contextValue *dockerproxy.RequestContextValue, templates map[string]string) error {
 	// Look up all the mappings this container needs
 	mapping := make(map[string]string)
@@ -351,7 +354,7 @@ func (b *bindManager) mungeContainersStartRequest(req *http.Request, contextValu
 		mountPath := path.Join(b.mountRoot, bindKey)
 		logEntry := logrus.WithFields(logrus.Fields{
 			"container": templates["id"],
-			"bind":      mountPath,
+			"path":      mountPath,
 			"target":    target,
 		})
 		err := b.prepareMountPath(target, bindKey)
@@ -375,6 +378,9 @@ func (b *bindManager) mungeContainersStartRequest(req *http.Request, contextValu
 // munge outgoing response to deactivate the mount, on
 // POST /containers/{id}/start
 // POST /containers/{id}/restart
+// HEAD /containers/{id}/archive
+// GET /containers/{id}/archive
+// PUT /containers/{id}/archive
 func (b *bindManager) mungeContainersStartResponse(req *http.Response, contextValue *dockerproxy.RequestContextValue, templates map[string]string) error {
 	binds, ok := (*contextValue)[contextKey].(*map[string]string)
 	if !ok {
@@ -386,9 +392,9 @@ func (b *bindManager) mungeContainersStartResponse(req *http.Response, contextVa
 		mountDir := path.Join(b.mountRoot, bindKey)
 		logEntry := logrus.WithFields(logrus.Fields{
 			"container": templates["id"],
-			"bind":      mountDir,
+			"path":      mountDir,
 		})
-		err := unix.Unmount(mountDir, 0)
+		err := unix.Unmount(mountDir, unix.MNT_DETACH|unix.UMOUNT_NOFOLLOW)
 		if err != nil {
 			logEntry.WithError(err).Error("failed to unmount")
 			return fmt.Errorf("could not unmount bind mount %s: %w", mountDir, err)
@@ -442,4 +448,11 @@ func init() {
 	dockerproxy.RegisterResponseMunger(http.MethodPost, "/containers/{id}/start", b.mungeContainersStartResponse)
 	dockerproxy.RegisterResponseMunger(http.MethodPost, "/containers/{id}/restart", b.mungeContainersStartResponse)
 	dockerproxy.RegisterResponseMunger(http.MethodDelete, "/containers/{id}", b.mungeContainersDeleteResponse)
+
+	dockerproxy.RegisterRequestMunger(http.MethodHead, "/containers/{id}/archive", b.mungeContainersStartRequest)
+	dockerproxy.RegisterResponseMunger(http.MethodHead, "/containers/{id}/archive", b.mungeContainersStartResponse)
+	dockerproxy.RegisterRequestMunger(http.MethodGet, "/containers/{id}/archive", b.mungeContainersStartRequest)
+	dockerproxy.RegisterResponseMunger(http.MethodGet, "/containers/{id}/archive", b.mungeContainersStartResponse)
+	dockerproxy.RegisterRequestMunger(http.MethodPut, "/containers/{id}/archive", b.mungeContainersStartRequest)
+	dockerproxy.RegisterResponseMunger(http.MethodPut, "/containers/{id}/archive", b.mungeContainersStartResponse)
 }

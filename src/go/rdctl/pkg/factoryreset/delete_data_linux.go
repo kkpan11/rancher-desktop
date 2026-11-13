@@ -1,16 +1,19 @@
 package factoryreset
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/autostart"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/paths"
-	"github.com/sirupsen/logrus"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/process"
 )
 
-func DeleteData(appPaths paths.Paths, removeKubernetesCache bool) error {
-	if err := autostart.EnsureAutostart(false); err != nil {
+func DeleteData(ctx context.Context, appPaths *paths.Paths, removeKubernetesCache bool) error {
+	if err := autostart.EnsureAutostart(ctx, false); err != nil {
 		logrus.Errorf("Failed to remove autostart configuration: %s", err)
 	}
 
@@ -19,10 +22,15 @@ func DeleteData(appPaths paths.Paths, removeKubernetesCache bool) error {
 		logrus.Errorf("Error getting home directory: %s", err)
 	}
 
+	if err := process.TerminateProcessInDirectory(appPaths.ExtensionRoot, false); err != nil {
+		logrus.Errorf("Failed to stop extension processes, ignoring: %s", err)
+	}
+
 	pathList := []string{
 		appPaths.AltAppHome,
 		appPaths.Config,
 		appPaths.Logs,
+		appPaths.OldUserData,
 		filepath.Join(homeDir, ".local", "state", "rancher-desktop"),
 	}
 
@@ -35,11 +43,14 @@ func DeleteData(appPaths paths.Paths, removeKubernetesCache bool) error {
 		pathList = append(pathList, filepath.Join(configPath, "Rancher Desktop"))
 	}
 
+	// Remove a downloaded update so it is not installed after the reset.
+	pathList = append(pathList, updaterCacheDir(appPaths))
+
 	if removeKubernetesCache {
 		pathList = append(pathList, appPaths.Cache)
 	} else {
 		pathList = append(pathList, filepath.Join(appPaths.Cache, "updater-longhorn.json"))
 	}
 	pathList = append(pathList, appHomeDirectories(appPaths)...)
-	return deleteUnixLikeData(appPaths, pathList)
+	return deleteUnixLikeData(ctx, appPaths, pathList)
 }

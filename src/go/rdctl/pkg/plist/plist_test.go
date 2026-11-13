@@ -1,23 +1,27 @@
 package plist
 
 import (
-	"github.com/stretchr/testify/assert"
+	"fmt"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+
+	options "github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/options/generated"
 )
 
 func TestJsonToPlistFormat(t *testing.T) {
 	t.Run("handles empty bodies", func(t *testing.T) {
-		s, err := JsonToPlist("{}")
+		s, err := JSONToPlist("{}")
 		assert.NoError(t, err)
-		assert.Equal(t, `<?xml version="1.0" encoding="UTF-8"?>
+		assert.Equal(t, fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
   <dict>
     <key>version</key>
-    <integer>12</integer>
+    <integer>%d</integer>
   </dict>
 </plist>
-`, s)
+`, options.CURRENT_SETTINGS_VERSION), s)
 	})
 
 	t.Run("Handles arrays", func(t *testing.T) {
@@ -25,14 +29,14 @@ func TestJsonToPlistFormat(t *testing.T) {
         "enabled": false,
         "list": ["wink", "blink", "drink"]
      } } }, "containerEngine": { "name": "beatrice" }}`
-		s, err := JsonToPlist(jsonBody)
+		s, err := JSONToPlist(jsonBody)
 		assert.NoError(t, err)
-		assert.Equal(t, `<?xml version="1.0" encoding="UTF-8"?>
+		assert.Equal(t, fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
   <dict>
     <key>version</key>
-    <integer>12</integer>
+    <integer>%d</integer>
     <key>application</key>
     <dict>
       <key>extensions</key>
@@ -57,7 +61,7 @@ func TestJsonToPlistFormat(t *testing.T) {
     </dict>
   </dict>
 </plist>
-`, s)
+`, options.CURRENT_SETTINGS_VERSION), s)
 	})
 
 	t.Run("Handles everything", func(t *testing.T) {
@@ -100,8 +104,12 @@ func TestJsonToPlistFormat(t *testing.T) {
   },
   "virtualMachine": {
     "memoryInGB": 4,
+    "mount": {
+      "type": "reverse-sshfs"
+    },
     "numberCPUs": 2,
-    "hostResolver": true
+    "type": "qemu",
+    "useRosetta": false
   },
   "WSL": {
     "integrations": {
@@ -138,10 +146,7 @@ func TestJsonToPlistFormat(t *testing.T) {
   },
   "experimental": {
     "virtualMachine": {
-      "type": "qemu",
-      "useRosetta": false,
       "mount": {
-        "type": "reverse-sshfs",
         "9p": {
           "securityModel": "none",
           "protocolVersion": "9p2000.L",
@@ -149,7 +154,6 @@ func TestJsonToPlistFormat(t *testing.T) {
           "cacheMode": "mmap"
         }
       },
-      "networkingTunnel": false,
       "proxy": {
         "enabled": false,
         "address": "",
@@ -161,7 +165,7 @@ func TestJsonToPlistFormat(t *testing.T) {
   }
 }
 `
-		s, err := JsonToPlist(jsonBody)
+		s, err := JSONToPlist(jsonBody)
 		assert.NoError(t, err)
 		assert.Equal(t, `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -235,8 +239,15 @@ func TestJsonToPlistFormat(t *testing.T) {
       <integer>4</integer>
       <key>numberCPUs</key>
       <integer>2</integer>
-      <key>hostResolver</key>
-      <true/>
+      <key>type</key>
+      <string>qemu</string>
+      <key>useRosetta</key>
+      <false/>
+      <key>mount</key>
+      <dict>
+        <key>type</key>
+        <string>reverse-sshfs</string>
+      </dict>
     </dict>
     <key>kubernetes</key>
     <dict>
@@ -265,8 +276,6 @@ func TestJsonToPlistFormat(t *testing.T) {
       <dict>
         <key>mount</key>
         <dict>
-          <key>type</key>
-          <string>reverse-sshfs</string>
           <key>9p</key>
           <dict>
             <key>securityModel</key>
@@ -279,12 +288,6 @@ func TestJsonToPlistFormat(t *testing.T) {
             <string>mmap</string>
           </dict>
         </dict>
-        <key>networkingTunnel</key>
-        <false/>
-        <key>type</key>
-        <string>qemu</string>
-        <key>useRosetta</key>
-        <false/>
         <key>proxy</key>
         <dict>
           <key>enabled</key>
@@ -361,14 +364,14 @@ func TestJsonToPlistFormat(t *testing.T) {
 									}
 							}
 `
-		s, err := JsonToPlist(jsonBody)
+		s, err := JSONToPlist(jsonBody)
 		assert.NoError(t, err)
-		assert.Equal(t, `<?xml version="1.0" encoding="UTF-8"?>
+		assert.Equal(t, fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
   <dict>
     <key>version</key>
-    <integer>12</integer>
+    <integer>%d</integer>
     <key>application</key>
     <dict>
       <key>extensions</key>
@@ -406,7 +409,6 @@ func TestJsonToPlistFormat(t *testing.T) {
     </dict>
   </dict>
 </plist>
-`, s)
+`, options.CURRENT_SETTINGS_VERSION), s)
 	})
-
 }

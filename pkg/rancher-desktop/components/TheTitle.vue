@@ -1,10 +1,10 @@
 <script lang="ts">
-import Vue from 'vue';
+import { defineComponent, markRaw } from 'vue';
 import { mapState } from 'vuex';
 
-const componentCache: { [key: string]: any } = {};
+const componentCache: Record<string, any> = {};
 
-export default Vue.extend({
+export default defineComponent({
   name: 'the-title',
   data() {
     return {
@@ -17,10 +17,19 @@ export default Vue.extend({
       'page',
       [
         'title',
+        'titleKey',
+        'titleArgs',
         'description',
+        'descriptionKey',
         'action',
         'icon',
       ]),
+    displayTitle(): string {
+      return this.titleKey ? this.t(this.titleKey, this.titleArgs) : this.title;
+    },
+    displayDescription(): string {
+      return this.descriptionKey ? this.t(this.descriptionKey) : this.description;
+    },
   },
   watch: {
     $route: {
@@ -33,7 +42,7 @@ export default Vue.extend({
       async handler(componentName) {
         if (componentName) {
           componentCache[componentName] ||= (await import(`@pkg/components/${ componentName }.vue`)).default;
-          this.dynamicComponent = componentCache[componentName];
+          this.dynamicComponent = markRaw(componentCache[componentName]);
         }
       },
       immediate: true,
@@ -50,10 +59,7 @@ export default Vue.extend({
 <template>
   <div class="title">
     <div class="title-top">
-      <transition-group
-        name="fade-group"
-        class="title-group"
-      >
+      <transition-group name="fade-group">
         <button
           v-if="isChild"
           key="back-btn"
@@ -77,7 +83,7 @@ export default Vue.extend({
             key="mainTitleIcon"
             :class="icon"
           />
-          {{ title }}
+          {{ displayTitle }}
         </h1>
       </transition-group>
       <transition
@@ -95,10 +101,10 @@ export default Vue.extend({
     </div>
     <hr>
     <div
-      v-show="description"
+      v-show="displayDescription"
       class="description"
     >
-      {{ description }}
+      {{ displayDescription }}
     </div>
   </div>
 </template>
@@ -125,14 +131,15 @@ export default Vue.extend({
   }
 
   .fade-group-item {
+    display: inherit;
     transition: all 0.25s ease-out;
   }
 
-  .fade-actions{
+  .fade-actions {
     transition: opacity 0.25s ease-out;
   }
 
-  .fade-group-item-enter, .fade-group-leave-to
+  .fade-group-item-enter-from, .fade-group-leave-to
   {
     opacity: 0;
   }
@@ -147,10 +154,6 @@ export default Vue.extend({
 
   .fade-active {
     transition: all 0.25s ease-in;
-  }
-
-  .title-group {
-    display: inherit;
   }
 
   .main-title-icon {

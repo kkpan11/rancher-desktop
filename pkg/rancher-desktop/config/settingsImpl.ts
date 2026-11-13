@@ -8,15 +8,19 @@ import { dirname, join } from 'path';
 import _ from 'lodash';
 
 import {
-  CURRENT_SETTINGS_VERSION, defaultSettings, DeploymentProfileType,
-  LockedSettingsType, Settings, SettingsError,
+  CURRENT_SETTINGS_VERSION,
+  defaultSettings,
+  DeploymentProfileType,
+  LockedSettingsType,
+  Settings,
+  SettingsError,
 } from '@pkg/config/settings';
 import { PathManagementStrategy } from '@pkg/integrations/pathManager';
 import clone from '@pkg/utils/clone';
+import { splitImageReference } from '@pkg/utils/dockerUtils';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
 import { RecursivePartial, RecursiveReadonly } from '@pkg/utils/typeUtils';
-import { getProductionVersion } from '@pkg/utils/version';
 
 const console = Logging.settings;
 
@@ -138,15 +142,17 @@ function finishConfiguringSettings(cfg: Settings, deploymentProfiles: Deployment
   } else if (os.platform() === 'linux' && !process.env.APPIMAGE) {
     cfg.application.updater.enabled = false;
   } else {
-    const appVersion = getProductionVersion();
+    const appVersion = process.env.RD_VERSION ?? 'unknown?';
 
     console.log(`appVersion is ${ appVersion }`);
     // Auto-update doesn't work for CI or local builds, so don't enable it by default.
     // CI builds use a version string like `git describe`, e.g. "v1.1.0-4140-g717225dc".
-    // Versions like "1.9.0-tech-preview" are pre-releases and not CI builds, so should not disable auto-update.
-    if (appVersion.match(/^v?\d+\.\d+\.\d+-\d+-g[0-9a-f]+$/) || appVersion.includes('?')) {
+    // Versions like "1.9.0-tech-preview" are pre-releases and not CI builds, so should not disable
+    // auto-update; however, "1.9.0-fallback" means we failed to parse the version, and it _should_
+    // disable auto-update, since we don't know what version we're running.
+    if ((/^v?\d+\.\d+\.\d+-(?:\d+-g[0-9a-f]+|fallback)$/.exec(appVersion)) || appVersion.includes('?')) {
       cfg.application.updater.enabled = false;
-      console.log('updates disabled');
+      console.log('updates disabled due to unsupported version');
     }
   }
   // Replace existing settings fields with whatever is set in the locked deployment-profile
@@ -432,9 +438,7 @@ export const updateTable: Record<number, (settings: any, locked : boolean) => vo
     // by the image (without tag) with the value being the tag.
     if (_.hasIn(settings, 'extensions')) {
       const withTags = Object.entries(settings.extensions ?? {}).filter(([, v]) => v).map(([k]) => k);
-      const extensions = withTags.map((image) => {
-        return image.split(':', 2).concat('latest').slice(0, 2) as [string, string];
-      });
+      const extensions = withTags.map(splitImageReference);
 
       settings.extensions = Object.fromEntries(extensions);
     }
@@ -481,6 +485,38 @@ export const updateTable: Record<number, (settings: any, locked : boolean) => vo
       _.unset(settings, 'experimental.virtualMachine');
     }
   },
+  12: (settings) => {
+    // This bump is only there to force networking tunnel.
+    _.set(settings, 'experimental.virtualMachine.networkingTunnel', true);
+  },
+  13: (settings) => {
+    _.unset(settings, 'virtualMachine.hostResolver');
+    _.unset(settings, 'experimental.virtualMachine.networkingTunnel');
+  },
+  14: (settings) => {
+    const replacements: ReplacementDirective[] = [
+      { oldPath: 'experimental.virtualMachine.type', newPath: 'virtualMachine.type' },
+      { oldPath: 'experimental.virtualMachine.useRosetta', newPath: 'virtualMachine.useRosetta' },
+    ];
+
+    processReplacements(settings, replacements);
+    if (_.isEmpty(_.get(settings, 'experimental.virtualMachine'))) {
+      _.unset(settings, 'experimental.virtualMachine');
+    }
+  },
+  15: (settings) => {
+    const replacements: ReplacementDirective[] = [
+      { oldPath: 'experimental.virtualMachine.mount.type', newPath: 'virtualMachine.mount.type' },
+    ];
+
+    processReplacements(settings, replacements);
+  },
+  16: (settings, locked) => {
+    if (!locked && !_.has(settings, 'containerEngine.mobyStorageDriver')) {
+      _.set(settings, 'containerEngine.mobyStorageDriver', 'auto');
+    }
+  },
+  // v19 added application.locale (defaults filled by _.defaultsDeep).
 };
 
 function migrateSettingsToCurrentVersion(settings: Record<string, any>): Settings {

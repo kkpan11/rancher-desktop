@@ -13,7 +13,7 @@ import (
 	"github.com/docker/docker-credential-helpers/credentials"
 )
 
-type dockerConfigType map[string]interface{}
+type dockerConfigType map[string]any
 
 func getParsedConfig() (dockerConfigType, error) {
 	dockerConfig := make(dockerConfigType)
@@ -41,7 +41,7 @@ func saveParsedConfig(config *dockerConfigType) error {
 	if err != nil {
 		return err
 	}
-	err = os.WriteFile(scratchFile.Name(), contents, 0600)
+	err = os.WriteFile(scratchFile.Name(), contents, 0o600)
 	scratchFile.Close()
 	if err != nil {
 		return err
@@ -57,12 +57,12 @@ func getRecordForServerURL(config *dockerConfigType, urlArg string) (string, str
 	if !ok {
 		return "", "", credentials.NewErrCredentialsNotFound()
 	}
-	auths := authsInterface.(map[string]interface{})
-	authDataForUrl, ok := auths[urlArg]
+	auths := authsInterface.(map[string]any)
+	authDataForURL, ok := auths[urlArg]
 	if !ok {
 		return "", "", credentials.NewErrCredentialsNotFound()
 	}
-	authData, ok := authDataForUrl.(map[string]interface{})["auth"]
+	authData, ok := authDataForURL.(map[string]any)["auth"]
 	if !ok {
 		return "", "", credentials.NewErrCredentialsNotFound()
 	}

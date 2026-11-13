@@ -17,11 +17,22 @@ limitations under the License.
 package dockerproxy
 
 import (
+	// Blank imports keeping modules that only generated code uses as direct
+	// requirements. The swagger code under pkg/dockerproxy/models imports the
+	// swag packages and is generated at build time, not checked in; go:generate
+	// below runs the go-swagger tool. Without these, `go mod tidy` demotes the
+	// modules to indirect when the generated code is absent — as it is in
+	// dependabot's tree — breaking its update PRs.
+	_ "github.com/go-openapi/runtime"
+	_ "github.com/go-openapi/swag/conv"
+	_ "github.com/go-openapi/swag/jsonutils"
+	_ "github.com/go-openapi/swag/stringutils"
+	_ "github.com/go-openapi/swag/typeutils"
 	_ "github.com/go-swagger/go-swagger"
 )
 
-//go:generate -command swagger go run github.com/go-swagger/go-swagger/cmd/swagger@v0.30.5
-//go:generate swagger generate server --quiet --skip-validation --config-file swagger-configuration.yaml --server-package models --spec swagger.yaml
+//go:generate -command swagger go tool swagger
+//go:generate swagger generate server --quiet --skip-validation --config-file swagger-configuration.yaml --server-package models --spec swagger-modified.yaml
 
 func init() {
 }

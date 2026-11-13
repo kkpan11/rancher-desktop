@@ -17,12 +17,13 @@ show_info() { # @test
     fi
 
     (
-        local format="# %-25s %s\n"
+        local format="# %s | %s\n"
 
         printf "$format" "Install location:" "$RD_LOCATION"
         printf "$format" "Resources path:" "$PATH_RESOURCES"
         echo "#"
         printf "$format" "Container engine:" "$RD_CONTAINER_ENGINE"
+        printf "$format" "Kubernetes version:" "$RD_KUBERNETES_VERSION ($RD_K3S_VERSIONS)"
         printf "$format" "Mount type:" "$RD_MOUNT_TYPE"
         if [ "$RD_MOUNT_TYPE" = "9p" ]; then
             printf "$format" "  9p cache mode:" "$RD_9P_CACHE_MODE"
@@ -31,18 +32,22 @@ show_info() { # @test
             printf "$format" "  9p security model:" "$RD_9P_SECURITY_MODEL"
         fi
         printf "$format" "Using image allow list:" "$(bool using_image_allow_list)"
+        if is_unix; then
+            printf "$format" "Host CPUs:" "$(getconf _NPROCESSORS_ONLN)"
+            printf "$format" "VM CPUs:" "$RD_VM_CPUS"
+        fi
+        printf "$format" "Wait factor:" "$RD_WAIT_FACTOR"
         if is_macos; then
             printf "$format" "Using VZ emulation:" "$(bool using_vz_emulation)"
             printf "$format" "Using ramdisk:" "$(bool using_ramdisk)"
         fi
         if is_windows; then
             printf "$format" "Using Windows executables:" "$(bool using_windows_exe)"
-            printf "$format" "Using networking tunnel:" "$(bool using_networking_tunnel)"
         fi
         echo "#"
         printf "$format" "Capturing logs:" "$(bool capturing_logs)"
         printf "$format" "Tracing execution:" "$(bool is_true "$RD_TRACE")"
         printf "$format" "Taking screenshots:" "$(bool taking_screenshots)"
         printf "$format" "Using ghcr.io images:" "$(bool using_ghcr_images)"
-    ) >&3
+    ) | column -t -s '|' >&3
 }

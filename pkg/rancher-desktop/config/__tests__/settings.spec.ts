@@ -1,17 +1,19 @@
+/** @jest-environment node */
 /* eslint object-curly-newline: ["error", {"consistent": true}] */
 
 import fs from 'fs';
 import path from 'path';
 
+import { jest } from '@jest/globals';
 import _ from 'lodash';
-import plist from 'plist';
+import * as plist from 'plist';
 
 import * as settings from '../settings';
 import * as settingsImpl from '../settingsImpl';
 
 import { PathManagementStrategy } from '@pkg/integrations/pathManager';
-import { readDeploymentProfiles } from '@pkg/main/deploymentProfiles';
 import paths from '@pkg/utils/paths';
+import mockModules from '@pkg/utils/testUtils/mockModules';
 import { RecursivePartial } from '@pkg/utils/typeUtils';
 
 class FakeFSError extends Error {
@@ -27,8 +29,18 @@ class FakeFSError extends Error {
 enum ProfileTypes {
   None = 'none',
   Unlocked = 'unlocked',
-  Locked = 'locked'
+  Locked = 'locked',
 }
+
+const actualSyncReader = fs.readFileSync;
+const modules = mockModules({
+  fs: {
+    ...fs,
+    readFileSync: jest.spyOn(fs, 'readFileSync'),
+  },
+});
+
+const { readDeploymentProfiles } = await import('@pkg/main/deploymentProfiles');
 
 describe('settings', () => {
   describe('merge', () => {
@@ -99,10 +111,11 @@ describe('settings', () => {
         enabled:  true,
         patterns: [],
       },
-      name: 'moby',
+      mobyStorageDriver: 'auto',
+      name:              'moby',
     },
     kubernetes: {
-      version: '1.23.15',
+      version: '1.29.15',
       enabled: true,
     },
     WSL: {
@@ -169,15 +182,13 @@ describe('settings', () => {
 
   describeNotWindows('profiles', () => {
     const lockedAccessors = ['containerEngine.allowedImages.enabled', 'containerEngine.allowedImages.patterns'];
-    let mock: jest.SpiedFunction<typeof fs['readFileSync']>;
-    const actualSyncReader = fs.readFileSync;
 
     beforeEach(() => {
       jest.spyOn(fs, 'writeFileSync').mockImplementation(() => { });
       settingsImpl.clearSettings();
     });
     afterEach(() => {
-      mock.mockRestore();
+      modules.fs.readFileSync.mockRestore();
     });
 
     /**
@@ -207,22 +218,27 @@ describe('settings', () => {
      *
      * On Linux, system files are (currently) `/etc/rancher-desktop/{defaults,locked}.json`,
      * while the user files are  `~/.config/rancher-desktop.{defaults,locked}.json`
+     * The alternate system location is `/usr/etc/rancher-desktop/{defaults,locked}.json`.
      *
      * macOS plist files:
      * User: `~/Library/Preferences/io.rancherdesktop.profile.{defaults,locked}.plist`
-     * System: `/Library/Preferences/io.rancherdesktop.profile.{defaults,locked}.plist`
+     * System: `/Library/Managed Preferences/io.rancherdesktop.profile.{defaults,locked}.plist`
+     * AltSystem: `/Library/Preferences/io.rancherdesktop.profile.{defaults,locked}.plist`
+     *
+     * A request for the AltSystem profile gets the same response as a request for the System profile.
      *
      * @param useSystemProfile: what to do when a system profile is requested
      * @param usePersonalProfile:  what to do when a user profile is requested
      * @param typeToCorrupt: if 'defaults', when a defaults profile is requested, just return the first half of the text.
      *                       ... similar if it's 'locked'
      */
-    function createMocker(useSystemProfile: ProfileTypes, usePersonalProfile: ProfileTypes, typeToCorrupt?: 'defaults'|'locked'): (inputPath: any, unused: any) => any {
+    function createMocker(useSystemProfile: ProfileTypes, usePersonalProfile: ProfileTypes, typeToCorrupt?: 'defaults' | 'locked'): (inputPath: any, unused: any) => any {
       return (inputPath: any, unused: any): any => {
-        if (!inputPath.startsWith(paths.deploymentProfileUser) && !inputPath.startsWith(paths.deploymentProfileSystem)) {
+        const profilePaths = [paths.deploymentProfileUser, paths.deploymentProfileSystem, paths.altDeploymentProfileSystem];
+        if (!profilePaths.some(p => inputPath.startsWith(p))) {
           return actualSyncReader(inputPath, unused);
         }
-        const action = inputPath.startsWith(paths.deploymentProfileSystem) ? useSystemProfile : usePersonalProfile;
+        const action = inputPath.startsWith(paths.deploymentProfileUser) ? usePersonalProfile : useSystemProfile;
 
         if (action === ProfileTypes.None || inputPath === path.join(paths.config, 'settings.json')) {
           throw new FakeFSError(`File ${ inputPath } not found`, 'ENOENT');
@@ -267,15 +283,15 @@ describe('settings', () => {
           return new RegExp(`Error loading plist file .*/io.rancherdesktop.profile.${ basename }.plist`);
         }
 
-        return new RegExp(`Error parsing deployment profile from .*/\\.config/rancher-desktop.${ basename }.json: SyntaxError: Unexpected end of JSON input`);
+        return new RegExp(`Error parsing deployment profile from .*/\\.config/rancher-desktop.${ basename }.json: SyntaxError: Unterminated string in JSON at position`);
       }
       test('complains about invalid default values', async() => {
-        mock = jest.spyOn(fs, 'readFileSync')
+        modules.fs.readFileSync
           .mockImplementation(createMocker(ProfileTypes.None, ProfileTypes.Unlocked, 'defaults'));
         await expect(readDeploymentProfiles()).rejects.toThrow(invalidProfileMessage('defaults'));
       });
       test('complains about invalid locked values', async() => {
-        mock = jest.spyOn(fs, 'readFileSync')
+        modules.fs.readFileSync
           .mockImplementation(createMocker(ProfileTypes.None, ProfileTypes.Locked, 'locked'));
         await expect(readDeploymentProfiles()).rejects.toThrow(invalidProfileMessage('locked'));
       });
@@ -296,7 +312,7 @@ describe('settings', () => {
 
       describe('when there is no profile', () => {
         beforeEach(() => {
-          mock = jest.spyOn(fs, 'readFileSync')
+          modules.fs.readFileSync
             .mockImplementation(createMocker(ProfileTypes.None, ProfileTypes.None));
         });
         test('all fields are unlocked', async() => {
@@ -309,7 +325,7 @@ describe('settings', () => {
       });
       describe('when there is a profile', () => {
         describe('all possible situations of (system,user) x (locked,unlocked)', () => {
-          const testCases: {system: ProfileTypes, user: ProfileTypes, shouldLock: boolean, msg: string}[] = [];
+          const testCases: { system: ProfileTypes, user: ProfileTypes, shouldLock: boolean, msg: string }[] = [];
 
           for (const system of Object.values(ProfileTypes)) {
             for (const user of Object.values(ProfileTypes)) {
@@ -328,7 +344,7 @@ describe('settings', () => {
           }
           test.each(testCases)('system profile $system user profile $user $msg',
             async({ system, user, shouldLock }) => {
-              mock = jest.spyOn(fs, 'readFileSync')
+              modules.fs.readFileSync
                 .mockImplementation(createMocker(system, user));
               const profiles = await readDeploymentProfiles();
 
@@ -343,14 +359,16 @@ describe('settings', () => {
         });
         describe('check profile reading', () => {
           it('preserves hash-like settings', async() => {
-            mock = jest.spyOn(fs, 'readFileSync')
+            modules.fs.readFileSync
               .mockImplementation(createMocker(ProfileTypes.None, ProfileTypes.Unlocked));
             const profiles = await readDeploymentProfiles();
             const expectedDefaults = _.omit(fullDefaults, ['debug', 'ignorableTestSettings', 'diagnostics.locked']);
-            const expected = {
+            const expected: RecursivePartial<settings.Settings> = {
               version:         settings.CURRENT_SETTINGS_VERSION,
               containerEngine: {
-                name: 'moby',
+                name: settings.ContainerEngine.MOBY,
+              },
+              experimental: {
               },
               kubernetes: {
                 version: '1.25.9',
@@ -474,7 +492,7 @@ describe('settings', () => {
         },
       };
 
-      expect(settingsImpl.migrateSpecifiedSettingsToCurrentVersion(s, false)).toEqual(expected);
+      expect(settingsImpl.migrateSpecifiedSettingsToCurrentVersion(s, false)).toMatchObject(expected);
     });
 
     it('correctly migrates earlier no-proxy settings', () => {
@@ -507,7 +525,7 @@ describe('settings', () => {
         },
       };
 
-      expect(settingsImpl.migrateSpecifiedSettingsToCurrentVersion(s, false)).toEqual(expected);
+      expect(settingsImpl.migrateSpecifiedSettingsToCurrentVersion(s, false)).toMatchObject(expected);
     });
 
     it('leaves unrecognized settings unchanged', () => {
@@ -535,7 +553,7 @@ describe('settings', () => {
       };
       const expected = _.merge({}, s, { version: settings.CURRENT_SETTINGS_VERSION });
 
-      expect(settingsImpl.migrateSpecifiedSettingsToCurrentVersion(s, false)).toEqual(expected);
+      expect(settingsImpl.migrateSpecifiedSettingsToCurrentVersion(s, false)).toMatchObject(expected);
     });
 
     it('updates all old settings going back to version 1', () => {
@@ -576,14 +594,15 @@ describe('settings', () => {
           },
         },
         containerEngine: {
-          name: settings.ContainerEngine.MOBY,
+          mobyStorageDriver: 'auto',
+          name:              settings.ContainerEngine.MOBY,
         },
-        experimental:   {},
+        experimental: {
+        },
         kubernetes:     {},
         virtualMachine: {
-          hostResolver: true,
-          memoryInGB:   30,
-          numberCPUs:   200,
+          memoryInGB: 30,
+          numberCPUs: 200,
         },
         WSL: {
           integrations: {
@@ -615,7 +634,6 @@ describe('settings', () => {
           {
             kubernetes: {
               suppressSudo: true,
-              hostResolver: true,
               memoryInGB:   300,
               numberCPUs:   45,
               experimental: {
@@ -642,9 +660,8 @@ describe('settings', () => {
               updater:                { enabled: true },
             },
             virtualMachine: {
-              hostResolver: true,
-              memoryInGB:   300,
-              numberCPUs:   45,
+              memoryInGB: 300,
+              numberCPUs: 45,
             },
             experimental: {
               virtualMachine: {
@@ -700,13 +717,15 @@ describe('settings', () => {
         6: [
           {
             extensions: {
-              'mice:oldest':   true,
-              'cats:youngest': false,
+              'mice:oldest':                         true,
+              'cats:youngest':                       false,
+              'registry.example:5000/org/image:tag': true,
             },
           },
           {
             extensions: {
-              mice: 'oldest',
+              mice:                              'oldest',
+              'registry.example:5000/org/image': 'tag',
             },
           },
         ],

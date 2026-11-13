@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"strings"
 )
 
@@ -27,11 +28,12 @@ type argHandlersType struct {
 	outputPathArgHandler   argHandler
 	mountArgHandler        argHandler
 	builderCacheArgHandler argHandler
+	buildContextArgHandler argHandler
 }
 
 // commandHandlerType is the type of commandDefinition.handler, which is used
 // to handle positional arguments (and special subcommands).
-// The passed-in arguments include any flags given after positional arguments.
+// The passed-in arguments excludes any flags given after positional arguments.
 type commandHandlerType func(*commandDefinition, []string, argHandlersType) (*parsedArgs, error)
 
 type commandDefinition struct {
@@ -45,6 +47,10 @@ type commandDefinition struct {
 	// options for this (sub) command.  If the handler is null, the option does
 	// not take arguments.
 	options map[string]argHandler
+	// if set, this command can include foreign flags that should not be parsed.
+	// This should be set for things like `nerdctl run` where flags can be passed
+	// to the command to be run.
+	hasForeignFlags bool
 	// handler for any positional arguments and subcommands.  This should not
 	// include the name of the subcommand itself.  If this is not given, all
 	// subcommands are searched for, and positional arguments are ignored.
@@ -132,10 +138,28 @@ func (c *commandDefinition) parseOption(arg, next string) ([]string, bool, []cle
 // parse arguments for this command; this includes options (--long, -x) as well
 // as subcommands and positional arguments.
 func (c commandDefinition) parse(args []string) (*parsedArgs, error) {
+	// Parsing rules:
+	// - At each command level, short options (-x) at that level can be parsed.
+	// - At each command level, long options from the current or any previous level can be parsed.
+	// - If a command contains positional arguments, it may not contain any subcommands.
+	//   (We check this in `./generate` to make sure this stays true.)
+	// - Positional arguments can be intermixed with (both long and short) options.
+	// - If a command can have foreign flags (e.g. `nerdctl run`), we stop parsing
+	//   options on first positional argument.  This means we parse the flag in
+	//   `nerdctl run --env foo=bar image sh -c ...` but not the `--env` flag in
+	//   `nerdctl run image --env foo=bar sh -c ...`.
+	// - Having foreign flags is mutually exclusive with having subcommands; this
+	//   is also checked in `./generate`.
+	// - `--` stops parsing of options.
 	var result parsedArgs
+	var positionalArgs []string
 	for argIndex := 0; argIndex < len(args); argIndex++ {
 		arg := args[argIndex]
-		if strings.HasPrefix(arg, "-") {
+		if arg == "--" {
+			// No more options, only positional arguments.
+			positionalArgs = append(positionalArgs, args[argIndex+1:]...)
+			break
+		} else if strings.HasPrefix(arg, "-") {
 			next := ""
 			if argIndex+1 < len(args) {
 				next = args[argIndex+1]
@@ -156,18 +180,9 @@ func (c commandDefinition) parse(args []string) (*parsedArgs, error) {
 			if consumed {
 				argIndex++
 			}
-		} else {
-			// Handler positional arguments and subcommands.
-			if c.handler != nil {
-				childResult, err := c.handler(&c, args[argIndex:], argHandlers)
-				if err != nil {
-					return nil, err
-				}
-				result.args = append(result.args, childResult.args...)
-				result.cleanup = append(result.cleanup, childResult.cleanup...)
-				break
-			}
-			// No custom handler; look for subcommands.
+		} else if len(c.subcommands) > 0 {
+			// This command has subcommands; assume any non-flags are subcommands.
+			// Hand off argument parsing to the subcommand.
 			subcommandPath := c.commandPath
 			if subcommandPath != "" {
 				subcommandPath += " "
@@ -186,10 +201,38 @@ func (c commandDefinition) parse(args []string) (*parsedArgs, error) {
 				result.args = append(result.args, childResult.args...)
 				result.cleanup = append(result.cleanup, childResult.cleanup...)
 			} else {
-				// No subcommand; ignore positional arguments.
+				// Invalid subcommand; ignore positional arguments.
 				result.args = append(result.args, args[argIndex:]...)
 			}
 			break
+		} else {
+			if c.hasForeignFlags {
+				// If we have foreign flags, assume the rest of the arguments starting
+				// from the first positional argument is foreign.
+				positionalArgs = append(positionalArgs, args[argIndex:]...)
+				break
+			} else {
+				// This command doesn't have subcommands, nor foreign arguments.
+				// Everything is positional arguments; we still have to parse other
+				// arguments for flags, though.
+				positionalArgs = append(positionalArgs, arg)
+			}
+		}
+	}
+	// At this point, `result` is filled with options, and `positionalArgs`
+	// contains the unparsed positional arguments.
+	if c.handler != nil {
+		childResult, err := c.handler(&c, positionalArgs, argHandlers)
+		if err != nil {
+			return nil, err
+		}
+		result.args = append(result.args, childResult.args...)
+		result.cleanup = append(result.cleanup, childResult.cleanup...)
+	} else {
+		if len(positionalArgs) > 0 && !slices.Contains(result.args, "--") {
+			result.args = slices.Concat(result.args, []string{"--"}, positionalArgs)
+		} else {
+			result.args = append(result.args, positionalArgs...)
 		}
 	}
 	return &result, nil
@@ -208,6 +251,7 @@ func parseArgs() (*parsedArgs, error) {
 		_ = cleanupParseArgs()
 		return nil, err
 	}
+	result.args = injectSeccompOpt(result.args)
 	return result, nil
 }
 
@@ -288,16 +332,31 @@ func aliasCommand(alias, target string) {
 
 func init() {
 	// Set up the argument handlers
+	registerArgHandler("builder build", "--build-context", argHandlers.buildContextArgHandler)
 	registerArgHandler("builder build", "--cache-from", argHandlers.builderCacheArgHandler)
 	registerArgHandler("builder build", "--cache-to", argHandlers.builderCacheArgHandler)
 	registerArgHandler("builder build", "--file", argHandlers.filePathArgHandler)
+	registerArgHandler("builder build", "-f", argHandlers.filePathArgHandler)
 	registerArgHandler("builder build", "--iidfile", argHandlers.outputPathArgHandler)
+	// --output and --secret are CSV whose src= and dest= values are paths.
+	registerArgHandler("builder build", "--output", argHandlers.builderCacheArgHandler)
+	registerArgHandler("builder build", "-o", argHandlers.builderCacheArgHandler)
+	registerArgHandler("builder build", "--secret", argHandlers.builderCacheArgHandler)
+	registerArgHandler("builder build", "--source-policy-file", argHandlers.filePathArgHandler)
 	registerArgHandler("builder debug", "--file", argHandlers.filePathArgHandler)
 	registerArgHandler("builder debug", "-f", argHandlers.filePathArgHandler)
+	registerArgHandler("builder debug", "--secret", argHandlers.builderCacheArgHandler)
+	registerArgHandler("checkpoint create", "--checkpoint-dir", argHandlers.filePathArgHandler)
+	registerArgHandler("checkpoint ls", "--checkpoint-dir", argHandlers.filePathArgHandler)
+	registerArgHandler("checkpoint rm", "--checkpoint-dir", argHandlers.filePathArgHandler)
 	registerArgHandler("compose", "--file", argHandlers.filePathArgHandler)
 	registerArgHandler("compose", "-f", argHandlers.filePathArgHandler)
 	registerArgHandler("compose", "--project-directory", argHandlers.filePathArgHandler)
 	registerArgHandler("compose", "--env-file", argHandlers.filePathArgHandler)
+	// nerdctl's help text renders these with a metavar because the
+	// description quotes the "volumes" Compose section, but they are booleans.
+	registerArgHandler("compose down", "--volumes", nil)
+	registerArgHandler("compose down", "-v", nil)
 	registerArgHandler("compose run", "--volume", argHandlers.volumeArgHandler)
 	registerArgHandler("compose run", "-v", argHandlers.volumeArgHandler)
 	registerArgHandler("container create", "--cidfile", argHandlers.outputPathArgHandler)
@@ -308,6 +367,9 @@ func init() {
 	registerArgHandler("container create", "--pidfile", argHandlers.outputPathArgHandler)
 	registerArgHandler("container create", "--volume", argHandlers.volumeArgHandler)
 	registerArgHandler("container create", "-v", argHandlers.volumeArgHandler)
+	registerArgHandler("container exec", "--env-file", argHandlers.filePathArgHandler)
+	registerArgHandler("container export", "--output", argHandlers.outputPathArgHandler)
+	registerArgHandler("container export", "-o", argHandlers.outputPathArgHandler)
 	registerArgHandler("container run", "--cidfile", argHandlers.outputPathArgHandler)
 	registerArgHandler("container run", "--cosign-key", argHandlers.filePathArgHandler)
 	registerArgHandler("container run", "--env-file", argHandlers.filePathArgHandler)
@@ -316,22 +378,30 @@ func init() {
 	registerArgHandler("container run", "--pidfile", argHandlers.outputPathArgHandler)
 	registerArgHandler("container run", "--volume", argHandlers.volumeArgHandler)
 	registerArgHandler("container run", "-v", argHandlers.volumeArgHandler)
-	registerArgHandler("image build", "--file", argHandlers.filePathArgHandler)
-	registerArgHandler("image build", "-f", argHandlers.filePathArgHandler)
+	registerArgHandler("container start", "--checkpoint-dir", argHandlers.filePathArgHandler)
 	registerArgHandler("image convert", "--estargz-record-in", argHandlers.filePathArgHandler)
+	registerArgHandler("image convert", "--zstdchunked-record-in", argHandlers.filePathArgHandler)
+	registerArgHandler("image decrypt", "--key", argHandlers.filePathArgHandler)
+	registerArgHandler("image encrypt", "--key", argHandlers.filePathArgHandler)
 	registerArgHandler("image load", "--input", argHandlers.filePathArgHandler)
+	registerArgHandler("image pull", "--cosign-key", argHandlers.filePathArgHandler)
+	registerArgHandler("image push", "--cosign-key", argHandlers.filePathArgHandler)
 	registerArgHandler("image save", "--output", argHandlers.outputPathArgHandler)
 
 	// Set up command handlers
-	registerCommandHandler("image build", imageBuildHandler)
+	registerCommandHandler("builder build", builderBuildHandler)
 	registerCommandHandler("container cp", containerCopyHandler)
+	registerCommandHandler("image import", imageImportHandler)
 
 	// Set up aliases
 	aliasCommand("commit", "container commit")
 	aliasCommand("cp", "container cp")
 	aliasCommand("create", "container create")
 	aliasCommand("exec", "container exec")
+	aliasCommand("export", "container export")
 	aliasCommand("kill", "container kill")
+	aliasCommand("image build", "builder build")
+	aliasCommand("import", "image import")
 	aliasCommand("logs", "container logs")
 	aliasCommand("pause", "container pause")
 	aliasCommand("port", "container port")
@@ -342,7 +412,7 @@ func init() {
 	aliasCommand("stop", "container stop")
 	aliasCommand("unpause", "container unpause")
 	aliasCommand("wait", "container wait")
-	aliasCommand("build", "image build")
+	aliasCommand("build", "builder build")
 	aliasCommand("load", "image load")
 	aliasCommand("pull", "image pull")
 	aliasCommand("push", "image push")

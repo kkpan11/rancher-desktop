@@ -11,6 +11,7 @@ import (
 	"unicode"
 
 	"github.com/google/uuid"
+
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/lock"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/paths"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/runner"
@@ -24,7 +25,7 @@ const nameDisplayCutoffSize = 30
 // Manager handles all snapshot-related functionality.
 type Manager struct {
 	Snapshotter
-	paths.Paths
+	*paths.Paths
 	lock.BackendLocker
 }
 
@@ -57,13 +58,13 @@ func (manager *Manager) Snapshot(name string) (Snapshot, error) {
 }
 
 func (manager *Manager) SnapshotDirectory(snapshot Snapshot) string {
-	return filepath.Join(manager.Paths.Snapshots, snapshot.ID)
+	return filepath.Join(manager.Snapshots, snapshot.ID)
 }
 
 // ValidateName checks that name is a valid snapshot name and that
 // it is not used by an existing snapshot.
 func (manager *Manager) ValidateName(name string) error {
-	if len(name) == 0 {
+	if name == "" {
 		return fmt.Errorf("snapshot name must not be the empty string")
 	}
 	runeName := []rune(name)
@@ -118,45 +119,45 @@ func (manager *Manager) writeMetadataFile(snapshot Snapshot) error {
 }
 
 // Create a new snapshot.
-func (manager *Manager) Create(ctx context.Context, name, description string) (snapshot Snapshot, err error) {
+func (manager *Manager) Create(ctx context.Context, name, description string) (Snapshot, error) {
 	id, err := uuid.NewRandom()
 	if err != nil {
-		return snapshot, fmt.Errorf("failed to generate ID for snapshot: %w", err)
+		return Snapshot{}, fmt.Errorf("failed to generate ID for snapshot: %w", err)
 	}
-	snapshot = Snapshot{
+	snapshot := Snapshot{
 		Created:     time.Now(),
 		Name:        name,
 		ID:          id.String(),
 		Description: description,
 	}
 	action := fmt.Sprintf("Creating snapshot %q", name)
-	if err = manager.Lock(manager.Paths, action); err != nil {
-		return
+	if err := manager.Lock(ctx, manager.Paths, action); err != nil {
+		return snapshot, err
 	}
 	defer func() {
 		if err != nil {
 			os.RemoveAll(manager.SnapshotDirectory(snapshot))
 		}
-		unlockErr := manager.Unlock(manager.Paths, true)
+		unlockErr := manager.Unlock(ctx, manager.Paths, true)
 		if err == nil {
 			err = unlockErr
 		}
 	}()
 	// (Re)validate the name after acquiring the lock in case another process created a snapshot with the same name
-	if err = manager.ValidateName(name); err != nil {
-		return
+	if err := manager.ValidateName(name); err != nil {
+		return snapshot, err
 	}
 	if err = manager.writeMetadataFile(snapshot); err == nil {
 		err = manager.CreateFiles(ctx, manager.Paths, manager.SnapshotDirectory(snapshot))
 	}
-	return
+	return snapshot, err
 }
 
 // List snapshots that are present on the system. If includeIncomplete is
 // true, includes snapshots that are currently being created, are currently
 // being deleted, or are otherwise incomplete and cannot be restored from.
 func (manager *Manager) List(includeIncomplete bool) ([]Snapshot, error) {
-	dirEntries, err := os.ReadDir(manager.Paths.Snapshots)
+	dirEntries, err := os.ReadDir(manager.Snapshots)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return []Snapshot{}, fmt.Errorf("failed to read snapshots directory: %w", err)
 	}
@@ -166,7 +167,7 @@ func (manager *Manager) List(includeIncomplete bool) ([]Snapshot, error) {
 			continue
 		}
 		snapshot := Snapshot{}
-		metadataPath := filepath.Join(manager.Paths.Snapshots, dirEntry.Name(), "metadata.json")
+		metadataPath := filepath.Join(manager.Snapshots, dirEntry.Name(), "metadata.json")
 		contents, err := os.ReadFile(metadataPath)
 		if err != nil {
 			return []Snapshot{}, fmt.Errorf("failed to read %q: %w", metadataPath, err)
@@ -177,7 +178,7 @@ func (manager *Manager) List(includeIncomplete bool) ([]Snapshot, error) {
 		// TODO this should be done by the caller
 		snapshot.Created = snapshot.Created.Local()
 
-		completeFilePath := filepath.Join(manager.Paths.Snapshots, snapshot.ID, completeFileName)
+		completeFilePath := filepath.Join(manager.Snapshots, snapshot.ID, completeFileName)
 		_, err = os.Stat(completeFilePath)
 		completeFileExists := err == nil
 
@@ -211,12 +212,12 @@ func (manager *Manager) Restore(ctx context.Context, name string) (err error) {
 	}
 
 	action := fmt.Sprintf("Restoring snapshot %q", name)
-	if err := manager.Lock(manager.Paths, action); err != nil {
+	if err := manager.Lock(ctx, manager.Paths, action); err != nil {
 		return err
 	}
 	defer func() {
 		// Restart the backend only if a data reset occurred
-		unlockErr := manager.Unlock(manager.Paths, !errors.Is(err, ErrDataReset))
+		unlockErr := manager.Unlock(ctx, manager.Paths, !errors.Is(err, ErrDataReset))
 		if err == nil {
 			err = unlockErr
 		}

@@ -2,12 +2,12 @@
 import os from 'os';
 
 import { Banner } from '@rancher/components';
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 
 import BackendProgress from '@pkg/components/BackendProgress.vue';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
 
-export default Vue.extend({
+export default defineComponent({
   name:       'snapshots-dialog',
   components: { Banner, BackendProgress },
   layout:     'dialog',
@@ -35,7 +35,7 @@ export default Vue.extend({
     };
   },
 
-  async fetch() {
+  async beforeMount() {
     this.credentials = await this.$store.dispatch(
       'credentials/fetchCredentials',
     );
@@ -50,7 +50,7 @@ export default Vue.extend({
     });
 
     ipcRenderer.on('dialog/info', (_event, args) => {
-      this.info = this.t(args.infoKey, {}, true);
+      this.info = this.t(args.infoKey);
     });
 
     ipcRenderer.on('dialog/options', (_event, { window, format }) => {
@@ -82,7 +82,7 @@ export default Vue.extend({
     ipcRenderer.send('dialog/mounted');
   },
 
-  beforeDestroy() {
+  beforeUnmount() {
     ipcRenderer.removeAllListeners('dialog/error');
     ipcRenderer.removeAllListeners('dialog/options');
     ipcRenderer.removeAllListeners('dialog/close');
@@ -178,7 +178,7 @@ export default Vue.extend({
               <div class="created">
                 <span
                   v-if="snapshot.formattedCreateDate"
-                  v-clean-html="t('snapshots.card.created', { date: snapshot.formattedCreateDate.date, time: snapshot.formattedCreateDate.time }, true)"
+                  v-clean-html="t('snapshots.card.created', { date: snapshot.formattedCreateDate.date, time: snapshot.formattedCreateDate.time })"
                   class="value"
                 />
               </div>
@@ -380,7 +380,7 @@ export default Vue.extend({
     }
   }
 
-  .info-banner::v-deep code {
+  .info-banner :deep(code) {
     padding: 2px;
   }
 </style>

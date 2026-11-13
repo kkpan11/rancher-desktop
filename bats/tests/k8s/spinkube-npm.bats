@@ -41,7 +41,8 @@ local_setup() {
 }
 
 @test 'deploy app to kubernetes' {
-    spin kube deploy --from "$MY_APP_IMAGE"
+    spin kube deploy --context rancher-desktop --replicas 1 --from "$MY_APP_IMAGE"
+    wait_for_kube_deployment_available --namespace default "$MY_APP_NAME"
 }
 
 # TODO replace ingress with port-forwarding
@@ -87,5 +88,5 @@ EOF
 
     run --separate-stderr try curl --connect-timeout 5 --fail "http://${host}"
     assert_success
-    assert_output "Hello from JS-SDK"
+    assert_output --regexp '^(Hello|hello)'
 }

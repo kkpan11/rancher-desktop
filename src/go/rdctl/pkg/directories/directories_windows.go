@@ -19,16 +19,18 @@ package directories
 import (
 	"errors"
 	"fmt"
-	"path/filepath"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
+// The initial buffer size for use with InvokeWin32WithBuffer
+const initialBufferSize = uint32(256)
+
 // InvokeWin32WithBuffer calls the given function with increasing buffer sizes
 // until it does not return ERROR_INSUFFICIENT_BUFFER.
-func InvokeWin32WithBuffer(cb func(size int) error) error {
-	size := 256
+func InvokeWin32WithBuffer(cb func(size uint32) error) error {
+	size := initialBufferSize
 	for {
 		err := cb(size)
 		if err == nil {
@@ -42,43 +44,6 @@ func InvokeWin32WithBuffer(cb func(size int) error) error {
 		}
 		size *= 2
 	}
-}
-
-// GetApplicationDirectory returns the installation directory of the application.
-func GetApplicationDirectory() (string, error) {
-	var exePath string
-	err := InvokeWin32WithBuffer(func(bufSize int) error {
-		buf := make([]uint16, bufSize)
-		n, err := windows.GetModuleFileName(windows.Handle(0), &buf[0], uint32(bufSize))
-		if err != nil {
-			return err
-		}
-		if n == uint32(bufSize) {
-			// If the buffer is too small, GetModuleFileName returns the buffer size,
-			// and the result includes the null character. If the buffer is large
-			// enough, GetModuleFileName returns the string length, _excluding_ the
-			// null character.
-			if buf[bufSize-1] == 0 {
-				// The buffer contains a null character
-				return windows.ERROR_INSUFFICIENT_BUFFER
-			}
-		}
-		exePath = windows.UTF16ToString(buf[:n])
-		return nil
-	})
-	if err != nil {
-		return "", err
-	}
-
-	// Given the path to the exe, find its directory, and drop the
-	// "resources\win32\bin" suffix (possibly with another "resources" in front).
-	resultDir := filepath.Dir(exePath)
-	for _, part := range []string{"bin", "win32", "resources"} {
-		for filepath.Base(resultDir) == part {
-			resultDir = filepath.Dir(resultDir)
-		}
-	}
-	return resultDir, nil
 }
 
 func GetLocalAppDataDirectory() (string, error) {
@@ -112,7 +77,7 @@ func getKnownFolder(folder *windows.KNOWNFOLDERID) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("could not find CoTaskMemFree: %w", err)
 	}
-	var result uintptr
+	var result *uint16
 	hr, _, _ := SHGetKnownFolderPath.Call(
 		uintptr(unsafe.Pointer(folder)),
 		0,
@@ -121,12 +86,12 @@ func getKnownFolder(folder *windows.KNOWNFOLDERID) (string, error) {
 	)
 	// SHGetKnownFolderPath documentation says we _must_ free the result with
 	// CoTaskMemFree, even if the call failed.
-	defer CoTaskMemFree.Call(result)
+	// https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shgetknownfolderpath
+	defer func() { _, _, _ = CoTaskMemFree.Call(uintptr(unsafe.Pointer(result))) }()
 	if hr != 0 {
 		return "", windows.Errno(hr)
 	}
 
 	// result at this point contains the path, as a PWSTR
-	// Note that `go vet` has a false positive here on "misuse of Pointer".
-	return windows.UTF16PtrToString((*uint16)(unsafe.Pointer(result))), nil
+	return windows.UTF16PtrToString(result), nil
 }

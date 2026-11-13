@@ -18,6 +18,7 @@ package factoryreset
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -25,18 +26,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
-	"strings"
-	"unsafe"
 
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/directories"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/windows"
-)
 
-var (
-	pKernel32      = windows.NewLazySystemDLL("kernel32.dll")
-	pEnumProcesses = pKernel32.NewProc("K32EnumProcesses")
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/directories"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/process"
 )
 
 // CheckProcessWindows - returns true if Rancher Desktop is still running, false if it isn't
@@ -44,19 +39,19 @@ var (
 //
 // It does this by calling `tasklist`, the Windows answer to ps(1)
 
-func CheckProcessWindows() (bool, error) {
-	cmd := exec.Command("tasklist", "/NH", "/FI", "IMAGENAME eq Rancher Desktop.exe", "/FO", "CSV")
+func CheckProcessWindows(ctx context.Context) (bool, error) {
+	cmd := exec.CommandContext(ctx, "tasklist", "/NH", "/FI", "IMAGENAME eq Rancher Desktop.exe", "/FO", "CSV")
 	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 	allOutput, err := cmd.CombinedOutput()
 	if err != nil {
-		return false, fmt.Errorf("Failed to run %q: %w", cmd, err)
+		return false, fmt.Errorf("failed to run %q: %w", cmd, err)
 	}
 	r := csv.NewReader(bytes.NewReader(allOutput))
 	for {
 		record, err := r.Read()
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				return false, fmt.Errorf("Failed to csv-read the output for tasklist: %w", err)
+				return false, fmt.Errorf("failed to csv-read the output for tasklist: %w", err)
 			}
 			break
 		}
@@ -69,118 +64,15 @@ func CheckProcessWindows() (bool, error) {
 
 // KillRancherDesktop terminates all processes where the executable is from the
 // Rancher Desktop application, excluding the current process.
-func KillRancherDesktop() error {
-
-	err := stopPrivilegedService()
-	if err != nil {
-		return fmt.Errorf("failed to stop privileged service: %w", err)
-	}
-
-	appDir, err := directories.GetApplicationDirectory()
+func KillRancherDesktop(ctx context.Context) error {
+	appDir, err := directories.GetApplicationDirectory(ctx)
 	if err != nil {
 		return fmt.Errorf("could not find application directory: %w", err)
 	}
 
-	var processes []uint32
-	err = directories.InvokeWin32WithBuffer(func(size int) error {
-		processes = make([]uint32, size)
-		var bytesReturned uint32
-		// We can't use `windows.EnumProcesses`, because it passes in an incorrect
-		// value for the second argument (`cb`).
-		elementSize := unsafe.Sizeof(uint32(0))
-		bufferSize := uintptr(len(processes)) * elementSize
-		n, _, err := pEnumProcesses.Call(
-			uintptr(unsafe.Pointer(&processes[0])),
-			bufferSize,
-			uintptr(unsafe.Pointer(&bytesReturned)),
-		)
-		if n == 0 {
-			return err
-		}
-		if uintptr(bytesReturned) >= bufferSize {
-			return windows.ERROR_INSUFFICIENT_BUFFER
-		}
-		processesFound := uintptr(bytesReturned) / elementSize
-		logrus.Tracef("got %d processes", processesFound)
-		processes = processes[:processesFound]
-		return nil
-	})
+	err = process.TerminateProcessInDirectory(appDir, true)
 	if err != nil {
-		return fmt.Errorf("could not get process list: %w", err)
-	}
-
-	sort.Slice(processes, func(i, j int) bool {
-		return processes[i] < processes[j]
-	})
-	var processesToKill []uint32
-	for _, pid := range processes {
-		// Add a scope to help with defer
-		(func(pid uint32) {
-			if pid == uint32(os.Getpid()) {
-				// Skip the current process.
-				return
-			}
-
-			hProc, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-			if err != nil {
-				// We can't open privileged processes, processes that have exited since,
-				// idle process, etc.; so we log this at trace level instead.
-				logrus.Tracef("failed to open pid %d: %s (skipping)", pid, err)
-				return
-			}
-			defer windows.CloseHandle(hProc)
-
-			var imageName string
-			err = directories.InvokeWin32WithBuffer(func(size int) error {
-				nameBuf := make([]uint16, size)
-				charsWritten := uint32(size)
-				err := windows.QueryFullProcessImageName(hProc, 0, &nameBuf[0], &charsWritten)
-				if err != nil {
-					logrus.Tracef("failed to get image name for pid %d: %s", pid, err)
-					return err
-				}
-				if charsWritten >= uint32(size)-1 {
-					logrus.Tracef("buffer too small for pid %d image name", pid)
-					return windows.ERROR_INSUFFICIENT_BUFFER
-				}
-				imageName = windows.UTF16ToString(nameBuf)
-				return nil
-			})
-			if err != nil {
-				logrus.Debugf("failed to get process name of pid %d: %s (skipping)", pid, err)
-				return
-			}
-
-			relPath, err := filepath.Rel(appDir, imageName)
-			if err != nil {
-				// This may be because they're on different drives, network shares, etc.
-				logrus.Tracef("failed to make pid %d image %s relative to %s: %s", pid, imageName, appDir, err)
-				return
-			}
-			if strings.HasPrefix(relPath, "..") {
-				// Relative path includes "../" prefix, not a child of appDir
-				logrus.Tracef("skipping pid %d (%s), not in app %s", pid, imageName, appDir)
-				return
-			}
-
-			logrus.Tracef("will terminate pid %d image %s", pid, imageName)
-			processesToKill = append(processesToKill, pid)
-		})(pid)
-	}
-
-	for _, pid := range processesToKill {
-		(func() {
-			hProc, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pid)
-			if err != nil {
-				logrus.Infof("failed to open process %d for termination, skipping", pid)
-				return
-			}
-			defer windows.CloseHandle(hProc)
-
-			if err = windows.TerminateProcess(hProc, 0); err != nil {
-				logrus.Infof("failed to terminate process %d: %s", pid, err)
-			}
-		})()
+		return err
 	}
 
 	return nil
@@ -273,11 +165,13 @@ func getDirectoriesToDelete(keepSystemImages bool, appName string) ([]string, er
 	}
 	roamingAppData, err := directories.GetRoamingAppDataDirectory()
 	if err == nil {
-		dirs = append(dirs, filepath.Join(roamingAppData, appName))
-		// Electron stores some files in AppData\Roaming\Rancher Desktop
-		dirs = append(dirs, filepath.Join(roamingAppData, "Rancher Desktop"))
+		dirs = append(dirs,
+			filepath.Join(roamingAppData, appName),
+			// Electron stores some files in AppData\Roaming\Rancher Desktop
+			filepath.Join(roamingAppData, "Rancher Desktop"))
 	} else {
 		logrus.Errorf("Could not get AppData (roaming) folder: %s\n", err)
 	}
+	// The OldUserData directory is already deleted by deleting the Cache directory.
 	return dirs, nil
 }

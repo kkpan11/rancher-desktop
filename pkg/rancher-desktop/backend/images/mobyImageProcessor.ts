@@ -1,19 +1,17 @@
-import { spawn } from 'child_process';
 import path from 'path';
 
-import { VMBackend, VMExecutor } from '@pkg/backend/backend';
+import { VMBackend } from '@pkg/backend/backend';
 import * as imageProcessor from '@pkg/backend/images/imageProcessor';
 import * as K8s from '@pkg/backend/k8s';
 import mainEvents from '@pkg/main/mainEvents';
 import Logging from '@pkg/utils/logging';
-import { executable } from '@pkg/utils/resources';
 import * as window from '@pkg/window';
 
 const console = Logging.images;
 
 export default class MobyImageProcessor extends imageProcessor.ImageProcessor {
-  constructor(executor: VMExecutor) {
-    super(executor);
+  constructor(backend: VMBackend) {
+    super(backend);
 
     mainEvents.on('k8s-check-state', (mgr: VMBackend) => {
       if (!this.active) {
@@ -25,17 +23,20 @@ export default class MobyImageProcessor extends imageProcessor.ImageProcessor {
   }
 
   protected get processorName() {
-    return 'moby';
+    return 'docker';
   }
 
   protected async runImagesCommand(args: string[], sendNotifications = true): Promise<imageProcessor.childResultType> {
     const subcommandName = args[0];
 
-    if (this.executor.backend !== 'wsl' && !args.includes('--context')) {
-      args.unshift('--context', 'rancher-desktop');
-    }
-
-    return await this.processChildOutput(spawn(executable('docker'), args), subcommandName, sendNotifications);
+    return this.processChildOutput(
+      this.backend.containerEngineClient.runClient(args, 'stream'),
+      {
+        subcommandName,
+        notifications: {
+          stdout: sendNotifications, stderr: sendNotifications, ok: sendNotifications,
+        },
+      });
   }
 
   async buildImage(dirPart: string, filePart: string, taggedImageName: string): Promise<imageProcessor.childResultType> {
@@ -69,15 +70,8 @@ export default class MobyImageProcessor extends imageProcessor.ImageProcessor {
       false);
   }
 
-  async scanImage(taggedImageName: string): Promise<imageProcessor.childResultType> {
-    return await this.runTrivyCommand(
-      [
-        '--quiet',
-        'image',
-        '--format',
-        'json',
-        taggedImageName,
-      ]);
+  scanImage(taggedImageName: string, namespace: string): Promise<imageProcessor.childResultType> {
+    return this.runTrivyScan(taggedImageName);
   }
 
   relayNamespaces(): Promise<void> {
@@ -86,7 +80,7 @@ export default class MobyImageProcessor extends imageProcessor.ImageProcessor {
     return Promise.resolve();
   }
 
-  getNamespaces(): Promise<Array<string>> {
+  getNamespaces(): Promise<string[]> {
     throw new Error("docker doesn't support namespaces");
   }
 
@@ -98,8 +92,8 @@ export default class MobyImageProcessor extends imageProcessor.ImageProcessor {
    * ...
    */
 
-  parse(data: string): imageProcessor.imageType[] {
-    const images: Array<imageProcessor.imageType> = [];
+  parse(data: string): imageProcessor.ImageType[] {
+    const images: imageProcessor.ImageType[] = [];
     const records = data
       .split(/\r?\n/)
       .filter(line => line.trim().length > 0)
@@ -131,7 +125,7 @@ export default class MobyImageProcessor extends imageProcessor.ImageProcessor {
   }
 }
 
-function imageComparator(a: imageProcessor.imageType, b: imageProcessor.imageType): number {
+function imageComparator(a: imageProcessor.ImageType, b: imageProcessor.ImageType): number {
   return a.imageName.localeCompare(b.imageName) ||
     a.tag.localeCompare(b.tag) ||
     a.imageID.localeCompare(b.imageID);

@@ -70,7 +70,7 @@ export function updateFromCommandLine(cfg: Settings, lockedFields: LockedSetting
       processingExternalArguments = false;
       continue;
     }
-    const currentValue: boolean|string|number|Record<string, undefined>|undefined = _.get(cfg, fqFieldName);
+    const currentValue: boolean | string | number | Record<string, undefined> | undefined = _.get(cfg, fqFieldName);
 
     if (currentValue === undefined) {
       // Ignore unrecognized command-line options until we get to one we recognize
@@ -108,8 +108,8 @@ export function updateFromCommandLine(cfg: Settings, lockedFields: LockedSetting
     if (['boolean', 'number'].includes(currentValueType)) {
       try {
         finalValue = JSON.parse(finalValue);
-      } catch (err) {
-        throw new Error(`Can't evaluate --${ fqFieldName }=${ finalValue } as ${ currentValueType }: ${ err }`);
+      } catch (cause) {
+        throw new Error(`Can't evaluate --${ fqFieldName }=${ finalValue } as ${ currentValueType }: ${ cause }`, { cause });
       }
       // We know the current value's type is either boolean or number, so a constrained comparison is ok
       // eslint-disable-next-line valid-typeof
@@ -127,7 +127,7 @@ export function updateFromCommandLine(cfg: Settings, lockedFields: LockedSetting
     // If the field is locked, we don't need to know what it's locked to,
     // just that the proposed version is different from the current version.
     // The current version doesn't have to be the locked version, but will be after processing ends.
-    const limitedK8sVersionList: Array<string> = [newKubernetesVersion];
+    const limitedK8sVersionList: string[] = [newKubernetesVersion];
 
     if (cfg.kubernetes.version) {
       limitedK8sVersionList.push(cfg.kubernetes.version);
@@ -139,7 +139,7 @@ export function updateFromCommandLine(cfg: Settings, lockedFields: LockedSetting
   if (errors.length > 0) {
     const errorString = `Error in command-line options:\n${ errors.join('\n') }`;
 
-    if (errors.some(error => /field ".+?" is locked/.test(error))) {
+    if (settingsValidator.hasLockedFieldError) {
       throw new LockedFieldError(errorString);
     }
     if (isFatal) {
@@ -162,7 +162,7 @@ export function updateFromCommandLine(cfg: Settings, lockedFields: LockedSetting
 // but it also does some error checking.
 // On the happy path, it's exactly like `lodash.set`
 // exported for unit tests only
-export function getObjectRepresentation(fqFieldAccessor: RecursiveKeys<Settings>, finalValue: boolean|number|string): RecursivePartial<Settings> {
+export function getObjectRepresentation(fqFieldAccessor: RecursiveKeys<Settings>, finalValue: boolean | number | string): RecursivePartial<Settings> {
   if (!fqFieldAccessor) {
     throw new Error("Invalid command-line option: can't be the empty string.");
   }
@@ -171,11 +171,11 @@ export function getObjectRepresentation(fqFieldAccessor: RecursiveKeys<Settings>
   if (optionParts.length === 1) {
     return { [fqFieldAccessor]: finalValue };
   }
-  const lastField: string|undefined = optionParts.pop();
+  const lastField: string | undefined = optionParts.pop();
 
   if (!lastField) {
     throw new Error("Unrecognized command-line option ends with a dot ('.')");
   }
 
-  return _.set({}, fqFieldAccessor, finalValue) as RecursivePartial<Settings>;
+  return _.set({}, fqFieldAccessor, finalValue);
 }

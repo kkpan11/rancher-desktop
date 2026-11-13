@@ -32,7 +32,7 @@ test.describe.serial('Main App Test', () => {
 
   test.afterAll(async({ colorScheme }, testInfo) => {
     await teardown(electronApp, testInfo);
-    await tool('rdctl', 'factory-reset', '--verbose');
+    await tool('rdctl', 'reset', '--factory', '--verbose');
     reopenLogs();
   });
 
@@ -102,12 +102,9 @@ test.describe.serial('Main App Test', () => {
     await expect(virtualMachine.tabVolumes).toHaveText('Volumes');
 
     if (os.platform() === 'darwin') {
-      await expect(virtualMachine.tabNetwork).toBeVisible();
-      await expect(virtualMachine.tabNetwork).toHaveText('Network');
       await expect(virtualMachine.tabEmulation).toBeVisible();
       await expect(virtualMachine.tabEmulation).toHaveText('Emulation');
     } else {
-      await expect(virtualMachine.tabNetwork).not.toBeVisible();
       await expect(virtualMachine.tabEmulation).not.toBeVisible();
     }
 
@@ -134,7 +131,11 @@ test.describe.serial('Main App Test', () => {
       }
     }
 
-    await expect(virtualMachine.reverseSshFs).toBeChecked();
+    if (os.platform() === 'darwin' && parseInt(os.release()) >= 23) {
+      await expect(virtualMachine.virtiofs).toBeChecked();
+    } else {
+      await expect(virtualMachine.reverseSshFs).toBeChecked();
+    }
 
     await virtualMachine.ninep.click();
     await expect(virtualMachine.cacheMode).toBeVisible();
@@ -157,7 +158,7 @@ test.describe.serial('Main App Test', () => {
       await expect(virtualMachine.vz).toBeDisabled();
     } else {
       await expect(virtualMachine.vz).not.toBeDisabled();
-      await virtualMachine.vz.click();
+      await virtualMachine.vz.click({ position: { x: 10, y: 10 } });
       await expect(virtualMachine.useRosetta).toBeVisible();
 
       if (os.arch() === 'arm64') {
@@ -202,24 +203,13 @@ test.describe.serial('Main App Test', () => {
     await expect(kubernetes.kubernetesOptions).toBeVisible();
   });
 
-  test('should navigate to WSL and render network tab', async() => {
+  test('should navigate to WSL and render integrations tab', async() => {
     test.skip(os.platform() !== 'win32', 'WSL nav item not available on macOS & Linux');
     const { wsl } = new PreferencesPage(preferencesWindow);
 
     await wsl.nav.click();
 
     await expect(wsl.nav).toHaveClass('preferences-nav-item active');
-
-    await expect(wsl.tabNetwork).toHaveText('Network');
-    await expect(wsl.tabIntegrations).toBeVisible();
-    await expect(wsl.tabIntegrations).toHaveText('Integrations');
-
-    await expect(wsl.networkingTunnel).toBeVisible();
-  });
-
-  test('should integrations tab', async() => {
-    test.skip(os.platform() !== 'win32', 'WSL nav item not available on macOS & Linux');
-    const { wsl } = new PreferencesPage(preferencesWindow);
 
     await wsl.tabIntegrations.click();
     await expect(wsl.wslIntegrations).toBeVisible();
@@ -311,7 +301,7 @@ test.describe.serial('Main App Test', () => {
       expect(preferencesWindow).toBeDefined();
       // Wait for the window to actually load (i.e. transition from
       // app://index.html/#/preferences to app://index.html/#/Preferences#general)
-      await preferencesWindow.waitForURL(/Preferences/);
+      await preferencesWindow.waitForURL(/Preferences#/i);
       const { containerEngine } = new PreferencesPage(preferencesWindow);
 
       await expect(containerEngine.nav).toHaveClass('preferences-nav-item active');

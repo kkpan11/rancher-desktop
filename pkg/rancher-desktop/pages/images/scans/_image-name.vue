@@ -4,6 +4,7 @@
       v-if="showOutput"
       :current-command="currentCommand"
       :image-output-culler="imageOutputCuller"
+      :image-to-pull="image"
       @ok:process-end="onProcessEnd"
     >
       <template #loading="{ isLoading }">
@@ -57,6 +58,7 @@ export default {
   data() {
     return {
       image:                            this.$route.params.image,
+      namespace:                        this.$route.params.namespace,
       showImageOutput:                  true,
       imageManagerOutput:               '',
       imageOutputCuller:                null,
@@ -87,6 +89,7 @@ export default {
     },
     vulnerabilities() {
       const results = JSON.parse(this.jsonOutput)?.Results;
+      const seenIds = new Set();
 
       // TODO: rancher-sandbox/rancher-desktop#2007
       return results
@@ -94,8 +97,16 @@ export default {
           return [...prev, ...curr?.Vulnerabilities || []];
         }, [])
         ?.map(({ PkgName, VulnerabilityID, ...rest }) => {
+          const baseId = `${ PkgName }-${ VulnerabilityID }`;
+          let id = baseId;
+
+          for (let suffix = 1; seenIds.has(id); suffix++) {
+            id = `${ baseId }-${ suffix }`;
+          }
+          seenIds.add(id);
+
           return {
-            id: `${ PkgName }-${ VulnerabilityID }`,
+            id,
             PkgName,
             VulnerabilityID,
             ...rest,
@@ -103,17 +114,17 @@ export default {
         });
     },
     loadingText() {
-      return this.t('images.scan.loadingText', { image: this.image }, true);
+      return this.t('images.scan.loadingText', { image: this.image });
     },
     errorText() {
-      return this.t('images.scan.errorText', { image: this.image }, true);
+      return this.t('images.scan.errorText', { image: this.image });
     },
   },
 
   mounted() {
     this.$store.dispatch(
       'page/setHeader',
-      { title: this.t('images.scan.title', { image: this.$route.params.image }, true) },
+      { titleKey: 'images.scan.title', titleArgs: { image: this.$route.params.image } },
     );
 
     ipcRenderer.on('ok:images-process-output', (_event, data) => {
@@ -127,7 +138,7 @@ export default {
   methods: {
     scanImage() {
       this.startRunningCommand('trivy-image');
-      ipcRenderer.send('do-image-scan', this.image);
+      ipcRenderer.send('do-image-scan', this.image, this.namespace);
     },
     startRunningCommand(command) {
       this.imageOutputCuller = getImageOutputCuller(command);

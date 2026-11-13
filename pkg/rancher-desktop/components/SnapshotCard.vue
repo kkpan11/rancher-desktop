@@ -1,10 +1,11 @@
 <script lang="ts">
 import dayjs from 'dayjs';
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 import { mapGetters } from 'vuex';
 
 import { State as EngineStates } from '@pkg/backend/k8s';
 import { Snapshot } from '@pkg/main/snapshots/types';
+import { currentTime } from '@pkg/utils/dateUtils';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
 
 import type { PropType } from 'vue';
@@ -22,7 +23,7 @@ function formatDate(value: string) {
   };
 }
 
-export default Vue.extend({
+export default defineComponent({
   name:  'snapshot-card',
   props: {
     value: {
@@ -63,6 +64,7 @@ export default Vue.extend({
             type:         'restore',
             result:       'cancel',
             snapshotName: this.snapshot?.name,
+            eventTime:    currentTime(),
           },
         );
       });
@@ -79,7 +81,7 @@ export default Vue.extend({
                 dialog:           'SnapshotsDialog',
                 error,
                 errorTitle:       this.t('snapshots.dialog.restore.error.header'),
-                errorDescription: this.t('snapshots.dialog.restore.error.description', { snapshot: this.snapshot.name }, true),
+                errorDescription: this.t('snapshots.dialog.restore.error.description', { snapshot: this.snapshot.name }),
                 errorButton:      this.t('snapshots.dialog.restore.error.buttonText'),
               });
           } else {
@@ -90,6 +92,7 @@ export default Vue.extend({
                 type:         'restore',
                 result:       snapshotCancelled ? 'cancel' : 'success',
                 snapshotName: this.snapshot?.name,
+                eventTime:    currentTime(),
               },
             );
           }
@@ -114,6 +117,7 @@ export default Vue.extend({
           result:       error ? 'error' : 'success',
           error,
           snapshotName: this.snapshot.name,
+          eventTime:    currentTime(),
         });
       }
     },
@@ -132,7 +136,7 @@ export default Vue.extend({
           format: {
             header:            this.t(`snapshots.dialog.${ type }.header`, { snapshot: this.snapshot.name }),
             snapshot:          this.snapshot,
-            message:           type === 'restore' ? this.t(`snapshots.dialog.${ type }.info`, { }, true) : '',
+            message:           type === 'restore' ? this.t(`snapshots.dialog.${ type }.info`) : '',
             showProgressBar:   false,
             snapshotEventType: 'confirm',
           },
@@ -156,7 +160,7 @@ export default Vue.extend({
           },
           format: {
             header:            this.t('snapshots.dialog.restoring.header', { snapshot }),
-            message:           this.t('snapshots.dialog.restoring.message', { snapshot }, true),
+            message:           this.t('snapshots.dialog.restoring.message', { snapshot }),
             showProgressBar:   true,
             snapshotEventType: 'restore',
           },
@@ -181,7 +185,7 @@ export default Vue.extend({
         <div class="created">
           <span
             v-if="snapshot.formattedCreateDate"
-            v-clean-html="t('snapshots.card.created', { date: snapshot.formattedCreateDate.date, time: snapshot.formattedCreateDate.time }, true)"
+            v-clean-html="t('snapshots.card.created', { date: snapshot.formattedCreateDate.date, time: snapshot.formattedCreateDate.time })"
             class="value"
           />
         </div>

@@ -17,11 +17,13 @@ limitations under the License.
 package platform
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/Microsoft/go-winio"
 	"github.com/linuxkit/virtsock/pkg/hvsock"
@@ -31,17 +33,13 @@ import (
 // default.
 const DefaultEndpoint = "npipe:////./pipe/docker_engine"
 
-// ErrListenerClosed is the error that is returned when we attempt to call
-// Accept() on a closed listener.
-var ErrListenerClosed = winio.ErrPipeListenerClosed
-
 // MakeDialer computes the dial function.
-func MakeDialer(port uint32) (func() (net.Conn, error), error) {
+func MakeDialer(port uint32) (func(ctx context.Context) (net.Conn, error), error) {
 	vmGUID, err := probeVMGUID(port)
 	if err != nil {
 		return nil, fmt.Errorf("could not detect WSL2 VM: %w", err)
 	}
-	dial := func() (net.Conn, error) {
+	dial := func(ctx context.Context) (net.Conn, error) {
 		conn, err := dialHvsock(vmGUID, port)
 		if err != nil {
 			return nil, err
@@ -65,23 +63,44 @@ func dialHvsock(vmGUID hvsock.GUID, port uint32) (net.Conn, error) {
 		ServiceID: svcGUID,
 	}
 
-	conn, err := hvsock.Dial(addr)
-	if err != nil {
-		return nil, fmt.Errorf("could not dial Hyper-V socket: %w", err)
-	}
+	// Normally dial times out after 30 seconds, but we want to time out faster.
+	ch := make(chan struct {
+		conn net.Conn
+		err  error
+	}, 1)
+	go func() {
+		conn, err := hvsock.Dial(addr)
+		ch <- struct {
+			conn net.Conn
+			err  error
+		}{conn: conn, err: err}
+	}()
 
-	return conn, nil
+	select {
+	case result := <-ch:
+		if result.err != nil {
+			return nil, fmt.Errorf("could not dial Hyper-V socket: %w", result.err)
+		}
+		return result.conn, nil
+	case <-time.After(time.Second):
+		return nil, fmt.Errorf("timed out dialing Hyper-V socket")
+	}
 }
 
 // Listen on the given Windows named pipe endpoint.
-func Listen(endpoint string) (net.Listener, error) {
+func Listen(ctx context.Context, endpoint string) (net.Listener, error) {
 	const prefix = "npipe://"
 
 	if !strings.HasPrefix(endpoint, prefix) {
 		return nil, fmt.Errorf("endpoint %s does not start with protocol %s", endpoint, prefix)
 	}
 
-	listener, err := winio.ListenPipe(endpoint[len(prefix):], nil)
+	// Configure pipe in MessageMode to support Docker's half-close semantics
+	// - Enables zero-byte writes as EOF signals (CloseWrite)
+	// - Crucial for stdin stream termination in interactive containers
+	pipeConfig := &winio.PipeConfig{MessageMode: true}
+
+	listener, err := winio.ListenPipe(endpoint[len(prefix):], pipeConfig)
 	if err != nil {
 		return nil, fmt.Errorf("could not listen on %s: %w", endpoint, err)
 	}
@@ -146,9 +165,9 @@ func IsAbsolutePath(input string) bool {
 
 // TranslatePathFromClient converts a client path to a path that can be used by
 // the docker daemon.
-func TranslatePathFromClient(windowsPath string) (string, error) {
+func TranslatePathFromClient(ctx context.Context, windowsPath string) (string, error) {
 	// TODO: See if we can do something faster than shelling out.
-	cmd := exec.Command("wsl", "--distribution", "rancher-desktop", "--exec", "/bin/wslpath", "-a", "-u", windowsPath)
+	cmd := exec.CommandContext(ctx, "wsl", "--distribution", "rancher-desktop", "--exec", "/bin/wslpath", "-a", "-u", windowsPath)
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("error getting WSL path: %w", err)

@@ -1,22 +1,31 @@
+import { jest } from '@jest/globals';
 import { mount } from '@vue/test-utils';
+import FloatingVue from 'floating-vue';
 
-import UpdateStatus from '../UpdateStatus.vue';
+import type { UpdateState } from '@pkg/main/update';
+import mockModules from '@pkg/utils/testUtils/mockModules';
+import { t as tFn } from '@pkg/utils/testUtils/translations';
 
-import { UpdateState } from '@pkg/main/update';
-
-jest.mock('@pkg/utils/ipcRenderer', () => {
-  return {
+mockModules({
+  '@pkg/utils/ipcRenderer': {
     ipcRenderer: {
       on:   jest.fn(),
       send: jest.fn(),
     },
-  };
+  },
+  electron: undefined,
 });
 
-function wrap(props: UpdateStatus['$props']) {
+const { default: UpdateStatus } = await import('../UpdateStatus.vue');
+
+function wrap(props: typeof UpdateStatus['$props']) {
   return mount(UpdateStatus, {
-    propsData: props,
-    mocks:     { t: jest.fn() },
+    props,
+    global: {
+      mocks:   { t: tFn },
+      stubs:   { T: { template: '<span> {{ k }} </span>' } },
+    },
+    plugins: [FloatingVue],
   });
 }
 
@@ -59,7 +68,7 @@ describe('UpdateStatus.vue', () => {
         } as UpdateState,
       });
 
-      expect(wrapper.findComponent({ ref: 'updateStatus' }).text())
+      expect(wrapper.get({ ref: 'updateStatus' }).text())
         .toEqual('There was an error checking for updates.');
       expect(wrapper.element.querySelector('.update-notification'))
         .toBeFalsy();
@@ -71,7 +80,7 @@ describe('UpdateStatus.vue', () => {
         updateState: { available: true } as UpdateState,
       });
 
-      expect(wrapper.findComponent({ ref: 'updateStatus' }).text())
+      expect(wrapper.get({ ref: 'updateStatus' }).text())
         .toEqual('');
     });
 
@@ -83,11 +92,13 @@ describe('UpdateStatus.vue', () => {
         } as UpdateState,
       });
 
-      expect(wrapper.findComponent({ ref: 'updateStatus' }).text().replace(/\s+/g, ' '))
-        .toEqual('An update to version v1.2.3 is available. Restart the application to apply the update.');
+      const statusDiv = wrapper.get({ ref: 'updateStatus' });
 
-      expect(wrapper.findComponent({ ref: 'applyButton' }).exists()).toBeTruthy();
-      expect(wrapper.findComponent({ ref: 'applyButton' }).attributes('disabled')).toBeFalsy();
+      expect(statusDiv.find('p').text())
+        .toEqual('An update to version v1.2.3 is available.');
+      expect(statusDiv.find('.update-notification').text())
+        .toEqual('Restart the application to apply the update.');
+      expect(wrapper.get({ ref: 'applyButton' }).attributes()).not.toHaveProperty('disabled');
     });
 
     it('does not allow applying again', async() => {
@@ -99,7 +110,7 @@ describe('UpdateStatus.vue', () => {
       });
 
       await wrapper.setData({ applying: true });
-      expect(wrapper.getComponent({ ref: 'applyButton' }).attributes('disabled')).toBeTruthy();
+      expect(wrapper.get({ ref: 'applyButton' }).attributes()).toHaveProperty('disabled');
     });
 
     it('shows download progress', () => {
@@ -129,9 +140,9 @@ describe('UpdateStatus.vue', () => {
         locale: 'en',
       });
 
-      expect(wrapper.findComponent({ ref: 'updateStatus' }).text())
+      expect(wrapper.get({ ref: 'updateStatus' }).text())
         .toMatch(/^An update to version v1\.2\.3 is available; downloading... \(12%, 1\.2MB\/s(?:ec\.?)?\)$/);
-      expect(wrapper.findComponent({ ref: 'updateReady' }).exists()).toBeFalsy();
+      expect(wrapper.find({ ref: 'applyButton' }).exists()).toBeFalsy();
     });
   });
 
@@ -139,7 +150,7 @@ describe('UpdateStatus.vue', () => {
     it('should not be displayed if there are none', () => {
       const wrapper = wrap({ enabled: true, updateState: { info: { version: 'v1.2.3' } } as UpdateState });
 
-      expect(wrapper.findComponent({ ref: 'releaseNotes' }).exists()).toBeFalsy();
+      expect(wrapper.find({ ref: 'releaseNotes' }).exists()).toBeFalsy();
     });
 
     it('should render plain text', () => {
@@ -151,7 +162,7 @@ describe('UpdateStatus.vue', () => {
         } as UpdateState,
       });
 
-      expect(wrapper.findComponent({ ref: 'releaseNotes' }).text())
+      expect(wrapper.get({ ref: 'releaseNotes' }).text())
         .toEqual('hello');
     });
 
@@ -164,8 +175,22 @@ describe('UpdateStatus.vue', () => {
         } as UpdateState,
       });
 
-      expect(wrapper.findComponent({ ref: 'releaseNotes' }).html())
+      expect(wrapper.get({ ref: 'releaseNotes' }).html())
         .toContain('<strong>hello</strong>');
+    });
+
+    it('should keep the top of the card in view', () => {
+      const wrapper = wrap({
+        enabled:     true,
+        updateState: {
+          available: true,
+          info:      { version: 'v1.2.3', releaseNotes: 'hello' },
+        } as UpdateState,
+      });
+
+      // The Card centres an overflowing body, which hides the status line and
+      // the notes toggle. Its sticky layout anchors the content to the top.
+      expect(wrapper.find('.card-container.card-sticky').exists()).toBeTruthy();
     });
 
     it('should not support scripting', () => {
@@ -180,7 +205,7 @@ describe('UpdateStatus.vue', () => {
         } as UpdateState,
       });
 
-      expect(wrapper.findComponent({ ref: 'releaseNotes' }).html())
+      expect(wrapper.get({ ref: 'releaseNotes' }).html())
         .not.toContain('alert');
     });
   });

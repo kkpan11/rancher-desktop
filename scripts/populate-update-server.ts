@@ -44,7 +44,7 @@ function getInput(name: string) {
   return result;
 }
 
-/** Given a input variable that expects a single file, return it. */
+/** Given an input variable that expects a single file, return it. */
 async function getInputFile(name: string) {
   const inputPath = getInput(name);
   const stat = await fs.promises.stat(inputPath);
@@ -65,18 +65,18 @@ async function getInputFile(name: string) {
 /**
  * assetInfo describes information we need about one asset.
  */
-type assetInfo = {
+interface assetInfo {
   /** filepath is the (full) path to the asset file. */
-  filepath: string;
+  filepath:     string;
   /** filename is the base name of the asset. */
-  filename: string;
+  filename:     string;
   /** length of the file */
-  length: number;
+  length:       number;
   /** checksum is the checksum file contents of the file. */
-  checksum: string;
+  checksum:     string;
   /** checksumName is the base name of the checksum. */
   checksumName: string;
-};
+}
 
 /**
  * Given environment name, write checksum contents for the file.
@@ -89,7 +89,7 @@ async function getChecksum(name: string, filenameOverride?: string): Promise<ass
   const stat = await fs.promises.stat(filepath);
   const input = fs.createReadStream(filepath);
   const hasher = crypto.createHash('sha512');
-  const promise = new Promise((resolve) => {
+  const promise = new Promise<void>((resolve) => {
     input.on('end', resolve);
   });
 
@@ -196,7 +196,7 @@ async function updateRelease(octokit: Octokit, owner: string, repo: string, tag:
         data:       info.checksum,
       }),
       // We need a custom request for the  main file, as we need to stream it
-      // from a file strem.
+      // from a file stream.
       octokit.request({
         method:  'POST',
         url:     release.upload_url,

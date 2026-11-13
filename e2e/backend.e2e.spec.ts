@@ -9,8 +9,7 @@ import semver from 'semver';
 import { NavPage } from './pages/nav-page';
 import { getAlternateSetting, startSlowerDesktop, teardown } from './utils/TestUtils';
 
-import { Settings, ContainerEngine } from '@pkg/config/settings';
-import fetch from '@pkg/utils/fetch';
+import { Settings, ContainerEngine, VMType, MountType } from '@pkg/config/settings';
 import paths from '@pkg/utils/paths';
 import { RecursivePartial, RecursiveKeys } from '@pkg/utils/typeUtils';
 
@@ -21,7 +20,16 @@ test.describe.serial('KubernetesBackend', () => {
   let page: Page;
 
   test.beforeAll(async({ colorScheme }, testInfo) => {
-    [electronApp, page] = await startSlowerDesktop(testInfo);
+    [electronApp, page] = await startSlowerDesktop(testInfo, {
+      kubernetes: {
+        enabled: false,
+      },
+      virtualMachine: {
+        mount: {
+          type: MountType.REVERSE_SSHFS,
+        },
+      },
+    });
   });
 
   test.afterAll(({ colorScheme }, testInfo) => teardown(electronApp, testInfo));
@@ -78,8 +86,8 @@ test.describe.serial('KubernetesBackend', () => {
 
       try {
         return JSON.parse(text);
-      } catch (ex) {
-        throw new Error(`Response text is not JSON: \n${ text }`);
+      } catch (cause) {
+        throw new Error(`Response text is not JSON: \n${ text }`, { cause });
       }
     }
 
@@ -90,7 +98,7 @@ test.describe.serial('KubernetesBackend', () => {
         // The Kubernetes version could be empty if it's previously disabled.
         // Set something.
         const updatedSettings: RecursivePartial<Settings> = {
-          kubernetes: { version: '1.23.4' },
+          kubernetes: { version: '1.29.4' },
           version:    10 as Settings['version'],
         };
 
@@ -100,7 +108,7 @@ test.describe.serial('KubernetesBackend', () => {
       const newSettings: RecursivePartial<Settings> = {
         containerEngine: { name: getAlternateSetting(currentSettings, 'containerEngine.name', ContainerEngine.CONTAINERD, ContainerEngine.MOBY) },
         kubernetes:      {
-          version: getAlternateSetting(currentSettings, 'kubernetes.version', '1.23.6', '1.23.5'),
+          version: getAlternateSetting(currentSettings, 'kubernetes.version', '1.29.6', '1.29.5'),
           port:    getAlternateSetting(currentSettings, 'kubernetes.port', 6443, 6444),
           enabled: getAlternateSetting(currentSettings, 'kubernetes.enabled', true, false),
           options: {
@@ -111,8 +119,8 @@ test.describe.serial('KubernetesBackend', () => {
       };
       /** Platform-specific changes to `newSettings`. */
       const platformSettings: Partial<Record<NodeJS.Platform, RecursivePartial<Settings>>> = {
-        win32:  { virtualMachine: { hostResolver: getAlternateSetting(currentSettings, 'virtualMachine.hostResolver', true, false) } },
-        darwin: { experimental: { virtualMachine: { useRosetta: getAlternateSetting(currentSettings, 'experimental.virtualMachine.useRosetta', true, false) } } },
+        win32:  { kubernetes: { ingress: { localhostOnly: getAlternateSetting(currentSettings, 'kubernetes.ingress.localhostOnly', true, false) } } },
+        darwin: { virtualMachine: { type: getAlternateSetting(currentSettings, 'virtualMachine.type', VMType.VZ, VMType.QEMU) } },
       };
 
       _.merge(newSettings, platformSettings[process.platform] ?? {});
@@ -144,8 +152,8 @@ test.describe.serial('KubernetesBackend', () => {
 
       /** Platform-specific additions to `expectedDefinition`. */
       const platformExpectedDefinitions: Partial<Record<NodeJS.Platform, ExpectedDefinition>> = {
-        win32:  { 'virtualMachine.hostResolver': false },
-        darwin: { 'experimental.virtualMachine.useRosetta': false },
+        win32:  { 'kubernetes.ingress.localhostOnly': false },
+        darwin: { 'virtualMachine.type': false },
       };
 
       _.merge(expectedDefinition, platformExpectedDefinitions[process.platform] ?? {});
@@ -153,13 +161,12 @@ test.describe.serial('KubernetesBackend', () => {
       if (['darwin', 'linux'].includes(process.platform)) {
         // Lima additions to expectedDefinition
         expectedDefinition['application.adminAccess'] = false;
+        expectedDefinition['experimental.virtualMachine.diskSize'] = false;
         expectedDefinition['virtualMachine.numberCPUs'] = false;
         expectedDefinition['virtualMachine.memoryInGB'] = false;
-      } else if (process.platform === 'win32') {
-        expectedDefinition['experimental.virtualMachine.networkingTunnel'] = false;
       }
 
-      const expected: Record<string, {current: any, desired: any, severity: 'reset' | 'restart'}> = {};
+      const expected: Record<string, { current: any, desired: any, severity: 'reset' | 'restart' }> = {};
 
       for (const [key, reset] of Object.entries(expectedDefinition)) {
         const entry = {

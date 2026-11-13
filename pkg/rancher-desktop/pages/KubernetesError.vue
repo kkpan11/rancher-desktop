@@ -5,10 +5,10 @@
         <img
           id="logo"
           src="../../../resources/icons/logo-square-red@2x.png"
-        />
+        >
         <span>
           <h2 data-test="k8s-error-header">
-            Kubernetes Error
+            {{ t('kubernetesError.title') }}
           </h2>
           <h5>{{ versionString }}</h5>
         </span>
@@ -20,28 +20,27 @@
         </div>
         <div
           v-if="lastCommand"
-          class="error-part"
+          class="error-part command"
         >
-          <h4>Last command run:</h4>
+          <h4>{{ t('kubernetesError.lastCommand') }}</h4>
           <p>{{ lastCommand }}</p>
         </div>
         <div
           v-if="lastCommandComment"
           class="error-part"
         >
-          <h4>Context:</h4>
+          <h4>{{ t('kubernetesError.context') }}</h4>
           <p>{{ lastCommandComment }}</p>
         </div>
         <div
           v-if="lastLogLines.length"
           class="error-part grow"
         >
-          <h4>
-            Some recent <a
-              href="#"
-              @click.prevent="showLogs"
-            >logfile</a> lines:
-          </h4>
+          <!-- v-clean-html: the translated string embeds a data-action link -->
+          <h4
+            v-clean-html="t('kubernetesError.logLines')"
+            @click.prevent="onLogLinesClick"
+          />
           <pre id="log-lines">{{ joinedLastLogLines }}</pre>
         </div>
       </div>
@@ -51,7 +50,7 @@
       class="role-primary primary-action"
       @click="close"
     >
-      Close
+      {{ t('generic.close') }}
     </button>
   </div>
 </template>
@@ -59,11 +58,12 @@
 <script lang="ts">
 import os from 'os';
 
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
 
-export default Vue.extend({
+export default defineComponent({
+  name:   'kubernetes-error-dialog',
   layout: 'dialog',
   data() {
     return {
@@ -72,7 +72,7 @@ export default Vue.extend({
       lastCommand:        '',
       lastCommandComment: '',
       lastLogLines:       [],
-      appVersion:         '',
+      appVersion:         process.env.RD_VERSION ?? '?',
     };
   },
   computed: {
@@ -91,12 +91,6 @@ export default Vue.extend({
       return `Rancher Desktop ${ this.appVersion } - ${ this.platform } (${ this.arch })`;
     },
   },
-  beforeMount() {
-    ipcRenderer.on('get-app-version', (_event, version) => {
-      this.appVersion = version;
-    });
-    ipcRenderer.send('get-app-version');
-  },
   mounted() {
     ipcRenderer.on('dialog/populate', (event, titlePart, mainMessage, failureDetails) => {
       this.$data.titlePart = titlePart;
@@ -114,6 +108,11 @@ export default Vue.extend({
     },
     showLogs() {
       ipcRenderer.send('show-logs');
+    },
+    onLogLinesClick(event: MouseEvent) {
+      if ((event.target as HTMLElement)?.closest('[data-action="showLogs"]')) {
+        this.showLogs();
+      }
     },
   },
 });
@@ -163,6 +162,10 @@ export default Vue.extend({
     margin-bottom: 1.5rem;
     h4 {
       margin-top: auto;
+    }
+    &.command p {
+      font-family: monospace;
+      white-space: pre-wrap;
     }
     &.grow {
       display: flex;

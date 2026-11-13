@@ -2,17 +2,23 @@ package reg
 
 import (
 	"fmt"
-	"github.com/stretchr/testify/assert"
 	"sort"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+
+	options "github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/options/generated"
+)
+
+const (
+	DefaultsHeader = "HKEY_CURRENT_USER\\SOFTWARE\\Policies\\Rancher Desktop\\defaults"
 )
 
 func TestJsonToRegFormat(t *testing.T) {
-
 	t.Run("complains about bad arguments", func(t *testing.T) {
 		type errorTestCases struct {
-			hiveType      string
-			profileType   string
+			hiveType      RegistryHive
+			profileType   ProfileType
 			expectedError string
 		}
 		testCases := []errorTestCases{
@@ -39,35 +45,34 @@ func TestJsonToRegFormat(t *testing.T) {
 		}
 		for _, testCase := range testCases {
 			t.Run(fmt.Sprintf("%s:%s", testCase.hiveType, testCase.profileType), func(t *testing.T) {
-				_, err := JsonToReg(testCase.hiveType, testCase.profileType, "")
+				_, err := JSONToReg(testCase.hiveType, testCase.profileType, "")
 				assert.ErrorContains(t, err, testCase.expectedError)
 			})
 		}
 	})
 	t.Run("handles empty bodies", func(t *testing.T) {
-		lines, err := JsonToReg("hkcu", "defaults", "{}")
+		lines, err := JSONToReg("hkcu", "defaults", "{}")
 		assert.NoError(t, err)
-		header := "HKEY_CURRENT_USER\\SOFTWARE\\Policies\\Rancher Desktop\\defaults"
 		assert.NoError(t, err)
-		assert.Equal(t, fmt.Sprintf("[%s]", header), lines[3])
+		assert.Equal(t, fmt.Sprintf("[%s]", DefaultsHeader), lines[3])
 		assert.Equal(t, 5, len(lines))
 		assert.Equal(t, "Windows Registry Editor Version 5.00", lines[0])
 		assert.Equal(t, "[HKEY_CURRENT_USER\\SOFTWARE\\Policies]", lines[1])
 		assert.Equal(t, "[HKEY_CURRENT_USER\\SOFTWARE\\Policies\\Rancher Desktop]", lines[2])
 		assert.Equal(t, "[HKEY_CURRENT_USER\\SOFTWARE\\Policies\\Rancher Desktop\\defaults]", lines[3])
-		assert.Equal(t, `"version"=dword:c`, lines[4])
+		assert.Equal(t, fmt.Sprintf(`"version"=dword:%02x`, options.CURRENT_SETTINGS_VERSION), lines[4])
 	})
 	t.Run("converts the registry-type arguments into reg headers", func(t *testing.T) {
 		type testCaseType struct {
-			hiveType       string
-			profileType    string
+			hiveType       RegistryHive
+			profileType    ProfileType
 			expectedHeader string
 		}
 		testCases := []testCaseType{
 			{
 				hiveType:       "hkcu",
 				profileType:    "defaults",
-				expectedHeader: "HKEY_CURRENT_USER\\SOFTWARE\\Policies\\Rancher Desktop\\defaults",
+				expectedHeader: DefaultsHeader,
 			},
 			{
 				hiveType:       "hklm",
@@ -88,7 +93,7 @@ func TestJsonToRegFormat(t *testing.T) {
 		jsonBody := `{"version": 19, "application": { "pathManagementStrategy": "manual" } }`
 		for _, testCase := range testCases {
 			t.Run(fmt.Sprintf("%s:%s", testCase.hiveType, testCase.profileType), func(t *testing.T) {
-				lines, err := JsonToReg(testCase.hiveType, testCase.profileType, jsonBody)
+				lines, err := JSONToReg(testCase.hiveType, testCase.profileType, jsonBody)
 				assert.NoError(t, err)
 				assert.Equal(t, 7, len(lines))
 				assert.Equal(t, fmt.Sprintf("[%s]", testCase.expectedHeader), lines[3])
@@ -105,11 +110,11 @@ func TestJsonToRegFormat(t *testing.T) {
         "list": ["wink", "blink", "drink"]
      } } }, "containerEngine": { "name": "beatrice" }}`
 		header := "HKEY_CURRENT_USER\\SOFTWARE\\Policies\\Rancher Desktop\\defaults"
-		lines, err := JsonToReg("hkcu", "defaults", jsonBody)
+		lines, err := JSONToReg("hkcu", "defaults", jsonBody)
 		assert.NoError(t, err)
 		assert.Equal(t, 12, len(lines))
 		assert.Equal(t, fmt.Sprintf("[%s]", header), lines[3])
-		assert.Equal(t, `"version"=dword:c`, lines[4])
+		assert.Equal(t, fmt.Sprintf(`"version"=dword:%02x`, options.CURRENT_SETTINGS_VERSION), lines[4])
 		assert.Equal(t, fmt.Sprintf("[%s\\application]", header), lines[5])
 		assert.Equal(t, fmt.Sprintf("[%s\\application\\extensions]", header), lines[6])
 		assert.Equal(t, fmt.Sprintf("[%s\\application\\extensions\\allowed]", header), lines[7])
@@ -131,7 +136,7 @@ func TestJsonToRegFormat(t *testing.T) {
   }
 }`
 		header := "HKEY_CURRENT_USER\\SOFTWARE\\Policies\\Rancher Desktop\\defaults"
-		lines, err := JsonToReg("hkcu", "defaults", jsonBody)
+		lines, err := JSONToReg("hkcu", "defaults", jsonBody)
 		assert.NoError(t, err)
 		assert.Equal(t, 11, len(lines))
 		assert.Equal(t, fmt.Sprintf("[%s\\WSL]", header), lines[5])
@@ -169,7 +174,7 @@ func TestJsonToRegFormat(t *testing.T) {
     "name": "moby"
   }
 }`
-		lines, err := JsonToReg("hkcu", "defaults", jsonBody)
+		lines, err := JSONToReg("hkcu", "defaults", jsonBody)
 		assert.NoError(t, err)
 		expectedLines := []string{
 			`Windows Registry Editor Version 5.00`,
@@ -235,8 +240,12 @@ func TestJsonToRegFormat(t *testing.T) {
   },
   "virtualMachine": {
     "memoryInGB": 4,
+    "mount": {
+      "type": "reverse-sshfs"
+    },
     "numberCPUs": 2,
-    "hostResolver": true
+    "type": "qemu",
+    "useRosetta": false
   },
   "WSL": {
     "integrations": {
@@ -271,10 +280,7 @@ func TestJsonToRegFormat(t *testing.T) {
   },
   "experimental": {
     "virtualMachine": {
-      "type": "qemu",
-      "useRosetta": false,
       "mount": {
-        "type": "reverse-sshfs",
         "9p": {
           "securityModel": "none",
           "protocolVersion": "9p2000.L",
@@ -282,7 +288,6 @@ func TestJsonToRegFormat(t *testing.T) {
           "cacheMode": "mmap"
         }
       },
-      "networkingTunnel": false,
       "proxy": {
         "enabled": false,
         "address": "",
@@ -294,8 +299,8 @@ func TestJsonToRegFormat(t *testing.T) {
   }
 }
 `
-		lines, err := JsonToReg("hkcu", "defaults", jsonBody)
+		lines, err := JSONToReg("hkcu", "defaults", jsonBody)
 		assert.NoError(t, err)
-		assert.Equal(t, 77, len(lines))
+		assert.Equal(t, 76, len(lines))
 	})
 }

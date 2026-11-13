@@ -1,9 +1,9 @@
 <script lang="ts">
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 
 import PreferencesNavItem from '@pkg/components/Preferences/ModalNavItem.vue';
 
-export default Vue.extend({
+export default defineComponent({
   name:       'preferences-nav',
   components: { NavItem: PreferencesNavItem },
   props:      {
@@ -34,13 +34,13 @@ export default Vue.extend({
   <div class="preferences-nav">
     <nav-item
       v-for="navItem in navItems"
-      :key="navItem"
-      :data-test="navToKebab(navItem)"
-      :name="navItem"
-      :active="currentNavItem === navItem"
+      :key="navItem.name"
+      :data-test="navToKebab(navItem.name)"
+      :name="navItem.name"
+      :active="currentNavItem === navItem.name"
       @click="navClicked"
     >
-      {{ navItem }}
+      {{ t(navItem.labelKey) }}
     </nav-item>
   </div>
 </template>

@@ -12,12 +12,6 @@ using_docker() {
 }
 
 ########################################################################
-: "${RD_KUBERNETES_VERSION:=1.23.6}"
-
-########################################################################
-: "${RD_KUBERNETES_PREV_VERSION:=1.22.7}"
-
-########################################################################
 : "${RD_RANCHER_IMAGE_TAG:=}"
 
 rancher_image_tag() {
@@ -96,7 +90,7 @@ if [[ -n $RD_TIMEOUT ]]; then
 fi
 
 ########################################################################
-: "${RD_USE_VZ_EMULATION:=false}"
+: "${RD_USE_VZ_EMULATION:=$(bool is_macos)}"
 
 using_vz_emulation() {
     is_true "$RD_USE_VZ_EMULATION"
@@ -107,7 +101,7 @@ if using_vz_emulation && ! supports_vz_emulation; then
 fi
 
 ########################################################################
-: "${RD_USE_WINDOWS_EXE:=false}"
+: "${RD_USE_WINDOWS_EXE:=$(bool is_windows)}"
 
 using_windows_exe() {
     is_true "$RD_USE_WINDOWS_EXE"
@@ -118,17 +112,6 @@ if using_windows_exe && ! is_windows; then
 fi
 
 ########################################################################
-: "${RD_USE_NETWORKING_TUNNEL:=$(bool is_windows)}"
-
-using_networking_tunnel() {
-    is_true "$RD_USE_NETWORKING_TUNNEL"
-}
-
-if using_networking_tunnel && ! is_windows; then
-    fatal "RD_USE_NETWORKING_TUNNEL only works on Windows"
-fi
-
-########################################################################
 if is_unix; then
     : "${RD_MOUNT_TYPE:=reverse-sshfs}"
 
@@ -136,6 +119,9 @@ if is_unix; then
 
     if [ "$RD_MOUNT_TYPE" = "virtiofs" ] && ! using_vz_emulation; then
         fatal "RD_MOUNT_TYPE=virtiofs only works with VZ emulation"
+    fi
+    if [ "$RD_MOUNT_TYPE" = "9p" ] && using_vz_emulation; then
+        fatal "RD_MOUNT_TYPE=9p only works with qemu emulation"
     fi
 else
     : "${RD_MOUNT_TYPE:=}"
@@ -180,9 +166,22 @@ using_ramdisk() {
 : "${RD_PROTECTED_DOT:=·}"
 
 ########################################################################
+# RD_VM_CPUS is the number of CPUs given to the virtual machine, matching
+# Rancher Desktop's own default.  CI sizes it per runner instead; see
+# .github/workflows/bats.yaml.
+: "${RD_VM_CPUS:=2}"
+
+########################################################################
+# RD_WAIT_FACTOR multiplies the waits in these helpers, `try`'s attempts and
+# the RD_KUBELET_TIMEOUT default below among them.  Waits sized for a
+# developer machine run out on a slow one, such as the macOS CI runners.
+# CI sizes the factor per runner; see .github/workflows/bats.yaml.
+: "${RD_WAIT_FACTOR:=1}"
+
+########################################################################
 # RD_KUBELET_TIMEOUT specifies the number of minutes wait_for_kubelet()
 # waits before it times out.
-: "${RD_KUBELET_TIMEOUT:=10}"
+: "${RD_KUBELET_TIMEOUT:=$((10 * RD_WAIT_FACTOR))}"
 
 ########################################################################
 # RD_LOCATION specifies the location where Rancher Desktop is installed
@@ -201,6 +200,14 @@ using_dev_mode() {
 }
 
 ########################################################################
+# Kubernetes versions
+
+# The main Kubernetes version to test.
+: "${RD_KUBERNETES_VERSION:=1.32.7}"
+
+# A secondary Kubernetes version; this is used for testing upgrades.
+: "${RD_KUBERNETES_ALT_VERSION:=1.31.3}"
+
 # RD_K3S_VERSIONS specifies a list of k3s versions. foreach_k3s_version()
 # can dynamically register a test to run once for each version in the
 # list. Only versions between RD_K3S_MIN and RD_K3S_MAX (inclusively)
@@ -210,9 +217,9 @@ using_dev_mode() {
 # "all" will fetch the list of all k3s releases from GitHub
 # "latest" will fetch the list of latest versions from the release channel
 
-: "${RD_K3S_MIN:=1.0.0}"
+: "${RD_K3S_MIN:=1.25.3}"
 : "${RD_K3S_MAX:=1.99.0}"
-: "${RD_K3S_VERSIONS:=$RD_KUBERNETES_PREV_VERSION}"
+: "${RD_K3S_VERSIONS:=$RD_KUBERNETES_VERSION}"
 
 validate_semver RD_K3S_MIN
 validate_semver RD_K3S_MAX
@@ -228,3 +235,14 @@ if ! load_var RD_K3S_VERSIONS; then
 
     save_var RD_K3S_VERSIONS
 fi
+
+########################################################################
+# RD_VPN_TEST_IMAGE specifies the URL used by the split DNS test to access
+# the private registry. Defaults to empty. Can be set via environment
+# variable when running tests.
+
+: "${RD_VPN_TEST_IMAGE:=}"
+
+using_vpn_test_image() {
+    [[ -n $RD_VPN_TEST_IMAGE ]]
+}

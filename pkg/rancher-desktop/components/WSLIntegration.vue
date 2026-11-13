@@ -14,20 +14,22 @@
         :label="item.name"
         :disabled="item.disabled"
         :description="item.description"
-        @input="toggleIntegration(item.name, $event)"
+        @update:value="toggleIntegration(item.name, $event)"
       />
     </div>
   </section>
 </template>
 
 <script lang="ts">
-import { Banner, Card, Checkbox } from '@rancher/components';
-import Vue from 'vue';
-import Component from 'vue-class-component';
+import { Checkbox } from '@rancher/components';
+import { defineComponent } from 'vue';
 
 import type { PropType } from 'vue';
 
-const WSLIntegrationProps = Vue.extend({
+export default defineComponent({
+  name:       'wsl-integration',
+  components: { Checkbox },
+
   props: {
     title: {
       type:    String,
@@ -42,49 +44,50 @@ const WSLIntegrationProps = Vue.extend({
       default: () => ({}),
     },
   },
-});
 
-@Component({
-  components: {
-    Banner, Card, Checkbox,
+  data() {
+    return {
+      name: 'wsl-integration',
+      /**
+       * A mapping to temporarily disable a selection while work happens
+       * asynchronously, to prevent the user from retrying to toggle too quickly.
+       */
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- gives busy a string index signature for this.busy[name]
+      busy: {} as Record<string, boolean>,
+    };
   },
-})
-class WSLIntegration extends WSLIntegrationProps {
-  name = 'wsl-integration';
-  /**
-   * A mapping to temporarily disable a selection while work happens
-   * asynchronously, to prevent the user from retrying to toggle too quickly.
-   */
-  protected busy: Record<string, boolean> = {};
 
-  get integrationsList() {
-    const results: {name: string, value: boolean, disabled: boolean, description: string}[] = [];
+  computed: {
+    integrationsList() {
+      const results: { name: string, value: boolean, disabled: boolean, description: string }[] = [];
 
-    for (const [name, value] of Object.entries(this.integrations)) {
-      if (typeof value === 'boolean') {
-        if (value === this.busy[name]) {
+      for (const [name, value] of Object.entries(this.integrations)) {
+        if (typeof value === 'boolean') {
+          if (value === this.busy[name]) {
+            this.$delete(this.busy, name);
+          }
+          results.push({
+            name, value, disabled: name in this.busy, description: '',
+          });
+        } else {
+          results.push({
+            name, value: false, disabled: true, description: value,
+          });
           this.$delete(this.busy, name);
         }
-        results.push({
-          name, value, disabled: name in this.busy, description: '',
-        });
-      } else {
-        results.push({
-          name, value: false, disabled: true, description: value,
-        });
-        this.$delete(this.busy, name);
       }
-    }
 
-    return results.sort((x, y) => x.name.localeCompare(y.name));
-  }
+      return results.sort((x, y) => x.name.localeCompare(y.name));
+    },
+  },
 
-  toggleIntegration(name: string, value: boolean) {
-    this.$set(this.busy, name, value);
-    this.$emit('integration-set', name, value);
-  }
-}
-export default WSLIntegration;
+  methods: {
+    toggleIntegration(name: string, value: boolean) {
+      this.busy.name = value;
+      this.$emit('integration-set', name, value);
+    },
+  },
+});
 </script>
 
 <style lang="scss" scoped>

@@ -1,4 +1,5 @@
 # Test case 11 & 12
+# bats file_tags=opensuse
 
 load '../helpers/load'
 RD_FILE_RAMDISK_SIZE=12 # We need more disk to run the Rancher image.
@@ -9,28 +10,28 @@ local_setup() {
 
 # Check that the rancher-latest/rancher helm chart at the given version is
 # supported on the current Kubernetes version (as determined by
-# $RD_KUBERNETES_PREV_VERSION)
+# $RD_KUBERNETES_VERSION)
 is_rancher_chart_compatible() {
     local chart_version=$1
 
     run helm show chart rancher-latest/rancher --version "$chart_version"
-    assert_success || return
+    assert_success
 
     run awk '/^kubeVersion:/ { $1 = ""; print }' <<<"$output"
-    assert_success || return
+    assert_success
     # We only support kubeVersion of form "< x.y.z"
-    assert_output --regexp '^[[:space:]]*<[[:space:]]*[^[:space:]]+$' || return
+    assert_output --regexp '^[[:space:]]*<[[:space:]]*[^[:space:]]+$'
 
     run awk '{ print $2 }' <<<"$output"
-    assert_success || return
+    assert_success
 
     local unsupported_version=$output
-    semver_gt "$unsupported_version" "$RD_KUBERNETES_PREV_VERSION" || return
+    semver_gt "$unsupported_version" "$RD_KUBERNETES_VERSION"
 }
 
 # Set (and save) $rancher_chart_version to $RD_RANCHER_IMAGE_TAG if it is set
 # (and compatible), or otherwise the oldest chart version that supports
-# $RD_KUBERNETES_PREV_VERSION.
+# $RD_KUBERNETES_VERSION.
 # If no compatible chart version could be found, calls mark_k3s_version_skipped
 # and fails the test.
 determine_chart_version() {
@@ -41,7 +42,7 @@ determine_chart_version() {
         if ! is_rancher_chart_compatible "$rancher_chart_version"; then
             mark_k3s_version_skipped
             printf "Rancher %s is not compatible with Kubernetes %s" \
-                "$rancher_chart_version" "$RD_KUBERNETES_PREV_VERSION" |
+                "$rancher_chart_version" "$RD_KUBERNETES_VERSION" |
                 fail
             return
         fi
@@ -53,13 +54,13 @@ determine_chart_version() {
     default_version=${default_version#v}
 
     run --separate-stderr helm search repo --versions rancher-latest/rancher --output json
-    assert_success || return
+    assert_success
 
     run jq_output 'map(.version).[]'
-    assert_success || return
+    assert_success
 
     run sort --version-sort <<<"$output"
-    assert_success || return
+    assert_success
     local versions=$output
 
     for rancher_chart_version in $versions; do
@@ -73,15 +74,15 @@ determine_chart_version() {
             # Once we find a compatible version, use it (and don't look at the
             # rest of the chart versions).
             trace "$(printf "Selected rancher chart version %s for Kubernetes %s" \
-                "$rancher_chart_version" "$RD_KUBERNETES_PREV_VERSION")"
+                "$rancher_chart_version" "$RD_KUBERNETES_VERSION")"
             save_var rancher_chart_version
             return
         fi
     done
     mark_k3s_version_skipped
     printf "Could not find a version of rancher-latest/rancher compatible with Kubernetes %s\n" \
-        "$RD_KUBERNETES_PREV_VERSION" |
-        fail || return
+        "$RD_KUBERNETES_VERSION" |
+        fail
 }
 
 deploy_rancher() {
@@ -95,25 +96,44 @@ deploy_rancher() {
         fail "Could not restore Rancher chart version"
     fi
 
+    # v1.16.5 is the newest cert-manager that still supports Kubernetes 1.25.
+    # Unpinned pulls the latest chart, whose CRDs declare selectableFields;
+    # the apiservers we test against reject that field.  An OCI registry has
+    # no index to search, so helm only accepts an exact version here.
     helm upgrade \
-        --install cert-manager jetstack/cert-manager \
+        --install cert-manager oci://quay.io/jetstack/charts/cert-manager \
+        --version v1.16.5 \
         --namespace cert-manager \
         --set installCRDs=true \
         --set "extraArgs[0]=--enable-certificate-owner-ref=true" \
         --create-namespace
 
     local host
-    host=$(traefik_hostname) || return
+    host=$(traefik_hostname)
 
     comment "Installing rancher $rancher_chart_version"
+    # Kubernetes 1.25 removed the PodSecurityPolicy API, but chart 2.7.2, the
+    # oldest one determine_chart_version accepts for 1.25, still defaults
+    # global.cattle.psp.enabled to true and then refuses to install.  2.7.5 and
+    # later derive the value from the cluster version, so the flag is a no-op
+    # there.
     helm upgrade \
         --install rancher rancher-latest/rancher \
         --version "$rancher_chart_version" \
         --namespace cattle-system \
+        --set global.cattle.psp.enabled=false \
         --set hostname="$host" \
-        --wait \
-        --timeout=10m \
+        --set replicas=1 \
         --create-namespace
+
+    # Don't use `helm --wait`: the chart's Deployment relies on the default
+    # `progressDeadlineSeconds` (10m), which is shorter than the initial
+    # rancher image pull on slow networks. Wait on `Available` directly,
+    # since that condition is driven by pod Ready state and is unaffected
+    # by ProgressDeadlineExceeded.
+    kubectl wait --namespace cattle-system \
+        --for=condition=Available --timeout=30m \
+        deployment/rancher
 }
 
 verify_rancher() {
@@ -123,27 +143,33 @@ verify_rancher() {
     fi
 
     local host
-    host=$(traefik_hostname) || return
+    host=$(traefik_hostname)
 
-    run try --max 9 --delay 10 curl --insecure --silent --show-error "https://${host}/dashboard/auth/login"
+    # Without `--fail`, Traefik's "no available server" 503 counts as a
+    # successful curl, and `try` returns after the first attempt.
+    run try --max 9 --delay 10 curl --insecure --silent --show-error --fail "https://${host}/dashboard/auth/login"
     assert_success
-    assert_output --partial 'href="/dashboard/'
+    assert_output --partial 'src="/dashboard/'
     run kubectl get secret --namespace cattle-system bootstrap-secret -o json
     assert_success
     assert_output --partial "bootstrapPassword"
 }
 
 uninstall_rancher() {
-    run helm uninstall rancher --namespace cattle-system --wait
+    # Don't use `helm --wait`. Rancher's uninstall leaves a broken ext.cattle.io
+    # aggregated API that hangs helm's post-delete wait; factory_reset handles cleanup.
+    run helm uninstall rancher --namespace cattle-system
     assert_nothing
-    run helm uninstall cert-manager --namespace cert-manager --wait
+    run helm uninstall cert-manager --namespace cert-manager
     assert_nothing
 }
 
 @test 'add helm repo' {
     helm repo add jetstack https://charts.jetstack.io
     helm repo add rancher-latest https://releases.rancher.com/server-charts/latest
-    helm repo update
+    # Update only the repos this test adds; the shared global config may hold
+    # unrelated stale repos that would fail a bare `helm repo update`.
+    helm repo update jetstack rancher-latest
 }
 
 foreach_k3s_version \

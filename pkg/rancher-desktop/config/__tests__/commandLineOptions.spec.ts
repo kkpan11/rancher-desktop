@@ -1,13 +1,18 @@
 import fs from 'fs';
 import os from 'os';
 
+import { jest } from '@jest/globals';
 import _ from 'lodash';
 
-import { getObjectRepresentation, LockedFieldError, updateFromCommandLine } from '@pkg/config/commandLineOptions';
 import * as settings from '@pkg/config/settings';
 import { TransientSettings } from '@pkg/config/transientSettings';
 import clone from '@pkg/utils/clone';
+import mockModules from '@pkg/utils/testUtils/mockModules';
 import { RecursiveKeys } from '@pkg/utils/typeUtils';
+
+mockModules({ '@pkg/utils/logging': undefined });
+
+const { getObjectRepresentation, LockedFieldError, updateFromCommandLine } = await import('@pkg/config/commandLineOptions');
 
 describe('commandLineOptions', () => {
   let prefs: settings.Settings;
@@ -26,7 +31,7 @@ describe('commandLineOptions', () => {
         name: settings.ContainerEngine.MOBY,
       },
       kubernetes: {
-        version: '1.23.5',
+        version: '1.29.5',
         port:    6443,
         enabled: true,
         options: {
@@ -72,17 +77,17 @@ describe('commandLineOptions', () => {
     });
 
     test('one option with embedded equal sign should change only one value', () => {
-      const newPrefs = updateFromCommandLine(prefs, lockedSettings, ['--kubernetes.version=1.23.6']);
+      const newPrefs = updateFromCommandLine(prefs, lockedSettings, ['--kubernetes.version=1.29.6']);
 
-      expect(newPrefs.kubernetes.version).toBe('1.23.6');
+      expect(newPrefs.kubernetes.version).toBe('1.29.6');
       newPrefs.kubernetes.version = origPrefs.kubernetes.version;
       expect(newPrefs).toEqual(origPrefs);
     });
 
     test('one option over two args should change only one value', () => {
-      const newPrefs = updateFromCommandLine(prefs, lockedSettings, ['--kubernetes.version', '1.23.7']);
+      const newPrefs = updateFromCommandLine(prefs, lockedSettings, ['--kubernetes.version', '1.29.7']);
 
-      expect(newPrefs.kubernetes.version).toBe('1.23.7');
+      expect(newPrefs.kubernetes.version).toBe('1.29.7');
       newPrefs.kubernetes.version = origPrefs.kubernetes.version;
       expect(newPrefs).toEqual(origPrefs);
     });
@@ -115,9 +120,9 @@ describe('commandLineOptions', () => {
     });
 
     test('changes specified options', () => {
-      const optionsByPlatform: Record<string, Array<string | [string, string]>> = {
+      const optionsByPlatform: Record<string, (string | [string, string])[]> = {
         win32: [
-          '--virtualMachine.hostResolver',
+          '--experimental.virtualMachine.proxy.enabled',
         ],
         '!win32': [
           '--application.adminAccess',
@@ -147,11 +152,11 @@ describe('commandLineOptions', () => {
       };
 
       for (const platform in optionsByPlatform) {
-        const options: Array<string | [string, string]> = optionsByPlatform[platform as 'win32'|'linux'|'darwin'|'*'];
+        const options: (string | [string, string])[] = optionsByPlatform[platform as 'win32' | 'linux' | 'darwin' | '*'];
 
         for (const entry of options) {
           let option: string;
-          let newValue: string|boolean|number|undefined;
+          let newValue: string | boolean | number | undefined;
 
           if (Array.isArray(entry)) {
             option = entry[0];
@@ -160,7 +165,7 @@ describe('commandLineOptions', () => {
             option = entry;
           }
           const accessor = option.substring(2);
-          const oldValue: string|boolean|number|undefined = _.get(origPrefs, accessor);
+          const oldValue: string | boolean | number | undefined = _.get(origPrefs, accessor);
 
           expect(oldValue).not.toBeUndefined();
           if (newValue === undefined) {
@@ -311,7 +316,7 @@ describe('commandLineOptions', () => {
 
       expect(() => {
         updateFromCommandLine(prefs, lockedSettings, [`${ arg }=${ value }`]);
-      }).toThrow(`Can't evaluate ${ arg }=${ value } as number: SyntaxError: Unexpected token a in JSON at position 0`);
+      }).toThrow(`Can't evaluate ${ arg }=${ value } as number: SyntaxError: Unexpected token 'a', \"angeles\" is not valid JSON`);
     });
 
     test('should complain about type mismatches', () => {

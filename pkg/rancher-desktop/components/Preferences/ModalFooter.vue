@@ -1,10 +1,10 @@
 <script lang="ts">
-import Vue from 'vue';
+import { defineComponent } from 'vue';
 import { mapGetters } from 'vuex';
 
 import PreferencesAlert from '@pkg/components/Preferences/Alert.vue';
 
-export default Vue.extend({
+export default defineComponent({
   name:       'preferences-footer',
   components: { PreferencesAlert },
   computed:   {
@@ -35,14 +35,14 @@ export default Vue.extend({
         class="btn role-secondary"
         @click="cancel"
       >
-        Cancel
+        {{ t('generic.cancel') }}
       </button>
       <button
         class="btn role-primary"
         :disabled="isDisabled"
         @click="apply"
       >
-        Apply
+        {{ t('generic.apply') }}
       </button>
     </div>
   </div>

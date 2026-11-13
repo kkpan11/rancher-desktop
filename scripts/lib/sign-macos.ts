@@ -8,31 +8,31 @@ import path from 'path';
 
 import { notarize } from '@electron/notarize';
 import { build, Arch, Configuration, Platform } from 'app-builder-lib';
-import MacPackager from 'app-builder-lib/out/macPackager';
+import { MacPackager } from 'app-builder-lib/out/macPackager';
 import { AsyncTaskManager, log } from 'builder-util';
 import { Target } from 'electron-builder';
 import _ from 'lodash';
-import plist from 'plist';
+import * as plist from 'plist';
 import yaml from 'yaml';
 
 import { spawnFile } from '@pkg/utils/childProcess';
 
-type SigningConfig = {
+interface SigningConfig {
   entitlements: {
-    default: string[];
+    default:   string[];
     overrides: {
-      paths: string[];
+      paths:        string[];
       entitlements: string[];
     }[];
   }
   constraints: {
-    paths: string[];
-    self?: Record<string, any>;
-    parent?: Record<string, any>;
+    paths:        string[];
+    self?:        Record<string, any>;
+    parent?:      Record<string, any>;
     responsible?: Record<string, any>;
   }[]
   remove: string[];
-};
+}
 
 export async function sign(workDir: string): Promise<string[]> {
   const certFingerprint = process.env.CSC_FINGERPRINT ?? '';
@@ -187,7 +187,7 @@ export async function sign(workDir: string): Promise<string[]> {
 /**
  * Recursively walk the given directory and locate files to sign.
  */
-async function *findFilesToSign(dir: string): AsyncIterable<string> {
+async function * findFilesToSign(dir: string): AsyncIterable<string> {
   // When doing code signing, the children must be signed before their parents
   // (so that their signatures can be incorporated into the parent signature,
   // Merkle tree style).
@@ -207,30 +207,19 @@ async function *findFilesToSign(dir: string): AsyncIterable<string> {
       continue; // We only sign regular files.
     }
 
-    if (isBundleExecutable(fullPath)) {
+    if (await isBundleExecutable(fullPath)) {
       // For bundles (apps and frameworks), we skip signing the executable
       // itself as it will be signed when signing the bundle.
       continue;
     }
 
-    // For regular files, read the first four bytes of the file and look
-    // for Mach-O headers.
+    // For regular files, call `file` and check if it thinks it's Mach-O.
+    // We previously read the file header, but that was unreliable.
     try {
-      const file = await fs.promises.open(fullPath);
+      const { stdout } = await spawnFile('/usr/bin/file', ['--brief', fullPath], { stdio: 'pipe' });
 
-      try {
-        const { buffer } = await file.read({ buffer: Buffer.alloc(4), length: 4 });
-        const header = buffer.readUInt32BE();
-        const validHeaders = [
-          0xFEEDFACF, // Mach-O 64 bit, correct endian
-          0xCFFAEDFE, // Mach-O 64 bit, reversed endian
-        ];
-
-        if (!validHeaders.includes(header)) {
-          continue;
-        }
-      } finally {
-        await file.close();
+      if (!stdout.startsWith('Mach-O ')) {
+        continue;
       }
     } catch {
       log.info({ fullPath }, 'Failed to read file, assuming no need to sign.');
@@ -260,15 +249,33 @@ async function *findFilesToSign(dir: string): AsyncIterable<string> {
 /**
  * Detect if the path of a plain file indicates that it's the bundle executable
  */
-function isBundleExecutable(fullPath: string): boolean {
+async function isBundleExecutable(fullPath: string): Promise<boolean> {
   const parts = fullPath.split(path.sep).reverse();
 
   if (parts.length >= 4) {
-    // Foo.app/Contents/MacOS/Foo - the check style here avoids spell checker.
-    if (fullPath.endsWith(`${ parts[0] }.app/Contents/MacOS/${ parts[0] }`)) {
-      return true;
+    // Anything.app/Contents/MacOS/executable - the check style here avoids spell checker.
+    if (fullPath.endsWith(`.app/Contents/MacOS/${ parts[0] }`)) {
+      // Check Anything.app/Contents/Info.plist for CFBundleExecutable
+      const infoPlist = path.sep + path.join(...parts.slice(2).reverse(), 'Info.plist');
+
+      try {
+        const executableKey = 'CFBundleExecutable';
+        const plistContents = await fs.promises.readFile(infoPlist, 'utf-8');
+        const value = plist.parse(plistContents);
+
+        if (typeof value !== 'object' || !(executableKey in value)) {
+          return false;
+        }
+
+        return value[executableKey] === parts[0];
+      } catch (ex) {
+        log.info({ ex, infoPlist }, 'Failed to read Info.plist, assuming not the bundle executable.');
+
+        return false;
+      }
     }
   }
+
   if (parts.length >= 4) {
     // Foo.framework/Versions/A/Foo
     if (parts[3] === `${ parts[0] }.framework` && parts[2] === 'Versions') {
@@ -309,7 +316,7 @@ function evaluateConstraints(constraint: Record<string, any>): Record<string, an
  * CustomPackager overrides MacPackager to avoid building blockmap files
  */
 class CustomPackager extends MacPackager {
-  override pack(outDir: string, arch: Arch, targets: Array<Target>, taskManager: AsyncTaskManager): Promise<any> {
+  override pack(outDir: string, arch: Arch, targets: Target[], taskManager: AsyncTaskManager): Promise<any> {
     for (const target of targets) {
       if ('isWriteUpdateInfo' in target) {
         (target as any).isWriteUpdateInfo = false;

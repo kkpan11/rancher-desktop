@@ -5,6 +5,8 @@
 
 import Electron from 'electron';
 
+import { extensionThemes } from './extension-themes';
+
 import type { SpawnOptions } from '@pkg/main/extensions/types';
 import clone from '@pkg/utils/clone';
 import { ipcRenderer } from '@pkg/utils/ipcRenderer';
@@ -23,10 +25,10 @@ const id = Symbol('id');
  * ddClient.docker.listContainers()
  */
 interface DockerListContainersOptions {
-  all?: boolean;
-  limit?: number;
-  size?: boolean;
-  filters?: string;
+  all?:       boolean;
+  limit?:     number;
+  size?:      boolean;
+  filters?:   string;
   namespace?: string;
 }
 
@@ -35,27 +37,76 @@ interface DockerListContainersOptions {
  * ddClient.docker.listImages()
  */
 interface DockerListImagesOptions {
-  all?: boolean;
-  filters?: string;
-  digests?: boolean;
+  all?:       boolean;
+  filters?:   string;
+  digests?:   boolean;
   namespace?: string;
+}
+
+/**
+ * DockerListVolumesOptions describes the arguments for
+ * ddClient.docker.rdListVolumes()
+ */
+interface DockerListVolumesOptions {
+  filters?:   string;
+  namespace?: string;
+}
+
+/**
+ * DockerEventCallback is the callback function for Docker events
+ */
+type DockerEventCallback = (event: DockerEvent) => void;
+
+/**
+ * DockerEvent represents a Docker event
+ */
+interface DockerEvent {
+  Type:   string;    // container, volume, network, etc.
+  Action: string;  // create, start, stop, destroy, etc.
+  Actor: {
+    ID:         string;
+    Attributes: Record<string, string>;
+  };
+  time:     number;
+  timeNano: number;
+  status?:  string;
+  id?:      string;
+  from?:    string;
+}
+
+/**
+ * DockerEventSubscriptionOptions for subscribing to Docker events
+ */
+interface DockerEventSubscriptionOptions {
+  filters?: {
+    type?:      string[];
+    event?:     string[];
+    container?: string[];
+    label?:     string[];
+  };
+  namespace?: string;
+}
+
+/**
+ * DockerEventSubscription represents an active event subscription
+ */
+interface DockerEventSubscription {
+  unsubscribe(): void;
 }
 
 /** execProcess holds the state associated with a v1.ExecProcess. */
 interface execProcess {
   /** The identifier for this process. */
-  [id]: string;
+  [id]:     string;
   [stdout]: string;
   [stderr]: string;
   [stream]: v1.ExecStreamOptions;
 }
 
-// eslint-disable-next-line import/namespace -- it doesn't understand TypeScript
 interface RDXExecOptions extends v1.ExecOptions {
   namespace?: string;
 }
 
-// eslint-disable-next-line import/namespace -- it doesn't understand TypeScript
 interface RDXSpawnOptions extends v1.SpawnOptions {
   namespace?: string;
 }
@@ -64,6 +115,17 @@ interface RDXSpawnOptions extends v1.SpawnOptions {
  * The identifier for the extension (the name of the image).
  */
 const extensionId = location.protocol === 'app:' ? '<app>' : decodeURIComponent(location.hostname.replace(/(..)/g, '%$1'));
+
+/**
+ * Context passed from the main process via additionalArguments.
+ */
+const extensionContext: { arch?: string, hostname?: string, extensionVersion?: string } = (() => {
+  try {
+    return JSON.parse(process.argv.slice(-1).pop() ?? '{}');
+  } catch {
+    return {};
+  }
+})();
 
 /**
  * The processes that are waiting to complete, keyed by the process ID.
@@ -76,6 +138,11 @@ const outstandingProcesses: Record<string, execProcess> = {};
  * we don't end up reusing processes from previous loads.
  */
 const pageLoadId = Array.from(window.crypto.getRandomValues(new Uint8Array(16))).map(v => `00${ v.toString(16) }`.slice(-2)).join('');
+
+/**
+ * Store for active event subscriptions
+ */
+const eventSubscriptions = new Map<string, v1.ExecProcess>();
 
 /**
  * Construct a TypeError message that is similar to what the browser would
@@ -198,9 +265,9 @@ function getExec(scope: SpawnOptions['scope']): v1.Exec {
     return (async() => {
       const response = await ipcRenderer.invoke('extensions/spawn/blocking', safeOptions);
 
-      console.debug(`spawn/blocking got result:`, process.env.RD_TEST === 'e2e' ? JSON.stringify(response) : response);
+      console.debug(`spawn/blocking got result:`, (process.env.RD_TEST ?? '').includes('e2e') ? JSON.stringify(response) : response);
 
-      return {
+      const result = {
         cmd:    response.cmd,
         signal: typeof response.result === 'string' ? response.result : undefined,
         code:   typeof response.result === 'number' ? response.result : undefined,
@@ -216,6 +283,12 @@ function getExec(scope: SpawnOptions['scope']): v1.Exec {
           return JSON.parse(response.stdout);
         },
       };
+
+      if (result.signal || result.code) {
+        throw result;
+      }
+
+      return result;
     })();
   }
 
@@ -267,7 +340,7 @@ ipcRenderer.on('extensions/spawn/output', (event, id, data) => {
           return;
         }
         try {
-          process[stream].onOutput?.({ [key]: line } as {stdout:string} | {stderr:string});
+          process[stream].onOutput?.({ [key]: line } as { stdout: string } | { stderr: string });
         } catch (ex) {
           console.error(ex);
         }
@@ -298,10 +371,12 @@ ipcRenderer.on('extensions/spawn/close', (_, id, returnValue) => {
 });
 
 // During the nuxt removal, import/namespace started failing
-// eslint-disable-next-line import/namespace
-class Client implements v1.DockerDesktopClient {
-  constructor(info: {arch: string, hostname: string}) {
-    Object.assign(this.host, info);
+
+export class RDXClient implements v1.DockerDesktopClient {
+  constructor(info?: { arch: string, hostname: string }) {
+    if (info) {
+      Object.assign(this.host, info);
+    }
   }
 
   /**
@@ -309,8 +384,16 @@ class Client implements v1.DockerDesktopClient {
    * that wraps ddClient.extension.vm.service.request().
    */
   protected makeRequest(method: string, url: string, data?: any): Promise<unknown> {
+    const headers: Record<string, string> = {};
+
+    if (typeof data === 'object') {
+      // For objects, pass the value as JSON.
+      headers['Content-Type'] = 'application/json';
+      data = JSON.stringify(data);
+    }
+
     return this.request({
-      method, url, data, headers: {},
+      method, url, data, headers,
     });
   }
 
@@ -318,19 +401,33 @@ class Client implements v1.DockerDesktopClient {
     try {
       const result = await ipcRenderer.invoke('extensions/vm/http-fetch', config);
 
-      // Parse as JSON if possible (API is unclear).
-      try {
-        return JSON.parse(result);
-      } catch {
-        return result;
+      if (!result) {
+        return;
       }
+
+      // Parse as JSON if possible (API is unclear).
+      let { statusCode, message } = result;
+
+      try {
+        if (message) {
+          message = JSON.parse(message);
+        }
+      } catch {
+        // Body is not JSON, return it as-is.
+      }
+
+      if (statusCode >= 200 && statusCode < 300) {
+        return message;
+      }
+
+      return Promise.reject(result);
     } catch (ex) {
       console.debug(`${ config.method } ${ config.url } error:`, ex);
       throw ex;
     }
   }
 
-  extension: v1.Extension = {
+  extension: v1.Extension & { id?: string, version?: string } = {
     vm: {
       cli:     { exec: getExec('container') },
       service: {
@@ -343,8 +440,10 @@ class Client implements v1.DockerDesktopClient {
         head:    (url: string) => this.makeRequest('HEAD', url),
       },
     },
-    host:  { cli: { exec: getExec('host') } },
-    image: extensionId,
+    host:    { cli: { exec: getExec('host') } },
+    image:   extensionContext.extensionVersion ? `${ extensionId }:${ extensionContext.extensionVersion }` : extensionId,
+    id:      extensionId,
+    version: extensionContext.extensionVersion ?? '',
   };
 
   desktopUI = {
@@ -374,8 +473,8 @@ class Client implements v1.DockerDesktopClient {
       ipcRenderer.send('extensions/open-external', url);
     },
     platform: process.platform,
-    arch:     '<unknown>',
-    hostname: '<unknown>',
+    arch:     extensionContext.arch ?? '<unknown>',
+    hostname: extensionContext.hostname ?? '<unknown>',
   };
 
   docker = {
@@ -435,31 +534,40 @@ class Client implements v1.DockerDesktopClient {
 
       return lsContainers.map((c) => {
         const details = inspectContainers.find(i => i.Id.startsWith(c.ID));
-        const pick = (object: any, ...prop: (string | [string, string])[]) => {
+
+        function pick<K extends string | readonly [string, string]>(object: any, ...prop: K[])
+          : { [key in K as key extends string ? key : key[1]]: any } {
           const result: Record<string, any> = {};
 
           for (const p of prop) {
-            const [key, newKey] = Array.isArray(p) ? p : [p, p];
+            const [key, newKey] = (Array.isArray(p) ? p : [p, p]) as [string, string];
 
-            if (key in object ?? {}) {
+            if (key in (object ?? {})) {
               result[newKey] = object[key];
             }
           }
 
-          return result;
-        };
+          return result as any;
+        }
+
+        // The Docker Engine API prefixes container names with '/'; the CLI
+        // output we parse strips it, so restore it to match the Engine API.
+        const names = (typeof c.Names === 'string' ? c.Names.split(/\s+/g) : Array.from(c.Names))
+          .map((name: string) => (name.startsWith('/') ? name : `/${ name }`));
 
         return {
           ...pick(c, 'Image', 'Command', 'Status'),
-          ...pick(details, 'Id', ['Image', 'ImageID'], 'NetworkSettings', 'Mounts'),
+          ...pick(details, 'Id', 'NetworkSettings', 'Mounts'),
+          ...pick(details, ['Image', 'ImageID'] as const),
           HostConfig: details.HostConfig ?? {},
           SizeRootFs: details.SizeRootFs ?? -1,
           SizeRw:     details.SizeRw ?? -1,
           Ports:      details.NetworkSettings?.Ports ?? {},
           ...pick(details.Config, 'Labels'),
-          ...pick(details.State, ['Status', 'State']),
-          Names:      typeof c.Names === 'string' ? c.Names.split(/\s+/g) : Array.from(c.Names),
+          ...pick(details.State, ['Status', 'State'] as const),
+          Names:      names,
           Created:    Date.parse(c.CreatedAt).valueOf(),
+          Started:    Date.parse(details.State.StartedAt).valueOf(),
         };
       });
     },
@@ -528,21 +636,113 @@ class Client implements v1.DockerDesktopClient {
         };
       });
     },
+    rdListVolumes: async(options: DockerListVolumesOptions = {}) => {
+      const lsArgs = ['ls', '--format={{json .}}'];
+
+      if (options.filters !== undefined) {
+        lsArgs.push(`--filter=${ options.filters }`);
+      }
+      if (options.namespace) {
+        lsArgs.unshift(`--namespace=${ options.namespace }`);
+      }
+
+      const lsResult = await this.docker.cli.exec('volume', lsArgs);
+
+      if (lsResult.code || lsResult.signal) {
+        throw new Error(`failed to list volumes: ${ lsResult.stderr }`);
+      }
+
+      const lsVolumes = lsResult.parseJsonLines();
+
+      return lsVolumes.map((v) => {
+        return {
+          Name:       v.Name,
+          Driver:     v.Driver,
+          Mountpoint: v.Mountpoint,
+          Labels:     v.Labels ?? {},
+          Scope:      v.Scope,
+          Options:    v.Options ?? {},
+          UsageData:  v.UsageData ?? {},
+          CreatedAt:  v.CreatedAt,
+          Created:    v.CreatedAt ? Date.parse(v.CreatedAt).valueOf() : 0,
+        };
+      });
+    },
+    rdSubscribeToEvents: (callback: DockerEventCallback, options: DockerEventSubscriptionOptions = {}): DockerEventSubscription => {
+      const eventArgs = ['events', '--format', '{{json .}}'];
+
+      options.filters?.type?.forEach(type => {
+        eventArgs.push('--filter', `type=${ type }`);
+      });
+      options.filters?.event?.forEach(event => {
+        eventArgs.push('--filter', `event=${ event }`);
+      });
+      options.filters?.container?.forEach(container => {
+        eventArgs.push('--filter', `container=${ container }`);
+      });
+      options.filters?.label?.forEach(label => {
+        eventArgs.push('--filter', `label=${ label }`);
+      });
+
+      const subscriptionId = `events-${ Date.now() }-${ Math.random().toString(36).substring(2, 11) }`;
+
+      const eventProcess = this.docker.cli.exec('system', eventArgs, {
+        stream: {
+          onOutput: ({ stdout, stderr }) => {
+            if (stdout) {
+              try {
+                const event = JSON.parse(stdout) as DockerEvent;
+                callback(event);
+              } catch (error) {
+                console.error('Failed to parse Docker event:', error, stdout);
+              }
+            }
+            if (stderr) {
+              console.error('Docker events stderr:', stderr);
+            }
+          },
+          onError: (error: any) => {
+            console.error('Docker events stream error:', error);
+          },
+          onClose: (code: number) => {
+            console.debug(`Docker events stream closed with code ${ code }`);
+          },
+          splitOutputLines: true,
+        },
+      });
+
+      eventSubscriptions.set(subscriptionId, eventProcess);
+
+      return {
+        unsubscribe: () => {
+          eventSubscriptions.get(subscriptionId)?.close();
+          eventSubscriptions.delete(subscriptionId);
+        },
+      };
+    },
   };
 }
 
 export default function initExtensions(): void {
   switch (document.location.protocol) {
   case 'x-rd-extension:': {
-    const hostInfo: { arch: string, hostname: string } = JSON.parse(process.argv.slice(-1).pop() ?? '{}');
-
-    Electron.contextBridge.exposeInMainWorld('ddClient', new Client(hostInfo));
+    Electron.contextBridge.exposeInMainWorld('ddClient', new RDXClient());
+    // Assigning from inside the main world keeps these writable.  Some
+    // extensions ship their own themes and assign over ours, which a
+    // contextBridge exposure would break.
+    Electron.contextBridge.executeInMainWorld({
+      func: (themes: unknown) => {
+        (globalThis as any).__ddMuiV5Themes = themes;
+        (globalThis as any).__ddMuiV6Themes = themes;
+      },
+      args: [extensionThemes],
+    });
     break;
   }
   case 'app:': {
     import('os').then(({ arch, hostname }) => {
       Object.defineProperty(window, 'ddClient', {
-        value:        new Client({ arch: arch(), hostname: hostname() }),
+        value:        new RDXClient({ arch: arch(), hostname: hostname() }),
         configurable: true,
         enumerable:   true,
         writable:     true,
@@ -571,5 +771,15 @@ export default function initExtensions(): void {
         }
       }
     }
+
+    // Clean up event subscriptions
+    for (const [id, proc] of eventSubscriptions) {
+      try {
+        proc.close();
+      } catch (ex) {
+        console.debug(`failed to kill event subscription ${ id }:`, ex);
+      }
+    }
+    eventSubscriptions.clear();
   });
 }

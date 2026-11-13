@@ -2,11 +2,12 @@
   "compilerOptions": {
     "target": "ES2018",
     "module": "ESNext",
-    "moduleResolution": "Node",
+    "moduleResolution": "Bundler",
     "lib": [
       "ESNext",
       "ESNext.AsyncIterable",
-      "DOM"
+      "DOM",
+      "DOM.Iterable",
     ],
     "esModuleInterop": true,
     "allowJs": true,
@@ -14,7 +15,6 @@
     "strict": true,
     "noEmit": false,
     "experimentalDecorators": true,
-    "baseUrl": ".",
     "paths": {
       "@pkg/*": [
         "./*"
@@ -23,17 +23,22 @@
     "typeRoots": [
       "../../node_modules",
       "../../node_modules/@types",
-    ],    
+    ],
     "types": [
-      "@nuxt/types",
       "@types/node",
       "@types/jest"
     ]
   },
   "exclude": [
     "node_modules",
-    ".nuxt",
     "dist",
     "babel.config.js"
+  ],
+  "include": [
+    "**/*",
+    "**/*.ts",
+    "**/*.d.ts",
+    "**/*.tsx",
+    "**/*.vue"
   ]
 }

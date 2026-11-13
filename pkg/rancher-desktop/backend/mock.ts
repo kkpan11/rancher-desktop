@@ -18,12 +18,14 @@ import {
   ContainerRunOptions,
   ContainerStopOptions,
   ReadableProcess,
+  WritableReadableProcess,
 } from './containerClient';
 import { KubernetesBackend, KubernetesBackendEvents, KubernetesError } from './k8s';
 import ProgressTracker from './progressTracker';
 
 import K3sHelper from '@pkg/backend/k3sHelper';
 import { Settings } from '@pkg/config/settings';
+import { t } from '@pkg/main/i18n';
 import { ChildProcess } from '@pkg/utils/childProcess';
 import Logging, { Log } from '@pkg/utils/logging';
 import { RecursivePartial } from '@pkg/utils/typeUtils';
@@ -34,8 +36,8 @@ export default class MockBackend extends events.EventEmitter implements VMExecut
   readonly kubeBackend: KubernetesBackend = new MockKubernetesBackend();
   readonly executor = this;
   readonly backend = 'mock';
-  cfg: BackendSettings | undefined;
-  state: State = State.STOPPED;
+  cfg:                  BackendSettings | undefined;
+  state:                State = State.STOPPED;
   readonly cpus = Promise.resolve(1);
   readonly memory = Promise.resolve(1);
   progress = { current: 0, max: 0 };
@@ -77,7 +79,7 @@ export default class MockBackend extends events.EventEmitter implements VMExecut
   async stop(): Promise<void> {
     console.log('Stopping mock backend...');
     this.setState(State.STOPPING);
-    await this.progressTracker.action('Stopping mock backend', 0,
+    await this.progressTracker.action(t('progress.stoppingMockBackend'), 0,
       util.promisify(setTimeout)(1_000));
     this.setState(State.STOPPED);
     console.log('Mock backend stopped.');
@@ -167,8 +169,8 @@ export default class MockBackend extends events.EventEmitter implements VMExecut
   // #endregion
 
   // #region Events
-  eventNames(): Array<keyof BackendEvents> {
-    return super.eventNames() as Array<keyof BackendEvents>;
+  eventNames(): (keyof BackendEvents)[] {
+    return super.eventNames() as (keyof BackendEvents)[];
   }
 
   listeners<eventName extends keyof BackendEvents>(
@@ -241,8 +243,8 @@ class MockKubernetesBackend extends events.EventEmitter implements KubernetesBac
   }
 
   // #region Events
-  eventNames(): Array<keyof KubernetesBackendEvents> {
-    return super.eventNames() as Array<keyof KubernetesBackendEvents>;
+  eventNames(): (keyof KubernetesBackendEvents)[] {
+    return super.eventNames() as (keyof KubernetesBackendEvents)[];
   }
 
   listeners<eventName extends keyof KubernetesBackendEvents>(
@@ -304,6 +306,7 @@ class MockContainerEngineClient implements ContainerEngineClient {
   runClient(args: string[], stdio: Log, options?: ContainerRunClientOptions): Promise<Record<string, never>>;
   runClient(args: string[], stdio: 'pipe', options?: ContainerRunClientOptions): Promise<{ stdout: string; stderr: string; }>;
   runClient(args: string[], stdio: 'stream', options?: ContainerRunClientOptions): ReadableProcess;
+  runClient(args: string[], stdio: 'interactive', options?: ContainerRunClientOptions): WritableReadableProcess;
   runClient(args: string[], stdio?: unknown, options?: ContainerRunClientOptions): unknown {
     return Promise.resolve({ stdout: '', stderr: '' });
   }

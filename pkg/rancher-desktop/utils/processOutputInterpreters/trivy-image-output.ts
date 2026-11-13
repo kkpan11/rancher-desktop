@@ -1,5 +1,6 @@
 const LineSplitter = /\r?\n/;
-const logFormat = /^[-\d]+T[-:.\d]+Z?\s+\033\[\d+m([A-Z]+)\033\[\d+m\s+(.*)$/;
+// eslint-disable-next-line no-control-regex -- Need to catch ANSI control
+const logFormat = /^[-\d]+T[-:.\d]+Z?\s+\x1B\[\d+m([A-Z]+)\x1B\[\d+m\s+(.*)$/;
 
 const CVEKeys = ['Package', 'VulnerabilityID', 'Severity', 'Title', 'InstalledVersion', 'FixedVersion', 'Description', 'PrimaryURL'];
 const severityRatings: Record<string, number> = {
@@ -14,8 +15,8 @@ const MaxSeverityRating = Math.max(...Object.values(severityRatings));
 type finalVulType = Record<string, string>;
 
 export default class TrivyScanImageOutputCuller {
-  prelimLines: Array<string>;
-  JSONLines: Array<string>;
+  prelimLines: string[];
+  JSONLines:   string[];
   inJSON = false;
 
   constructor() {
@@ -27,7 +28,7 @@ export default class TrivyScanImageOutputCuller {
     return key in severityRatings ? severityRatings[key] : MaxSeverityRating;
   }
 
-  fixLines(lines: Array<string>) {
+  fixLines(lines: string[]) {
     // "key": "value with an escaped \' single quote isn't valid json"
     return lines.map(line => line.replace(/\\'/g, "'"));
   }
@@ -66,9 +67,9 @@ export default class TrivyScanImageOutputCuller {
 
       return prelimLines.join('\n');
     }
-    const detailLines: Array<string> = [];
+    const detailLines: string[] = [];
 
-    core.forEach((targetWithVuls: { [x: string]: any; }) => {
+    core.forEach((targetWithVuls: Record<string, any>) => {
       const target = targetWithVuls['Target'];
       const sourceVulnerabilities = targetWithVuls['Vulnerabilities'];
 
@@ -77,7 +78,7 @@ export default class TrivyScanImageOutputCuller {
       }
       detailLines.push(`Target: ${ target }`, '');
 
-      const processedVulnerabilities: Array<finalVulType> = sourceVulnerabilities.map((v: any) => {
+      const processedVulnerabilities: finalVulType[] = sourceVulnerabilities.map((v: any) => {
         const record: finalVulType = {};
 
         CVEKeys.forEach((key) => {

@@ -24,9 +24,13 @@ RD_USE_IMAGE_ALLOW_LIST=true
     ctrctl pull --quiet "$IMAGE_PYTHON"
 }
 
+assert_pull_fails() {
+    run ctrctl pull "$1"
+    assert_refused_by_allow_list
+}
+
 @test 'verify pull ruby fails' {
-    run ctrctl pull "$IMAGE_RUBY"
-    assert_failure
+    try --max 9 --delay 10 assert_pull_fails "$IMAGE_RUBY"
 }
 
 @test 'drop python from the allowed-image list, add ruby' {
@@ -40,12 +44,12 @@ RD_USE_IMAGE_ALLOW_LIST=true
 }
 
 @test 'verify pull python fails' {
-    run ctrctl pull --quiet "$IMAGE_PYTHON"
-    assert_failure
+    try --max 9 --delay 10 assert_pull_fails "$IMAGE_PYTHON"
 }
 
 @test 'verify pull ruby succeeds' {
-    ctrctl pull --quiet "$IMAGE_RUBY"
+    # when using VZ and when traefik is enabled, then pulling the image does not always succeed on the first attempt
+    try --max 9 --delay 10 ctrctl pull --quiet "$IMAGE_RUBY"
 }
 
 @test 'clear all patterns' {
@@ -53,7 +57,7 @@ RD_USE_IMAGE_ALLOW_LIST=true
 }
 
 @test 'can run kubectl' {
-    kubectl run nginx --image="${IMAGE_NGINX}:latest" --port=8080
+    kubectl run nginx --image="${IMAGE_NGINX}" --port=8080
 }
 
 verify_no_nginx() {
@@ -71,5 +75,6 @@ verify_no_nginx() {
 }
 
 @test 'verify pull python succeeds because allowedImages filter is disabled' {
-    ctrctl pull --quiet "$IMAGE_PYTHON"
+    # when using VZ and when traefik is enabled, then pulling the image does not always succeed on the first attempt
+    try --max 9 --delay 10 ctrctl pull --quiet "$IMAGE_PYTHON"
 }

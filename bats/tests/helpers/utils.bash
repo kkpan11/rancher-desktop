@@ -76,6 +76,14 @@ refute_not_exists() {
     assert_exists "$@"
 }
 
+refute_file_exists() {
+    assert_file_not_exists "$@"
+}
+
+refute_file_contains() {
+    assert_file_not_contains "$@"
+}
+
 ########################################################################
 
 # Convert raw string into properly quoted JSON string
@@ -95,7 +103,7 @@ join_map() {
     local elem
     local result=""
     for elem in "$@"; do
-        elem=$(eval "$map" '"$elem"') || return
+        elem=$(eval "$map" '"$elem"')
         if [[ -z $result ]]; then
             result=$elem
         else
@@ -197,7 +205,7 @@ semver_gt() {
 
 get_setting() {
     run rdctl api /settings
-    assert_success || return
+    assert_success
     jq_output "$@"
 }
 
@@ -236,7 +244,9 @@ trace() {
 }
 
 # try runs the specified command until it either succeeds, or --max attempts
-# have been made (with a --delay seconds sleep in between).
+# have been made (with a --delay seconds sleep in between).  RD_WAIT_FACTOR
+# multiplies --max, so a slow machine gets more attempts; --no-scale leaves
+# --max as given, for a retry whose command already scales its own waits.
 #
 # Right now the command is **always** run with --separate-stderr, and stderr
 # is output after all of stdout. This is subject to change, if we can figure
@@ -244,6 +254,7 @@ trace() {
 try() {
     local max=24
     local delay=5
+    local scale=$RD_WAIT_FACTOR
 
     while [[ $# -gt 0 ]] && [[ $1 == -* ]]; do
         case "$1" in
@@ -254,6 +265,9 @@ try() {
         --delay)
             delay=$2
             shift
+            ;;
+        --no-scale)
+            scale=1
             ;;
         --)
             shift
@@ -266,6 +280,8 @@ try() {
         esac
         shift
     done
+
+    max=$((max * scale))
 
     local count=0
     while true; do
@@ -308,7 +324,7 @@ update_allowed_patterns() {
         pid=$(get_service_pid "$CONTAINER_ENGINE_SERVICE")
     fi
 
-    rdctl api settings -X PUT --input - <<EOF || return
+    rdctl api settings -X PUT --input - <<EOF
 {
   "version": 8,
   "containerEngine": {
@@ -321,12 +337,21 @@ update_allowed_patterns() {
 EOF
     # Wait for container engine (and Kubernetes) to be ready again
     if [[ -n ${pid:-} ]]; then
-        try --max 15 --delay 5 refute_service_pid "$CONTAINER_ENGINE_SERVICE" "$pid" || return
-        wait_for_container_engine || return
+        try --max 15 --delay 5 refute_service_pid "$CONTAINER_ENGINE_SERVICE" "$pid"
+        wait_for_container_engine
         if [[ $(get_setting .kubernetes.enabled) == "true" ]]; then
-            wait_for_kubelet || return
+            wait_for_kubelet
         fi
     fi
+}
+
+# Assert that the last `run ctrctl pull` failed because the allowed-images
+# proxy refused the image.
+assert_refused_by_allow_list() {
+    assert_failure
+    # Moby prints the proxy's message. nerdctl sends only a HEAD request, never
+    # sees the message, and prints just "403 Forbidden".
+    assert_output --regexp "(Forbidden|not covered by the Rancher Desktop allowed-images list)"
 }
 
 # create_file path/to/file <<< "contents"
@@ -345,15 +370,15 @@ create_file() {
     fi
 
     local contents # Base64 encoded file contents
-    contents="$(base64)" || return
+    contents="$(base64)"
 
     local winParent
     local winDest
-    winParent="$(wslpath -w "$(dirname "$dest")")" || return
-    winDest="$(wslpath -w "$dest")" || return
+    winParent="$(wslpath -w "$(dirname "$dest")")"
+    winDest="$(wslpath -w "$dest")"
     PowerShell.exe -NoProfile -NoLogo -NonInteractive -Command "New-Item -ItemType Directory -ErrorAction SilentlyContinue '$winParent'" || true
     local command="[IO.File]::WriteAllBytes('$winDest', \$([System.Convert]::FromBase64String('$contents')))"
-    PowerShell.exe -NoProfile -NoLogo -NonInteractive -Command "$command" || return
+    PowerShell.exe -NoProfile -NoLogo -NonInteractive -Command "$command"
 }
 
 # unique_filename /tmp/image .png
@@ -380,11 +405,12 @@ capture_logs() {
         logdir=$(unique_filename "${PATH_BATS_LOGS}/${RD_TEST_FILENAME}")
         mkdir -p "$logdir"
         # On Linux/macOS, the symlinks to the lima logs might be dangling.
-        # Remove any dangling ones before doing the copy.
+        # Remove them before the copy. An empty file left in their place
+        # makes lima.ts's symlink() fail, blanking lima logs until Rancher
+        # Desktop next starts.
         find -L "${PATH_LOGS}/" -type l \
             -exec rm -f -- '{}' ';' \
-            -exec touch -- '{}' ';' \
-            -exec echo 'Replaced dangling symlink with empty file:' '{}' ';'
+            -exec echo 'Removed dangling symlink:' '{}' ';'
         cp -LR "${PATH_LOGS}/" "$logdir"
         echo "${BATS_TEST_DESCRIPTION:-teardown}" >"${logdir}/test_description"
         # Capture settings.json
@@ -449,11 +475,11 @@ foreach_k3s_version() {
 }
 
 _foreach_k3s_version() {
-    local RD_KUBERNETES_PREV_VERSION=$1
+    local RD_KUBERNETES_VERSION=$1
     local skip_kubernetes_version
     skip_kubernetes_version=$(cat "${BATS_FILE_TMPDIR}/skip-kubernetes-version" 2>/dev/null || echo none)
-    if [[ $skip_kubernetes_version == "$RD_KUBERNETES_PREV_VERSION" ]]; then
-        skip "All remaining tests for Kubernetes $RD_KUBERNETES_PREV_VERSION are skipped"
+    if [[ $skip_kubernetes_version == "$RD_KUBERNETES_VERSION" ]]; then
+        skip "All remaining tests for Kubernetes $RD_KUBERNETES_VERSION are skipped"
     fi
     "$2"
 }
@@ -461,7 +487,7 @@ _foreach_k3s_version() {
 # Tests can call mark_k3s_version_skipped to skip the rest of the tests within
 # this iteration of foreach_k3s_version.
 mark_k3s_version_skipped() {
-    echo "$RD_KUBERNETES_PREV_VERSION" >"${BATS_FILE_TMPDIR}/skip-kubernetes-version"
+    echo "$RD_KUBERNETES_VERSION" >"${BATS_FILE_TMPDIR}/skip-kubernetes-version"
 }
 
 ########################################################################

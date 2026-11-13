@@ -5,26 +5,20 @@ import { URL } from 'url';
 import util from 'util';
 
 import { newError, CustomPublishOptions } from 'builder-util-runtime';
-import Electron from 'electron';
-import { AppUpdater, Provider, ResolvedUpdateFileInfo, UpdateInfo } from 'electron-updater';
-import { ProviderRuntimeOptions, ProviderPlatform } from 'electron-updater/out/providers/Provider';
+import Electron, { net } from 'electron';
+import { Provider } from 'electron-updater/out/providers/Provider';
 import semver from 'semver';
 
-import fetch from '@pkg/utils/fetch';
 import Logging from '@pkg/utils/logging';
 import { getMacOsVersion } from '@pkg/utils/osVersion';
 import paths from '@pkg/utils/paths';
 import getWSLVersion from '@pkg/utils/wslVersion';
 
+import type { AppUpdater, ResolvedUpdateFileInfo, UpdateInfo } from 'electron-updater';
+import type { ProviderRuntimeOptions, ProviderPlatform } from 'electron-updater/out/providers/Provider';
+
 const console = Logging.update;
 const gCachePath = path.join(paths.cache, 'updater-longhorn.json');
-
-/**
- * If Upgrade Responder doesn't have a requestIntervalInMinutes field (or if
- * it's zero), use this value instead.  Note that the server can still set it to
- * be less than this value.
- */
-const defaultUpdateIntervalInMinutes = 60;
 
 /**
  * LonghornProviderOptions specifies the options available for LonghornProvider.
@@ -44,7 +38,7 @@ export interface LonghornProviderOptions extends CustomPublishOptions {
   /**
    * The GitHub repository name.  Should be detected during packaging.
    */
-   readonly repo: string;
+  readonly repo: string;
 
   /**
    * Whether to use `v`-prefixed tag name.
@@ -59,7 +53,7 @@ export interface LonghornUpdateInfo extends UpdateInfo {
    * The minimum time (milliseconds since Unix epoch) we should next check for
    * an update.
    */
-  nextUpdateTime: number;
+  nextUpdateTime:             number;
   /**
    * Whether there is an unsupported version of Rancher Desktop that is
    * newer than the latest supported version.
@@ -72,43 +66,43 @@ export interface LonghornUpdateInfo extends UpdateInfo {
  * Responder service.
  */
 interface LonghornUpgraderResponse {
-  versions: UpgradeResponderVersion[];
+  versions:                 UpgradeResponderVersion[];
   /**
    * The number of minutes before the next update check should be performed.
    */
   requestIntervalInMinutes: number;
 }
 
-type UpgradeResponderVersion = {
-    Name: string;
-    ReleaseDate: Date;
-    Supported?: boolean;
-    Tags: string[];
-};
+interface UpgradeResponderVersion {
+  Name:        string;
+  ReleaseDate: Date;
+  Supported?:  boolean;
+  Tags:        string[];
+}
 
-type UpgradeResponderQueryResult = {
-  latest: UpgradeResponderVersion;
-  requestIntervalInMinutes: number,
+interface UpgradeResponderQueryResult {
+  latest:                     UpgradeResponderVersion;
+  requestIntervalInMinutes:   number,
   unsupportedUpdateAvailable: boolean,
-};
+}
 
-export type UpgradeResponderRequestPayload = {
+export interface UpgradeResponderRequestPayload {
   appVersion: string;
   extraInfo: {
-    platform: string;
+    platform:        string;
     platformVersion: string;
-    wslVersion?: string,
+    wslVersion?:     string,
   },
-};
+}
 
 export interface GitHubReleaseAsset {
   url: string;
 
   browser_download_url: string;
-  id: number;
-  name: string;
-  label: string;
-  size: number;
+  id:                   number;
+  name:                 string;
+  label:                string;
+  size:                 number;
 }
 
 /**
@@ -117,16 +111,16 @@ export interface GitHubReleaseAsset {
  */
 interface GitHubReleaseInfo {
   url: string;
-  id: number;
+  id:  number;
 
-  tag_name: string;
-  name: string;
-  body: string;
-  draft: boolean;
+  tag_name:   string;
+  name:       string;
+  body:       string;
+  draft:      boolean;
   prerelease: boolean;
 
   published_at: string;
-  assets: GitHubReleaseAsset[];
+  assets:       GitHubReleaseAsset[];
 }
 
 /**
@@ -136,32 +130,71 @@ interface GitHubReleaseInfo {
  */
 interface LonghornCache {
   /** The minimum time (in Unix epoch) we should next check for an update. */
-  nextUpdateTime: number;
+  nextUpdateTime:             number;
+  /**
+   * The GitHub API the release was fetched from. An entry fetched from a test
+   * server names both the download and its checksum, so it must not outlive the
+   * run that asked for it. A cache written before this field existed carries
+   * neither it nor the responder below, so `hasQueuedUpdate` and
+   * `checkForUpdates` both discard the entry.
+   */
+  apiURL?:                    string;
+  /**
+   * The upgrade responder override the release was found through, or the empty
+   * string when the update configuration's own server was used.
+   */
+  upgradeServer?:             string;
   /**
    * Whether there is an unsupported version of Rancher Desktop that is
    * newer than the latest supported version.
    */
   unsupportedUpdateAvailable: boolean;
   /** Whether the recorded release is an installable update */
-  isInstallable: boolean;
+  isInstallable:              boolean;
   release: {
     /** Release tag, typically in the form "v1.2.3". */
-    tag: string;
+    tag:   string;
     /** The name of the release, typically the same as the tag. */
-    name: string;
+    name:  string;
     /** Release notes, in GitHub-flavoured markdown. */
     notes: string;
     /** The release date of the next release. */
-    date: string;
+    date:  string;
   },
   file: {
     /** URL to download the release. */
-    url: string;
+    url:      string;
     /** File size of the release. */
-    size: number;
+    size:     number;
     /** Checksum of the release. */
     checksum: string;
   }
+}
+
+/**
+ * Where this run looks for releases. A redirected server names the asset to
+ * download and the checksum that verifies it, so both overrides require the
+ * flag that already marks the run as a test.
+ */
+function updateSources(): Required<Pick<LonghornCache, 'apiURL' | 'upgradeServer'>> {
+  const testing = process.env.RD_FORCE_UPDATES_ENABLED;
+
+  return {
+    apiURL:        (testing && process.env.RD_GITHUB_API_URL) || 'https://api.github.com',
+    upgradeServer: (testing && process.env.RD_UPGRADE_RESPONDER_URL) || '',
+  };
+}
+
+/**
+ * Whether a cached release came from the servers this run would ask. Only the
+ * environment overrides count: a build whose bundled update configuration names
+ * a different responder or repository writes the identity an official build
+ * computes, so its cached release survives into one.
+ */
+function fromCurrentSources(cache: LonghornCache): boolean {
+  const sources = updateSources();
+
+  return cache.apiURL === sources.apiURL && cache.upgradeServer === sources.upgradeServer;
 }
 
 export async function hasQueuedUpdate(): Promise<boolean> {
@@ -170,6 +203,14 @@ export async function hasQueuedUpdate(): Promise<boolean> {
     const cache: LonghornCache = JSON.parse(rawCache);
 
     if (!cache.isInstallable) {
+      return false;
+    }
+
+    // Every reader of the cache must agree on which releases count, or a test
+    // server's release stays queued for a launch that would refuse to fetch it.
+    if (!fromCurrentSources(cache)) {
+      console.log(`Ignoring update staged from ${ cache.apiURL ?? 'an unrecorded source' }.`);
+
       return false;
     }
 
@@ -288,13 +329,15 @@ export async function queryUpgradeResponder(url: string, currentVersion: semver.
   // trying to run a simplified test.  In that case, break the protocol and do
   // a HTTP GET instead of the HTTP POST with data we should do for actual
   // Longhorn Upgrade Responder servers.
-  const requestOptions = /^https?:\/\/[^/]+\.github\.io\//.test(url) ? { method: 'GET' } : {
-    method: 'POST',
-    body:   JSON.stringify(requestPayload),
-  };
+  const requestOptions = /^https?:\/\/[^/]+\.github\.io\//.test(url)
+    ? { method: 'GET' }
+    : {
+      method: 'POST',
+      body:   JSON.stringify(requestPayload),
+    };
 
   console.debug(`Checking ${ url } for updates`);
-  const responseRaw = await fetch(url, requestOptions);
+  const responseRaw = await net.fetch(url, requestOptions);
   const response = await responseRaw.json() as LonghornUpgraderResponse;
 
   console.debug(`Upgrade Responder response:`, util.inspect(response, true, null));
@@ -352,10 +395,27 @@ export default class LonghornProvider extends Provider<LonghornUpdateInfo> {
    * @returns Base64-encoded checksum.
    */
   protected async getSha512Sum(checksumURL: string): Promise<string> {
-    const contents = await (await fetch(checksumURL)).text();
-    const buffer = Buffer.from(contents.split(/\s+/)[0], 'hex');
+    const response = await net.fetch(checksumURL);
 
-    return buffer.toString('base64');
+    if (!response.ok) {
+      throw newError(
+        `Failed to fetch checksum from ${ checksumURL }: ${ response.status } ${ response.statusText }`,
+        'ERR_UPDATER_CHECKSUM_FETCH_FAILED',
+      );
+    }
+    const hex = (await response.text()).split(/\s+/)[0];
+
+    // Buffer.from(..., 'hex') silently truncates on non-hex input, so an HTML
+    // error page or redirect body would otherwise cache as an empty checksum.
+    // Require the digest to be 128 hex characters before decoding.
+    if (!/^[0-9a-f]{128}$/i.test(hex)) {
+      throw newError(
+        `Invalid sha512 checksum from ${ checksumURL }: ${ JSON.stringify(hex) }`,
+        'ERR_UPDATER_CHECKSUM_INVALID',
+      );
+    }
+
+    return Buffer.from(hex, 'hex').toString('base64');
   }
 
   /**
@@ -363,11 +423,15 @@ export default class LonghornProvider extends Provider<LonghornUpdateInfo> {
    * applicable.
    */
   protected async checkForUpdates(): Promise<LonghornCache> {
+    const sources = updateSources();
+
     try {
       const rawCache = await fs.promises.readFile(gCachePath, 'utf-8');
       const cache: LonghornCache = JSON.parse(rawCache);
 
-      if (cache.nextUpdateTime > Date.now()) {
+      // A cached release outlives the process, so a test server's release would
+      // otherwise still be installable once the run that fetched it is over.
+      if (cache.nextUpdateTime > Date.now() && fromCurrentSources(cache)) {
         return cache;
       }
     } catch (error) {
@@ -379,15 +443,21 @@ export default class LonghornProvider extends Provider<LonghornUpdateInfo> {
 
     const queryResult = await queryUpgradeResponder(this.configuration.upgradeServer, this.updater.currentVersion);
     const { latest, unsupportedUpdateAvailable } = queryResult;
-    const requestIntervalInMinutes = queryResult.requestIntervalInMinutes || defaultUpdateIntervalInMinutes;
-    const requestIntervalInMs = requestIntervalInMinutes * 1000 * 60;
-    const nextRequestTime = Date.now() + requestIntervalInMs;
+
+    // Trigger the next check no earlier than some early time in the next calendar day.
+    const nextRequestTime = new Date();
+    nextRequestTime.setDate(nextRequestTime.getDate() + 1);
+    nextRequestTime.setHours(
+      Math.floor(Math.random() * 2),
+      Math.floor(Math.random() * 60),
+      Math.floor(Math.random() * 60),
+      Math.floor(Math.random() * 1_000));
 
     // Get release information from GitHub releases.
     const { owner, repo, vPrefixedTagName } = this.configuration;
     const tag = (vPrefixedTagName ? 'v' : '') + latest.Name.replace(/^v/, '');
-    const infoURL = `https://api.github.com/repos/${ owner }/${ repo }/releases/tags/${ tag }`;
-    const releaseInfoRaw = await fetch(infoURL,
+    const infoURL = `${ sources.apiURL }/repos/${ owner }/${ repo }/releases/tags/${ tag }`;
+    const releaseInfoRaw = await net.fetch(infoURL,
       { headers: { Accept: 'application/vnd.github.v3+json' } });
     const releaseInfo = await releaseInfoRaw.json() as GitHubReleaseInfo;
     const assetFilter: (asset: GitHubReleaseAsset) => boolean = (() => {
@@ -426,7 +496,8 @@ export default class LonghornProvider extends Provider<LonghornUpdateInfo> {
     }
 
     const cache: LonghornCache = {
-      nextUpdateTime: nextRequestTime,
+      nextUpdateTime: nextRequestTime.getTime(),
+      ...sources,
       unsupportedUpdateAvailable,
       isInstallable:  false, // Always false, we'll update this later.
       release:        {
@@ -442,6 +513,9 @@ export default class LonghornProvider extends Provider<LonghornUpdateInfo> {
       },
     };
 
+    // Only the Kubernetes code path creates paths.cache, and a factory reset
+    // deletes it.
+    await fs.promises.mkdir(path.dirname(gCachePath), { recursive: true });
     await fs.promises.writeFile(gCachePath, JSON.stringify(cache),
       { encoding: 'utf-8', mode: 0o600 });
 

@@ -5,24 +5,24 @@ import os from 'os';
 import path from 'path';
 import util from 'util';
 
-import fetch from 'node-fetch';
+import { jest } from '@jest/globals';
 import semver from 'semver';
 
-import K3sHelper, {
-  buildVersion, ChannelMapping, NoCachedK3sVersionsError, ReleaseAPIEntry, VersionEntry,
-} from '../k3sHelper';
-
+import type { KubeClient } from '@pkg/backend/kube/client';
+import { SemanticVersionEntry } from '@pkg/utils/kubeVersions';
 import paths from '@pkg/utils/paths';
+import mockModules from '@pkg/utils/testUtils/mockModules';
+
+import type { ReleaseAPIEntry } from '../k3sHelper';
 
 const cachePath = path.join(paths.cache, 'k3s-versions.json');
-const { Response: FetchResponse } = jest.requireActual('node-fetch');
 
-// Mock fetch to ensure we never make an actual request.
-jest.mock('node-fetch', () => {
-  return jest.fn((...args) => {
-    throw new Error('Unexpected network traffic');
-  });
+const modules = mockModules({
+  '@pkg/utils/logging': undefined,
+  electron:             undefined,
 });
+
+const { default: K3sHelper, buildVersion, ChannelMapping, NoCachedK3sVersionsError } = await import('../k3sHelper');
 
 let cacheData: Buffer | null;
 
@@ -42,22 +42,22 @@ afterAll(() => {
 });
 
 beforeEach(() => {
-  jest.mocked(fetch).mockReset();
+  modules.electron.net.fetch.mockReset();
 });
 
 describe(buildVersion, () => {
   test('parses the build number', () => {
-    expect(buildVersion(new semver.SemVer('v1.2.3+k3s4'))).toEqual(4);
+    expect(buildVersion(new semver.SemVer('v1.99.3+k3s4'))).toEqual(4);
   });
 
   test('handles non-conforming versions', () => {
-    expect(buildVersion(new semver.SemVer('v1.2.3'))).toEqual(-1);
+    expect(buildVersion(new semver.SemVer('v1.99.3'))).toEqual(-1);
   });
 });
 
 describe(K3sHelper, () => {
   describe('processVersion', () => {
-    let subject: K3sHelper;
+    let subject: InstanceType<typeof K3sHelper>;
     const process = (name: string, existing: string[] = [], hasAssets = false) => {
       const assets: ReleaseAPIEntry['assets'] = [];
 
@@ -74,7 +74,7 @@ describe(K3sHelper, () => {
       for (const version of existing) {
         const parsed = new semver.SemVer(version);
 
-        subject['versions'][parsed.version] = new VersionEntry(parsed);
+        subject['versions'][parsed.version] = new SemanticVersionEntry(parsed);
       }
 
       return subject['processVersion']({ tag_name: name, assets });
@@ -91,31 +91,31 @@ describe(K3sHelper, () => {
       expect(await subject.availableVersions).toHaveLength(0);
     });
     it('should skip prereleases', async() => {
-      expect(process('1.2.3-beta1')).toEqual(true);
+      expect(process('1.99.3-beta1')).toEqual(true);
       expect(await subject.availableVersions).toHaveLength(0);
     });
     it('should skip valid but erroneous versions', async() => {
-      expect(process('1.2.3+rk3s1')).toEqual(true);
+      expect(process('1.99.3+rk3s1')).toEqual(true);
       expect(await subject.availableVersions).toHaveLength(0);
     });
     it('should ignore old versions', async() => {
-      expect(process('0.2.0')).toEqual(true);
+      expect(process('1.2.0')).toEqual(true);
       expect(await subject.availableVersions).toHaveLength(0);
     });
     it('should ignore obsolete builds', async() => {
-      expect(process('1.2.3_k3s4', ['1.2.3+k3s5'])).toEqual(true);
+      expect(process('1.99.3+k3s4', ['1.99.3+k3s5'])).toEqual(true);
       expect(await subject.availableVersions).toHaveLength(1);
     });
     it('should ignore existing builds', async() => {
-      expect(process('1.2.3+k3s4', ['1.2.3+k3s4'])).toEqual(false);
+      expect(process('1.99.3+k3s4', ['1.99.3+k3s4'])).toEqual(false);
       expect(await subject.availableVersions).toHaveLength(1);
     });
-    it('should ignore versions with missing assets', async() => {
-      expect(process('1.2.3+k3s4')).toEqual(true);
+    it('should ignore versions missing assets', async() => {
+      expect(process('1.99.3+k3s4')).toEqual(true);
       expect(await subject.availableVersions).toHaveLength(0);
     });
     it('should add versions', async() => {
-      expect(process('1.2.3+k3s4', [], true)).toEqual(true);
+      expect(process('1.99.3+k3s4', [], true)).toEqual(true);
       expect(await subject.availableVersions).toHaveLength(1);
     });
   });
@@ -123,9 +123,9 @@ describe(K3sHelper, () => {
   test('cache read/write', async() => {
     const subject = new K3sHelper('x86_64');
     const workDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'rd-test-cache-'));
-    const versions: Record<string, VersionEntry> = {
-      '1.2.3': new VersionEntry(semver.parse('1.2.3+k3s1') as semver.SemVer, ['stable']),
-      '2.3.4': new VersionEntry(semver.parse('2.3.4+k3s3') as semver.SemVer),
+    const versions: Record<string, SemanticVersionEntry> = {
+      '1.99.3': new SemanticVersionEntry(semver.parse('1.99.3+k3s1')!, ['stable']),
+      '2.3.4':  new SemanticVersionEntry(semver.parse('2.3.4+k3s3')!),
     };
     const versionStrings = Object.values(versions)
       .map(v => v.version)
@@ -139,11 +139,11 @@ describe(K3sHelper, () => {
       await subject['writeCache']();
 
       const actual = JSON.parse(await fs.promises.readFile(subject['cachePath'], 'utf8'));
-      const { versions: actualStrings, channels }: {versions: string[], channels: {[k: string]: string}} = actual;
+      const { versions: actualStrings, channels }: { versions: string[], channels: Record<string, string> } = actual;
 
       expect(actual).toHaveProperty('cacheVersion');
       expect(semver.sort(actualStrings)).toEqual(versionStrings);
-      expect(channels).toEqual({ stable: '1.2.3' });
+      expect(channels).toEqual({ stable: '1.99.3' });
 
       // Check that we can load the values back properly
       subject['versions'] = {};
@@ -167,18 +167,18 @@ describe(K3sHelper, () => {
     // Override cache reading to return a fake existing cache.
     // The first read returns nothing to trigger a synchronous update;
     // the rest of the reads return mocked values.
-    subject['readCache'] = jest.fn()
+    jest.spyOn(subject as any, 'readCache')
       .mockResolvedValueOnce(undefined)
-      .mockImplementation(function(this: K3sHelper) {
+      .mockImplementation(function(this: InstanceType<typeof K3sHelper>) {
         const result = new ChannelMapping();
 
         for (const [version, tags] of Object.entries({
-          'v1.2.1+k3s1': ['stale-tag'],
-          'v1.2.3+k3s1': ['stable'],
+          'v1.99.1+k3s1': ['stale-tag'],
+          'v1.99.3+k3s1': ['stable'],
         })) {
           const parsedVersion = new semver.SemVer(version);
 
-          this.versions[parsedVersion.version] = new VersionEntry(parsedVersion, tags);
+          this.versions[parsedVersion.version] = new SemanticVersionEntry(parsedVersion, tags);
           for (const tag of tags) {
             result[tag] = parsedVersion;
           }
@@ -191,15 +191,17 @@ describe(K3sHelper, () => {
     subject['delayForWaitLimiting'] = jest.fn(() => Promise.resolve());
 
     // Fake out the results
-    jest.mocked(fetch)
+    modules.electron.net.fetch
       .mockImplementationOnce((url) => {
         expect(url).toEqual(subject['channelApiUrl']);
 
-        return Promise.resolve(new FetchResponse(
+        return Promise.resolve(new Response(
           JSON.stringify({
-            data: [{
+            resourceType: 'channels',
+            data:         [{
+              type:   'channel',
               name:   'stable',
-              latest: 'v1.2.3+k3s3',
+              latest: 'v1.99.3+k3s3',
             }],
           }),
         ));
@@ -207,14 +209,14 @@ describe(K3sHelper, () => {
       .mockImplementationOnce((url) => {
         expect(url).toEqual(subject['releaseApiUrl']);
 
-        return Promise.resolve(new FetchResponse(
+        return Promise.resolve(new Response(
           JSON.stringify([
-            { tag_name: 'v1.2.3+k3s2', assets: validAssets },
-            { tag_name: 'v1.2.3+k3s3', assets: validAssets },
+            { tag_name: 'v1.99.3+k3s2', assets: validAssets },
+            { tag_name: 'v1.99.3+k3s3', assets: validAssets },
             // The next one is skipped because there's a newer build
-            { tag_name: 'v1.2.3+k3s1', assets: validAssets },
-            { tag_name: 'v1.2.4+k3s1', assets: [] },
-            { tag_name: 'v1.2.1+k3s2', assets: validAssets },
+            { tag_name: 'v1.99.3+k3s1', assets: validAssets },
+            { tag_name: 'v1.99.4+k3s1', assets: [] },
+            { tag_name: 'v1.99.1+k3s2', assets: validAssets },
           ]),
           { headers: { link: '<url>; rel="next"' } },
         ));
@@ -222,18 +224,18 @@ describe(K3sHelper, () => {
       .mockImplementationOnce((url) => {
         expect(url).toEqual('url');
 
-        return Promise.resolve(new FetchResponse(
-          null,
+        return Promise.resolve(new Response(
+          undefined,
           { status: 403, headers: { 'X-RateLimit-Remaining': '0' } },
         ));
       })
       .mockImplementationOnce((url) => {
         expect(url).toEqual('url');
 
-        return Promise.resolve(new FetchResponse(
+        return Promise.resolve(new Response(
           JSON.stringify([
             { tag_name: 'Invalid tag name', assets: validAssets },
-            { tag_name: 'v1.2.0+k3s5', assets: validAssets },
+            { tag_name: 'v1.99.0+k3s5', assets: validAssets },
           ]),
           { headers: { link: '<url>; rel="first"' } },
         ));
@@ -246,12 +248,12 @@ describe(K3sHelper, () => {
     subject.networkReady();
 
     await subject.initialize();
-    expect(fetch).toHaveBeenCalledTimes(4);
+    expect(modules.electron.net.fetch).toHaveBeenCalledTimes(4);
     expect(subject['delayForWaitLimiting']).toHaveBeenCalledTimes(1);
     expect(await subject.availableVersions).toEqual([
-      new VersionEntry(new semver.SemVer('v1.2.3+k3s3'), ['stable']),
-      new VersionEntry(new semver.SemVer('v1.2.1+k3s2')),
-      new VersionEntry(new semver.SemVer('v1.2.0+k3s5')),
+      new SemanticVersionEntry(new semver.SemVer('v1.99.3+k3s3'), ['stable']),
+      new SemanticVersionEntry(new semver.SemVer('v1.99.1+k3s2')),
+      new SemanticVersionEntry(new semver.SemVer('v1.99.0+k3s5')),
     ]);
   });
 
@@ -268,35 +270,35 @@ describe(K3sHelper, () => {
     // Override cache reading to return a fake existing cache.
     // The first read returns nothing to trigger a synchronous update;
     // the rest of the reads return mocked values.
-    subject['readCache'] = jest.fn()
+    jest.spyOn(subject, 'readCache' as any)
       .mockResolvedValueOnce(undefined)
-      .mockImplementation(function(this: K3sHelper) {
+      .mockImplementation(function(this: InstanceType<typeof K3sHelper>) {
         const result = new ChannelMapping();
 
         for (const [version, tags] of Object.entries({
-          'v1.26.0+k3s2': [],
-          'v1.26.1+k3s1': [],
-          'v1.26.2+k3s1': [],
-          'v1.26.3+k3s1': ['v1.26', 'stable'],
-          'v1.27.1+k3s1': [],
-          'v1.27.2+k3s1': [],
-          'v1.27.3+k3s1': [],
-          'v1.27.4+k3s1': [],
-          'v1.27.5+k3s1': ['v1.27', 'latest'],
+          'v1.96.0+k3s2': [],
+          'v1.96.1+k3s1': [],
+          'v1.96.2+k3s1': [],
+          'v1.96.3+k3s1': ['v1.96', 'stable'],
+          'v1.97.1+k3s1': [],
+          'v1.97.2+k3s1': [],
+          'v1.97.3+k3s1': [],
+          'v1.97.4+k3s1': [],
+          'v1.97.5+k3s1': ['v1.97', 'latest'],
         })) {
           const parsedVersion = new semver.SemVer(version);
 
-          this.versions[parsedVersion.version] = new VersionEntry(parsedVersion, tags);
+          this.versions[parsedVersion.version] = new SemanticVersionEntry(parsedVersion, tags);
           for (const tag of tags) {
             result[tag] = parsedVersion;
           }
         }
 
         subject['versionFromChannel'] = {
-          stable:  '1.26.3',
-          latest:  '1.27.5',
-          'v1.26': '1.26.3',
-          'v1.27': '1.27.5',
+          stable:  '1.96.3',
+          latest:  '1.97.5',
+          'v1.96': '1.96.3',
+          'v1.97': '1.97.5',
         };
 
         return Promise.resolve(result);
@@ -304,18 +306,29 @@ describe(K3sHelper, () => {
     subject['writeCache'] = jest.fn(() => Promise.resolve());
 
     // Fake out the results
-    jest.mocked(fetch)
+    modules.electron.net.fetch
       .mockImplementationOnce((url) => {
         expect(url).toEqual(subject['channelApiUrl']);
 
-        return Promise.resolve(new FetchResponse(
+        return Promise.resolve(new Response(
           JSON.stringify({
-            data: [
-              { name: 'v1.26', latest: '1.26.9+k3s1' },
-              { name: 'v1.27', latest: '1.27.7+k3s1' },
-              { name: 'stable', latest: '1.27.7+k3s1' },
-              { name: 'latest', latest: '1.28.3+k3s1' },
-              { name: 'v1.28', latest: '1.28.3+k3s1' },
+            resourceType: 'channels',
+            data:         [
+              {
+                type: 'channel', name: 'v1.96', latest: '1.96.9+k3s1',
+              },
+              {
+                type: 'channel', name: 'v1.97', latest: '1.97.7+k3s1',
+              },
+              {
+                type: 'channel', name: 'stable', latest: '1.97.7+k3s1',
+              },
+              {
+                type: 'channel', name: 'latest', latest: '1.98.3+k3s1',
+              },
+              {
+                type: 'channel', name: 'v1.98', latest: '1.98.3+k3s1',
+              },
             ],
           }),
         ));
@@ -323,13 +336,13 @@ describe(K3sHelper, () => {
       .mockImplementationOnce((url) => {
         expect(url).toEqual(subject['releaseApiUrl']);
 
-        return Promise.resolve(new FetchResponse(
+        return Promise.resolve(new Response(
           JSON.stringify([
-            { tag_name: 'v1.28.3+k3s2', assets: validAssets },
-            { tag_name: 'v1.28.2+k3s2', assets: validAssets },
-            { tag_name: 'v1.28.1+k3s2', assets: validAssets },
-            { tag_name: 'v1.27.7+k3s2', assets: validAssets },
-            { tag_name: 'v1.27.6+k3s1', assets: validAssets },
+            { tag_name: 'v1.98.3+k3s2', assets: validAssets },
+            { tag_name: 'v1.98.2+k3s2', assets: validAssets },
+            { tag_name: 'v1.98.1+k3s2', assets: validAssets },
+            { tag_name: 'v1.97.7+k3s2', assets: validAssets },
+            { tag_name: 'v1.97.6+k3s1', assets: validAssets },
           ]),
           { headers: { link: '<url>; rel="first"' } },
         ));
@@ -342,38 +355,47 @@ describe(K3sHelper, () => {
     subject.networkReady();
 
     await subject.initialize();
-    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(modules.electron.net.fetch).toHaveBeenCalledTimes(2);
     const availableVersions = await subject.availableVersions;
 
     expect(availableVersions).toEqual([
-      new VersionEntry(new semver.SemVer('v1.28.3+k3s2'), ['latest', 'v1.28']),
-      new VersionEntry(new semver.SemVer('v1.28.2+k3s2')),
-      new VersionEntry(new semver.SemVer('v1.28.1+k3s2')),
-      new VersionEntry(new semver.SemVer('v1.27.7+k3s2'), ['stable', 'v1.27']),
-      new VersionEntry(new semver.SemVer('v1.27.6+k3s1')),
-      new VersionEntry(new semver.SemVer('v1.27.5+k3s1')),
-      new VersionEntry(new semver.SemVer('v1.27.4+k3s1')),
-      new VersionEntry(new semver.SemVer('v1.27.3+k3s1')),
-      new VersionEntry(new semver.SemVer('v1.27.2+k3s1')),
-      new VersionEntry(new semver.SemVer('v1.27.1+k3s1')),
-      new VersionEntry(new semver.SemVer('v1.26.3+k3s1'), ['v1.26']),
-      new VersionEntry(new semver.SemVer('v1.26.2+k3s1')),
-      new VersionEntry(new semver.SemVer('v1.26.1+k3s1')),
-      new VersionEntry(new semver.SemVer('v1.26.0+k3s2')),
+      new SemanticVersionEntry(new semver.SemVer('v1.98.3+k3s2'), ['latest', 'v1.98']),
+      new SemanticVersionEntry(new semver.SemVer('v1.98.2+k3s2')),
+      new SemanticVersionEntry(new semver.SemVer('v1.98.1+k3s2')),
+      new SemanticVersionEntry(new semver.SemVer('v1.97.7+k3s2'), ['stable', 'v1.97']),
+      new SemanticVersionEntry(new semver.SemVer('v1.97.6+k3s1')),
+      new SemanticVersionEntry(new semver.SemVer('v1.97.5+k3s1')),
+      new SemanticVersionEntry(new semver.SemVer('v1.97.4+k3s1')),
+      new SemanticVersionEntry(new semver.SemVer('v1.97.3+k3s1')),
+      new SemanticVersionEntry(new semver.SemVer('v1.97.2+k3s1')),
+      new SemanticVersionEntry(new semver.SemVer('v1.97.1+k3s1')),
+      new SemanticVersionEntry(new semver.SemVer('v1.96.3+k3s1'), ['v1.96']),
+      new SemanticVersionEntry(new semver.SemVer('v1.96.2+k3s1')),
+      new SemanticVersionEntry(new semver.SemVer('v1.96.1+k3s1')),
+      new SemanticVersionEntry(new semver.SemVer('v1.96.0+k3s2')),
     ]);
+
+    // Verify versionFromChannel is updated after channel assignment
+    expect(subject['versionFromChannel']).toEqual({
+      'v1.96':  '1.96.3',
+      'v1.97':  '1.97.7',
+      'v1.98':  '1.98.3',
+      stable:  '1.97.7',
+      latest:  '1.98.3',
+    });
   });
 
   describe('initialize', () => {
     it('should finish initialize without network if cache is available', async() => {
       const writer = new K3sHelper('x86_64');
 
-      writer['versions'] = { 'v1.0.0': new VersionEntry(new semver.SemVer('v1.0.0')) };
+      writer['versions'] = { 'v1.99.0': new SemanticVersionEntry(new semver.SemVer('v1.99.0')) };
       await writer['writeCache']();
 
       // We want to check that initialize() returns before updateCache() does.
 
       const subject = new K3sHelper('x86_64');
-      const pendingInit = new Promise((resolve) => {
+      const pendingInit = new Promise((resolve, reject) => {
         // We need a cast on updateCache here since it's a protected method.
         jest.spyOn(subject, 'updateCache' as any).mockImplementation(async() => {
           // This will be called, but will not block initialization.
@@ -381,14 +403,37 @@ describe(K3sHelper, () => {
 
           return [];
         });
-        subject.initialize().then(resolve);
+        subject.initialize().then(resolve, reject);
       });
 
       expect(await subject.availableVersions).toContainEqual({
-        version:  semver.parse('v1.0.0'),
+        version:  semver.parse('v1.99.0'),
         channels: undefined,
       });
       await pendingInit;
+    });
+
+    it('should not reset versionFromChannel when called multiple times', async() => {
+      const subject = new K3sHelper('x86_64');
+
+      // Mock readCache to populate versionFromChannel
+      jest.spyOn(subject as any, 'readCache').mockImplementation(function(this: InstanceType<typeof K3sHelper>) {
+        this.versions['1.99.3'] = new SemanticVersionEntry(semver.parse('1.99.3+k3s1')!, ['stable']);
+        this.versionFromChannel['stable'] = '1.99.3';
+
+        return Promise.resolve();
+      });
+
+      // Mock updateCache to not actually run
+      jest.spyOn(subject as any, 'updateCache').mockResolvedValue(undefined);
+
+      // First initialization
+      await subject.initialize();
+      expect(subject['versionFromChannel']).toEqual({ stable: '1.99.3' });
+
+      // Second initialization should not reset versionFromChannel
+      await subject.initialize();
+      expect(subject['versionFromChannel']).toEqual({ stable: '1.99.3' });
     });
   });
 
@@ -398,7 +443,7 @@ describe(K3sHelper, () => {
       ['finds the oldest newer major version', 'v3.1.2+k3s3',
         ['v1.2.9+k3s1', 'v1.2.9+k3s4', 'v4.2.8+k3s1', 'v4.3.0+k3s1'], 'v4.2.8+k3s1'],
       ['finds the oldest newer minor version', 'v1.12.2+k3s3',
-        ['v1.2.9+k3s1', 'v1.7.0+k3s1', 'v1.23.9+k3s4', 'v2.12.8+k3s1'], 'v1.23.9+k3s4'],
+        ['v1.2.9+k3s1', 'v1.7.0+k3s1', 'v1.29.9+k3s4', 'v2.12.8+k3s1'], 'v1.29.9+k3s4'],
       ['finds the oldest newer patch version at the start of the list', 'v1.12.2+k3s3',
         ['v1.12.4+k3s1', 'v1.12.4+k3s4', 'v1.12.8+k3s1', 'v1.12.9+k3s4'], 'v1.12.4+k3s4'],
       ['finds the oldest newer patch version inside the list', 'v1.12.10+k3s99',
@@ -417,15 +462,41 @@ describe(K3sHelper, () => {
 
     test.each(table)('%s', (title: string, desiredVersion: string, cachedFilenames: readonly [string, string, string, string], expected: string) => {
       const desiredSemver = new semver.SemVer(desiredVersion);
-      const selectedSemVer = subject['selectClosestSemVer'](desiredSemver, cachedFilenames as unknown as Array<string>);
+      const selectedSemVer = subject['selectClosestSemVer'](desiredSemver, cachedFilenames as unknown as string[]);
 
       expect(selectedSemVer).toHaveProperty('raw', expected);
     });
 
     test('can handle zero choices', () => {
-      const desiredSemver = new semver.SemVer('v1.2.3+k3s4');
+      const desiredSemver = new semver.SemVer('v1.99.3+k3s4');
 
       expect(() => subject['selectClosestSemVer'](desiredSemver, [])).toThrow(NoCachedK3sVersionsError);
+    });
+  });
+
+  describe('uninstallHelmChart', () => {
+    it('should leave the -crd chart for k3s to delete', async() => {
+      const chart = (name: string, owner: string) => ({
+        metadata: { name, annotations: { 'objectset.rio.cattle.io/owner-name': owner } },
+      });
+      const items = [chart('traefik', 'traefik'), chart('traefik-crd', 'traefik'), chart('other', 'other')];
+      const deleted: string[] = [];
+      const client = {
+        k8sClient: {
+          makeApiClient: () => ({
+            listNamespacedCustomObject:   () => Promise.resolve({ items }),
+            deleteNamespacedCustomObject: ({ name }: { name: string }) => {
+              deleted.push(name);
+
+              return Promise.resolve();
+            },
+          }),
+        },
+      } as unknown as KubeClient;
+
+      await new K3sHelper('x86_64').uninstallHelmChart(client, 'traefik');
+
+      expect(deleted).toEqual(['traefik']);
     });
   });
 });

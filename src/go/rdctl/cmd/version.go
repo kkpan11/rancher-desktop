@@ -18,8 +18,11 @@ package cmd
 
 import (
 	"fmt"
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/client"
+
 	"github.com/spf13/cobra"
+
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/client"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/version"
 )
 
 // showVersionCmd represents the showVersion command
@@ -28,7 +31,7 @@ var showVersionCmd = &cobra.Command{
 	Short: "Shows the CLI version.",
 	Long:  `Shows the CLI version.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		_, err := fmt.Printf("rdctl client version: %s, targeting server version: %s\n", client.Version, client.ApiVersion)
+		_, err := fmt.Printf("rdctl client version: %s, targeting server version: %s\n", version.Version, client.APIVersion)
 		return err
 	},
 }

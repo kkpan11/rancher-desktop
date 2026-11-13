@@ -6,7 +6,8 @@ import path from 'path';
 
 import Electron from 'electron';
 
-import { ImageProcessor } from '@pkg/backend/images/imageProcessor';
+import { ImageProcessor, ImageType } from '@pkg/backend/images/imageProcessor';
+import { t } from '@pkg/main/i18n';
 import { getIpcMainProxy } from '@pkg/main/ipcMain';
 import { isUnixError } from '@pkg/typings/unix.interface';
 import Logging from '@pkg/utils/logging';
@@ -14,13 +15,6 @@ import * as window from '@pkg/window';
 
 const console = Logging.images;
 const ipcMainProxy = getIpcMainProxy(console);
-
-interface ImageContents {
-  imageName: string,
-  tag: string,
-  imageID: string,
-  size: string
-}
 
 // Map image-related events to the associated image processor's methods
 // TODO: export the factory function to make this a singleton
@@ -41,7 +35,7 @@ export class ImageEventHandler {
     this.initEventHandlers();
   }
 
-  protected onImagesChanged(images: ImageContents[]) {
+  protected onImagesChanged(images: ImageType[]) {
     window.send('images-changed', images);
   }
 
@@ -64,7 +58,7 @@ export class ImageEventHandler {
         event.reply('images-process-ended', 0);
       } catch (err) {
         await Electron.dialog.showMessageBox({
-          message: `Error trying to delete image ${ imageName } (${ imageID }):\n\n ${ isUnixError(err) ? err.stderr : '' } `,
+          message: t('imageEvents.deleteError', { name: imageName, id: imageID, error: isUnixError(err) ? err.stderr : '' }),
           type:    'error',
         });
         event.reply('images-process-ended', 1);
@@ -80,7 +74,7 @@ export class ImageEventHandler {
         event.reply('images-process-ended', 0);
       } catch (err) {
         await Electron.dialog.showMessageBox({
-          message: `Error trying to delete images ${ imageIDs }`,
+          message: t('imageEvents.deleteBatchError', { ids: String(imageIDs) }),
           type:    'error',
         });
         event.reply('images-process-ended', 1);
@@ -89,9 +83,9 @@ export class ImageEventHandler {
 
     ipcMainProxy.on('do-image-build', async(event, taggedImageName) => {
       const options: any = {
-        title:      'Pick the build directory',
+        title:      t('imageEvents.buildTitle'),
         properties: ['openFile'],
-        message:    'Please select the Dockerfile to use (could have a different name)',
+        message:    t('imageEvents.buildMessage'),
       };
 
       if (this.#lastBuildDirectory) {
@@ -143,15 +137,23 @@ export class ImageEventHandler {
       event.reply('images-process-ended', code);
     });
 
-    ipcMainProxy.on('do-image-scan', async(event, imageName) => {
+    ipcMainProxy.on('do-image-scan', async(event, imageName, namespace) => {
       let taggedImageName = imageName;
       let code;
 
-      if (!imageName.includes(':')) {
+      // The containerd scanner only supports image names that include the registry name
+      if (!taggedImageName.includes('/')) {
+        taggedImageName = `library/${ imageName }`;
+      }
+      if (!taggedImageName.split('/')[0].includes('.')) {
+        taggedImageName = `docker.io/${ taggedImageName }`;
+      }
+      if (!taggedImageName.includes(':')) {
         taggedImageName += ':latest';
       }
+
       try {
-        code = (await this.imageProcessor.scanImage(taggedImageName)).code;
+        code = (await this.imageProcessor.scanImage(taggedImageName, namespace)).code;
         await this.imageProcessor.refreshImages();
       } catch (err) {
         console.error(`Failed to scan image ${ imageName }: `, err);
@@ -159,7 +161,7 @@ export class ImageEventHandler {
           code = err.code;
         }
         Electron.dialog.showMessageBox({
-          message: `Error trying to scan ${ taggedImageName }:\n\n ${ isUnixError(err) ? err.stderr : '' } `,
+          message: t('imageEvents.scanError', { name: taggedImageName, error: isUnixError(err) ? err.stderr : '' }),
           type:    'error',
         }).catch((err) => {
           console.log('messageBox failure: ', err);
@@ -179,7 +181,7 @@ export class ImageEventHandler {
           code = err.code;
         }
         Electron.dialog.showMessageBox({
-          message: `Error trying to push ${ taggedImageName }:\n\n ${ isUnixError(err) ? err.stderr : '' } `,
+          message: t('imageEvents.pushError', { name: taggedImageName, error: isUnixError(err) ? err.stderr : '' }),
           type:    'error',
         }).catch((err) => {
           console.log('messageBox failure: ', err);

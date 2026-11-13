@@ -1,5 +1,15 @@
+# bats file_tags=opensuse
+
 load '../helpers/load'
 RD_FILE_RAMDISK_SIZE=12 # We need more disk to run the Rancher image.
+
+local_setup() {
+    if is_macos x86_64 || is_linux x86_64; then
+        # Alpine 3.23 no longer includes the legacy iptables modules in the x86_64 kernel
+        # https://github.com/rancher/rancher/issues/54862
+        skip "rancher/rancher needs iptables (legacy)"
+    fi
+}
 
 @test 'factory reset' {
     factory_reset
@@ -14,7 +24,7 @@ RD_FILE_RAMDISK_SIZE=12 # We need more disk to run the Rancher image.
     local rancher_image
     rancher_image="rancher/rancher:$(rancher_image_tag)"
 
-    ctrctl pull "$rancher_image"
+    ctrctl pull --quiet "$rancher_image"
     ctrctl run --privileged -d --restart=no -p 8080:80 -p 8443:443 --name rancher "$rancher_image"
 }
 

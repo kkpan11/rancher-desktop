@@ -19,6 +19,7 @@ package config
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,9 +30,10 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/paths"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/paths"
 )
 
 // ConnectionInfo stores the parameters needed to connect to an HTTP server
@@ -49,18 +51,28 @@ var (
 	configPath string
 	// DefaultConfigPath - used to differentiate not being able to find a user-specified config file from the default
 	DefaultConfigPath string
+
+	wslDistroEnvs = []string{"WSL_DISTRO_NAME", "WSL_INTEROP", "WSLENV"}
+	// lstatFunc allows tests to inject a stub for /bin/wslpath checks.
+	lstatFunc = os.Lstat
 )
 
 // DefineGlobalFlags sets up the global flags, available for all sub-commands
 func DefineGlobalFlags(rootCmd *cobra.Command) {
 	var configDir string
-	var err error
 	if runtime.GOOS == "linux" && isWSLDistro() {
-		if configDir, err = wslifyConfigDir(); err != nil {
-			log.Fatalf("Can't get WSL config-dir: %v", err)
+		ctx := rootCmd.Context()
+		if ctx == nil {
+			ctx = context.Background()
 		}
-		configDir = filepath.Join(configDir, "rancher-desktop")
-	} else {
+		if wslConfigDir, err := wslifyConfigDir(ctx); err == nil {
+			windowsConfigPath := filepath.Join(wslConfigDir, "rancher-desktop", "rd-engine.json")
+			if _, statErr := os.Stat(windowsConfigPath); statErr == nil {
+				configDir = filepath.Join(wslConfigDir, "rancher-desktop")
+			}
+		}
+	}
+	if configDir == "" {
 		appPaths, err := paths.GetPaths()
 		if err != nil {
 			log.Fatalf("failed to get paths: %s", err)
@@ -89,7 +101,7 @@ func GetConnectionInfo(mayBeMissing bool) (*ConnectionInfo, error) {
 	content, readFileError := os.ReadFile(configPath)
 	if readFileError != nil {
 		// It is ok if the default config path doesn't exist; the user may have specified the required settings on the commandline.
-		// But it is an error if the file specified via --config-path can not be read.
+		// But it is an error if the file specified via --config-path cannot be read.
 		if configPath != DefaultConfigPath || !errors.Is(readFileError, os.ErrNotExist) {
 			return nil, readFileError
 		}
@@ -130,18 +142,31 @@ func GetConnectionInfo(mayBeMissing bool) (*ConnectionInfo, error) {
 // determines if we are running in a wsl linux distro
 // by checking for availability of wslpath and see if it's a symlink
 func isWSLDistro() bool {
-	fi, err := os.Lstat("/bin/wslpath")
-	if os.IsNotExist(err) {
+	fi, err := lstatFunc("/bin/wslpath")
+	if err != nil {
 		return false
 	}
-	return fi.Mode()&os.ModeSymlink == os.ModeSymlink
+	if fi.Mode()&os.ModeSymlink != os.ModeSymlink {
+		return false
+	}
+	return hasWSLEnvs()
 }
 
-func getLocalAppDataPath() (string, error) {
+// hasWSLEnvs reports whether any WSL environment marker is present.
+func hasWSLEnvs() bool {
+	for _, envName := range wslDistroEnvs {
+		if _, ok := os.LookupEnv(envName); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func getLocalAppDataPath(ctx context.Context) (string, error) {
 	var outBuf bytes.Buffer
 	// changes the codepage to 65001 which is UTF-8
 	subCommand := `chcp 65001 >nul & echo %LOCALAPPDATA%`
-	cmd := exec.Command("cmd.exe", "/c", subCommand)
+	cmd := exec.CommandContext(ctx, "cmd.exe", "/c", subCommand)
 	cmd.Stdout = &outBuf
 	// We are intentionally not using CombinedOutput and
 	// excluding the stderr since it could contain some
@@ -152,15 +177,15 @@ func getLocalAppDataPath() (string, error) {
 	return strings.TrimRight(outBuf.String(), "\r\n"), nil
 }
 
-func wslifyConfigDir() (string, error) {
-	path, err := getLocalAppDataPath()
+func wslifyConfigDir(ctx context.Context) (string, error) {
+	path, err := getLocalAppDataPath(ctx)
 	if err != nil {
 		return "", err
 	}
 	var outBuf bytes.Buffer
-	cmd := exec.Command("/bin/wslpath", path)
+	cmd := exec.CommandContext(ctx, "/bin/wslpath", path)
 	cmd.Stdout = &outBuf
-	if err = cmd.Run(); err != nil {
+	if err := cmd.Run(); err != nil {
 		return "", err
 	}
 	return strings.TrimRight(outBuf.String(), "\r\n"), err

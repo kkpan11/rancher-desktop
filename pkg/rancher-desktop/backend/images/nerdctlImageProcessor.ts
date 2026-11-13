@@ -1,7 +1,6 @@
-import { spawn } from 'child_process';
 import path from 'path';
 
-import { VMBackend, VMExecutor } from '@pkg/backend/backend';
+import { VMBackend } from '@pkg/backend/backend';
 import * as imageProcessor from '@pkg/backend/images/imageProcessor';
 import * as K8s from '@pkg/backend/k8s';
 import mainEvents from '@pkg/main/mainEvents';
@@ -12,8 +11,8 @@ import { executable } from '@pkg/utils/resources';
 const console = Logging.images;
 
 export default class NerdctlImageProcessor extends imageProcessor.ImageProcessor {
-  constructor(executor: VMExecutor) {
-    super(executor);
+  constructor(backend: VMBackend) {
+    super(backend);
 
     mainEvents.on('k8s-check-state', (mgr: VMBackend) => {
       if (!this.active) {
@@ -30,9 +29,15 @@ export default class NerdctlImageProcessor extends imageProcessor.ImageProcessor
 
   protected async runImagesCommand(args: string[], sendNotifications = true): Promise<imageProcessor.childResultType> {
     const subcommandName = args[0];
-    const namespacedArgs = ['--namespace', this.currentNamespace].concat(args);
 
-    return await this.processChildOutput(spawn(executable('nerdctl'), namespacedArgs), subcommandName, sendNotifications);
+    return await this.processChildOutput(
+      this.backend.containerEngineClient.runClient(args, 'stream', { namespace: this.currentNamespace }),
+      {
+        subcommandName,
+        notifications: {
+          stdout: sendNotifications, stderr: sendNotifications, ok: sendNotifications,
+        },
+      });
   }
 
   async buildImage(dirPart: string, filePart: string, taggedImageName: string): Promise<imageProcessor.childResultType> {
@@ -67,18 +72,17 @@ export default class NerdctlImageProcessor extends imageProcessor.ImageProcessor
       false);
   }
 
-  async scanImage(taggedImageName: string): Promise<imageProcessor.childResultType> {
-    return await this.runTrivyCommand(
-      [
-        '--quiet',
-        'image',
-        '--format',
-        'json',
-        taggedImageName,
-      ]);
+  scanImage(taggedImageName: string, namespace: string): Promise<imageProcessor.childResultType> {
+    return this.runTrivyScan(
+      taggedImageName,
+      {
+        CONTAINERD_ADDRESS:   '/run/k3s/containerd/containerd.sock',
+        CONTAINERD_NAMESPACE: namespace,
+      },
+    );
   }
 
-  async getNamespaces(): Promise<Array<string>> {
+  async getNamespaces(): Promise<string[]> {
     const { stdout, stderr } = await childProcess.spawnFile(executable('nerdctl'),
       ['namespace', 'list', '--quiet'],
       { stdio: ['inherit', 'pipe', 'pipe'] });
@@ -98,8 +102,8 @@ export default class NerdctlImageProcessor extends imageProcessor.ImageProcessor
    * ...
    */
 
-  parse(data: string): imageProcessor.imageType[] {
-    const images: Array<imageProcessor.imageType> = [];
+  parse(data: string): imageProcessor.ImageType[] {
+    const images: imageProcessor.ImageType[] = [];
     const records = data.split(/\r?\n/)
       .filter(line => line.trim().length > 0)
       .map((line) => {
@@ -130,7 +134,7 @@ export default class NerdctlImageProcessor extends imageProcessor.ImageProcessor
   }
 }
 
-function imageComparator(a: imageProcessor.imageType, b: imageProcessor.imageType): number {
+function imageComparator(a: imageProcessor.ImageType, b: imageProcessor.ImageType): number {
   return a.imageName.localeCompare(b.imageName) ||
     a.tag.localeCompare(b.tag) ||
     a.imageID.localeCompare(b.imageID);

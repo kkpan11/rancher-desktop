@@ -1,5 +1,4 @@
 //go:build linux || windows
-// +build linux windows
 
 /*
 Copyright © 2021 SUSE LLC
@@ -27,7 +26,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"os"
 	"os/signal"
 	"regexp"
@@ -39,13 +37,17 @@ import (
 
 	"github.com/rancher-sandbox/rancher-desktop/src/go/wsl-helper/pkg/dockerproxy/models"
 	"github.com/rancher-sandbox/rancher-desktop/src/go/wsl-helper/pkg/dockerproxy/platform"
+	"github.com/rancher-sandbox/rancher-desktop/src/go/wsl-helper/pkg/dockerproxy/util"
 )
+
+// requestContextKeyType is a type defined for the context key to be unique.
+type requestContextKeyType struct{}
 
 // RequestContextValue contains things we attach to incoming requests
 type RequestContextValue map[interface{}]interface{}
 
 // requestContext is the context key for requestContextValue
-var requestContext = struct{}{}
+var requestContext = requestContextKeyType{}
 
 type containerInspectResponseBody struct {
 	ID string `json:"Id"`
@@ -55,8 +57,8 @@ const dockerAPIVersion = "v1.41.0"
 
 // Serve up the docker proxy at the given endpoint, using the given function to
 // create a connection to the real dockerd.
-func Serve(endpoint string, dialer func() (net.Conn, error)) error {
-	listener, err := platform.Listen(endpoint)
+func Serve(ctx context.Context, endpoint string, dialer func(ctx context.Context) (net.Conn, error)) error {
+	listener, err := platform.Listen(ctx, endpoint)
 	if err != nil {
 		return err
 	}
@@ -75,7 +77,10 @@ func Serve(endpoint string, dialer func() (net.Conn, error)) error {
 	logWriter := logrus.StandardLogger().Writer()
 	defer logWriter.Close()
 	munger := newRequestMunger()
-	proxy := &httputil.ReverseProxy{
+	proxy := &util.ReverseProxy{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dialer(ctx)
+		},
 		Director: func(req *http.Request) {
 			logrus.WithField("request", req).
 				WithField("headers", req.Header).
@@ -96,12 +101,6 @@ func Serve(endpoint string, dialer func() (net.Conn, error)) error {
 					WithField("modified request", req).
 					Error("could not munge request")
 			}
-		},
-		Transport: &http.Transport{
-			Dial: func(string, string) (net.Conn, error) {
-				return dialer()
-			},
-			DisableCompression: true, // for debugging
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			logEntry := logrus.WithField("response", resp)
@@ -178,7 +177,7 @@ func (m *requestMunger) getRequestPath(req *http.Request) string {
 }
 
 // MungeRequest modifies a given request in-place.
-func (m *requestMunger) MungeRequest(req *http.Request, dialer func() (net.Conn, error)) error {
+func (m *requestMunger) MungeRequest(req *http.Request, dialer func(ctx context.Context) (net.Conn, error)) error {
 	requestPath := m.getRequestPath(req)
 	logEntry := logrus.WithFields(logrus.Fields{
 		"method": req.Method,
@@ -219,7 +218,7 @@ func (m *requestMunger) MungeRequest(req *http.Request, dialer func() (net.Conn,
 	return nil
 }
 
-func (m *requestMunger) MungeResponse(resp *http.Response, dialer func() (net.Conn, error)) error {
+func (m *requestMunger) MungeResponse(resp *http.Response, dialer func(ctx context.Context) (net.Conn, error)) error {
 	requestPath := m.getRequestPath(resp.Request)
 	logEntry := logrus.WithFields(logrus.Fields{
 		"method": resp.Request.Method,
@@ -264,9 +263,9 @@ func (m *requestMunger) MungeResponse(resp *http.Response, dialer func() (net.Co
 CanonicalizeContainerID makes a request upstream to inspect and resolve the full id of the container
 we use the provided id path template variable to make an upstream request to the docker engine api to inspect the container.
 Fortunately it supports both id or name as the container identifier.
-The Id returned will be the full long container id that is used to lookup in docker-binds.json.
+The ID returned will be the full long container id that is used to lookup in docker-binds.json.
 */
-func (m *requestMunger) CanonicalizeContainerID(req *http.Request, id string, dialer func() (net.Conn, error)) (*containerInspectResponseBody, error) {
+func (m *requestMunger) CanonicalizeContainerID(req *http.Request, id string, dialer func(ctx context.Context) (net.Conn, error)) (*containerInspectResponseBody, error) {
 	// url for inspecting container
 	inspectURL, err := req.URL.Parse(fmt.Sprintf("/%s/containers/%s/json", dockerAPIVersion, id))
 	if err != nil {
@@ -275,8 +274,8 @@ func (m *requestMunger) CanonicalizeContainerID(req *http.Request, id string, di
 
 	client := &http.Client{
 		Transport: &http.Transport{
-			Dial: func(string, string) (net.Conn, error) {
-				return dialer()
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return dialer(ctx)
 			},
 		},
 	}
@@ -322,7 +321,7 @@ type requestMungerFunc func(*http.Request, *RequestContextValue, map[string]stri
 
 // responseMungerFunc is a munger for an outgoing response; it also receives an
 // arbitrary mapping that was initially passed to the matching request munger,
-// as well a a mapping of any path templating patterns that were matched.
+// as well as a mapping of any path templating patterns that were matched.
 type responseMungerFunc func(*http.Response, *RequestContextValue, map[string]string) error
 
 // mungerMethodMapping is a helper structure to find a munger given an API path,

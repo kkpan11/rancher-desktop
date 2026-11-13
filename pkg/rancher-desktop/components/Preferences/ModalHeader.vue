@@ -1,12 +1,12 @@
 <script lang="ts">
-import Vue from 'vue';
-export default Vue.extend({ name: 'preferences-header' });
+import { defineComponent } from 'vue';
+export default defineComponent({ name: 'preferences-header' });
 </script>
 
 <template>
   <div class="preferences-header">
     <div class="title">
-      Preferences
+      {{ t('preferences.header') }}
     </div>
   </div>
 </template>

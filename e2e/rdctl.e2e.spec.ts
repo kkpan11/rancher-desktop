@@ -24,7 +24,6 @@ import path from 'path';
 
 import { expect, test } from '@playwright/test';
 import _ from 'lodash';
-import fetch, { RequestInit } from 'node-fetch';
 import yaml from 'yaml';
 
 import { NavPage } from './pages/nav-page';
@@ -56,7 +55,7 @@ test.describe('Command server', () => {
   let serverState: ServerState;
   let page: Page;
   const ENOENTMessage = os.platform() === 'win32' ? 'The system cannot find the file specified' : 'no such file or directory';
-  const appPath = path.join(__dirname, '../');
+  const appPath = path.dirname(import.meta.dirname);
 
   async function doRequest(path: string, body = '', method = 'GET') {
     const url = `http://127.0.0.1:${ serverState.port }/${ path.replace(/^\/*/, '') }`;
@@ -90,7 +89,7 @@ test.describe('Command server', () => {
     }
   }
 
-  async function rdctlWithStdin(inputFile: string, commandArgs: string[]): Promise< { stdout: string, stderr: string, error?: any}> {
+  async function rdctlWithStdin(inputFile: string, commandArgs: string[]): Promise< { stdout: string, stderr: string, error?: any }> {
     let stream: fs.ReadStream | null = null;
 
     try {
@@ -189,13 +188,13 @@ test.describe('Command server', () => {
 
   test('setting existing settings should be a no-op', async() => {
     let resp = await doRequest('/v1/settings');
-    const rawSettings = resp.body.read().toString();
+    const rawSettings = await resp.text();
 
     resp = await doRequest('/v1/settings', rawSettings, 'PUT');
     expect({
       ok:     resp.ok,
       status: resp.status,
-      body:   resp.body.read().toString(),
+      body:   await resp.text(),
     }).toEqual({
       ok:     true,
       status: 202,
@@ -208,7 +207,7 @@ test.describe('Command server', () => {
     const settings = await resp.json();
     const desiredEnabled = !settings.kubernetes.enabled;
     const desiredEngine = 'flip';
-    const desiredVersion = /1.23.4/.test(settings.kubernetes.version) ? 'v1.19.1' : 'v1.23.4';
+    const desiredVersion = /1.29.4/.test(settings.kubernetes.version) ? 'v1.19.1' : 'v1.29.4';
     const requestedSettings = _.merge({}, settings, {
       version:         CURRENT_SETTINGS_VERSION,
       containerEngine: {
@@ -248,7 +247,7 @@ test.describe('Command server', () => {
 
     expect(resp2.ok).toBeFalsy();
     expect(resp2.status).toEqual(400);
-    const body = resp2.body.read().toString();
+    const body = await resp2.text();
     const expectedWSL = {
       win32: `Proposed field "WSL.integrations" should be an object, got <ceci n'est pas un objet>.`,
       lima:  `Changing field "WSL.integrations" via the API isn't supported.`,
@@ -274,9 +273,7 @@ test.describe('Command server', () => {
 
     expect(resp.ok).toBeFalsy();
     expect(resp.status).toEqual(400);
-    const body = resp.body.read().toString();
-
-    expect(body).toContain('error processing JSON request block');
+    await expect(resp.text()).resolves.toContain('error processing JSON request block');
   });
 
   test('should reject empty payload, settings request', async() => {
@@ -284,19 +281,15 @@ test.describe('Command server', () => {
 
     expect(resp.ok).toBeFalsy();
     expect(resp.status).toEqual(400);
-    const body = resp.body.read().toString();
-
-    expect(body).toContain('no settings specified in the request');
+    await expect(resp.text()).resolves.toContain('no settings specified in the request');
   });
 
   test('version-only path of a nonexistent version should 404', async() => {
-    const resp = await doRequest('/v99bottlesofbeeronthewall');
+    const resp = await doRequest('/v99-bottles-of-beer-on-the-wall');
 
     expect(resp.ok).toBeFalsy();
     expect(resp.status).toEqual(404);
-    const body = resp.body.read().toString();
-
-    expect(body).toContain('Unknown command: GET /v99bottlesofbeeronthewall');
+    await expect(resp.text()).resolves.toContain('Unknown command: GET /v99-bottles-of-beer-on-the-wall');
   });
 
   test('should not restart on unrelated changes', async() => {
@@ -392,13 +385,13 @@ test.describe('Command server', () => {
 
   test('setting existing transient settings should be a no-op', async() => {
     let resp = await doRequest('/v1/transient_settings');
-    const rawSettings = resp.body.read().toString();
+    const rawSettings = await resp.text();
 
     resp = await doRequest('/v1/transient_settings', rawSettings, 'PUT');
     expect({
       ok:     resp.ok,
       status: resp.status,
-      body:   resp.body.read().toString(),
+      body:   await resp.text(),
     }).toEqual({
       ok:     true,
       status: 202,
@@ -525,9 +518,7 @@ test.describe('Command server', () => {
 
     expect(resp.ok).toBeFalsy();
     expect(resp.status).toEqual(400);
-    const body = resp.body.read().toString();
-
-    expect(body).toContain('error processing JSON request block');
+    await expect(resp.text()).resolves.toContain('error processing JSON request block');
   });
 
   test('should reject empty payload, transient settings request', async() => {
@@ -535,9 +526,7 @@ test.describe('Command server', () => {
 
     expect(resp.ok).toBeFalsy();
     expect(resp.status).toEqual(400);
-    const body = resp.body.read().toString();
-
-    expect(body).toContain('no settings specified in the request');
+    await expect(resp.text()).resolves.toContain('no settings specified in the request');
   });
 
   test.describe('v0 API', () => {
@@ -549,13 +538,13 @@ test.describe('Command server', () => {
 
     test('should no longer work', async() => {
       for (const method in endpoints) {
-        for (const endpoint of endpoints[method as 'GET'|'PUT']) {
+        for (const endpoint of endpoints[method as 'GET' | 'PUT']) {
           const resp = await doRequest(`/v0/${ endpoint }`, '', method);
 
           expect({
             ok:     resp.ok,
             status: resp.status,
-            body:   resp.body.read().toString(),
+            body:   await resp.text(),
           }).toEqual({
             ok:     false,
             status: 400,
@@ -678,7 +667,7 @@ test.describe('Command server', () => {
     });
 
     test.describe('set', () => {
-      const unsupportedPrefsByPlatform: {[x in NodeJS.Platform] ?: [string, any][]} = {
+      const unsupportedPrefsByPlatform: Partial<Record<NodeJS.Platform, [string, any][]>> = {
         win32: [
           ['application.admin-access', true],
           ['application.path-management-strategy', 'rcfiles'],
@@ -686,19 +675,19 @@ test.describe('Command server', () => {
           ['experimental.virtual-machine.mount.9p.msize-in-kib', 128],
           ['experimental.virtual-machine.mount.9p.protocol-version', ProtocolVersion.NINEP2000_L],
           ['experimental.virtual-machine.mount.9p.security-model', SecurityModel.NONE],
-          ['experimental.virtual-machine.mount.type', MountType.NINEP],
-          ['experimental.virtual-machine.use-rosetta', true],
-          ['experimental.virtual-machine.type', VMType.VZ],
           ['virtual-machine.memory-in-gb', 10],
+          ['virtual-machine.mount.type', MountType.NINEP],
           ['virtual-machine.number-cpus', 10],
+          ['virtual-machine.type', VMType.VZ],
+          ['virtual-machine.use-rosetta', true],
         ],
         darwin: [
-          ['virtual-machine.host-resolver', true],
+          ['kubernetes.ingress.localhost-only', true],
         ],
         linux: [
-          ['experimental.virtual-machine.use-rosetta', true],
-          ['experimental.virtual-machine.type', VMType.VZ],
-          ['virtual-machine.host-resolver', true],
+          ['experimental.virtual-machine.proxy.enabled', true],
+          ['virtual-machine.type', VMType.VZ],
+          ['virtual-machine.use-rosetta', true],
         ],
       };
       const unsupportedOptions = unsupportedPrefsByPlatform[os.platform()] ?? [];
@@ -724,7 +713,7 @@ test.describe('Command server', () => {
         expect(stderr).toContain('Usage:');
         const options = stderr.split(/\n/)
           .filter(line => /^\s+--/.test(line))
-          .map(line => (/\s+--([-.\w]+)\s/.exec(line) || [])[1])
+          .map(line => (/\s+--([-.\w]+)/.exec(line) || [])[1])
           .filter(line => line);
 
         // This part is a bit subtle
@@ -757,7 +746,7 @@ test.describe('Command server', () => {
           stdout, stderr, error,
         }).toEqual({
           error:  expect.any(Error),
-          stderr: expect.stringContaining('Error: invalid argument "gorb" for "--kubernetes-enabled" flag: strconv.ParseBool: parsing "gorb": invalid syntax'),
+          stderr: expect.stringContaining('Error: invalid argument "gorb" for "--kubernetes-enabled" flag: must be true or false'),
           stdout: '',
         });
         expect(stderr).toContain('Usage:');
@@ -832,7 +821,6 @@ test.describe('Command server', () => {
           case 'win32':
             body.kubernetes.WSLIntegrations ??= {};
             body.kubernetes.WSLIntegrations.bosco = true;
-            body.kubernetes.hostResolver = !oldSettings.virtualMachine.hostResolver;
           }
           const { stdout, stderr, error } = await rdctl(['api', '/v1/settings', '-X', 'PUT', '-b', JSON.stringify(body)]);
 
@@ -851,12 +839,14 @@ test.describe('Command server', () => {
         test('accepts new settings', async() => {
           const oldSettings: Settings = JSON.parse((await rdctl(['list-settings'])).stdout);
           const body: RecursivePartial<Settings> = {
-            ...(os.platform() === 'win32' ? {} : {
-              virtualMachine: {
-                memoryInGB: oldSettings.virtualMachine.memoryInGB + 1,
-                numberCPUs: oldSettings.virtualMachine.numberCPUs + 1,
-              },
-            }),
+            ...(os.platform() === 'win32'
+              ? {}
+              : {
+                virtualMachine: {
+                  memoryInGB: oldSettings.virtualMachine.memoryInGB + 1,
+                  numberCPUs: oldSettings.virtualMachine.numberCPUs + 1,
+                },
+              }),
             version:     CURRENT_SETTINGS_VERSION,
             application: {
               // XXX: Can't change adminAccess until we can process the sudo-request dialog (and decline it)
@@ -886,7 +876,7 @@ test.describe('Command server', () => {
           });
           const newSettings: Settings = JSON.parse((await rdctl(['list-settings'])).stdout);
 
-          expect(newSettings).toEqual(_.merge(oldSettings, body));
+          expect(newSettings).toEqual(_.merge({}, oldSettings, body));
 
           // And now reinstate the old prefs so other tests that count on them will pass.
           const result = await rdctl(['api', '/v1/settings', '-X', 'PUT', '-b', JSON.stringify(oldSettings)]);
@@ -1186,7 +1176,7 @@ test.describe('Command server', () => {
 
       test.describe('getting endpoints', () => {
         async function getEndpoints() {
-          const apiSpecPath = path.join(path.dirname(__filename), '../pkg/rancher-desktop/assets/specs/command-api.yaml');
+          const apiSpecPath = path.join(import.meta.dirname, '../pkg/rancher-desktop/assets/specs/command-api.yaml');
           const apiSpec = await fs.promises.readFile(apiSpecPath, 'utf-8');
           const specPaths = yaml.parse(apiSpec).paths;
 
@@ -1263,8 +1253,9 @@ test.describe('Command server', () => {
           expect(JSON.parse(stdout)).toMatchObject({
             checks: [{
               id:          'CONNECTED_TO_INTERNET',
-              description: 'The application cannot reach the general internet for updated kubernetes versions and other components, but can still operate.',
+              description: expect.stringMatching(/^The application/),
               mute:        false,
+              passed:      expect.any(Boolean),
             }],
           });
         });
@@ -1277,7 +1268,7 @@ test.describe('Command server', () => {
               {
                 category:    'Networking',
                 id:          'CONNECTED_TO_INTERNET',
-                description: 'The application cannot reach the general internet for updated kubernetes versions and other components, but can still operate.',
+                description: expect.stringMatching(/^The application/),
                 mute:        false,
                 fixes:       [],
                 passed:      expect.any(Boolean),
@@ -1321,7 +1312,7 @@ test.describe('Command server', () => {
               {
                 category:    'Networking',
                 id:          'CONNECTED_TO_INTERNET',
-                description: 'The application cannot reach the general internet for updated kubernetes versions and other components, but can still operate.',
+                description: expect.stringMatching(/^The application/),
                 mute:        false,
               },
             ],

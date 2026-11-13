@@ -2,39 +2,47 @@
 
 import os from 'os';
 
+import { jest } from '@jest/globals';
 import _ from 'lodash';
 import { SemVer } from 'semver';
 
-import SettingsValidator from '../settingsValidator';
-
 import * as settings from '@pkg/config/settings';
-import { MountType, VMType } from '@pkg/config/settings';
+import { MountType, Theme, VMType } from '@pkg/config/settings';
 import { getDefaultMemory } from '@pkg/config/settingsImpl';
 import { PathManagementStrategy } from '@pkg/integrations/pathManager';
-import * as osVersion from '@pkg/utils/osVersion';
+import mockModules from '@pkg/utils/testUtils/mockModules';
 import { RecursivePartial } from '@pkg/utils/typeUtils';
+
+const modules = mockModules({
+  os: {
+    arch:     jest.spyOn(os, 'arch'),
+    platform: jest.spyOn(os, 'platform'),
+  },
+  '@pkg/utils/osVersion': {
+    getMacOsVersion: jest.fn<() => SemVer>(() => new SemVer('13.5.0')),
+  },
+});
 
 const cfg = _.merge(
   {},
   settings.defaultSettings,
   {
-    kubernetes:  { version: '1.23.4' },
+    kubernetes:  { version: '1.29.4' },
     application: { pathManagementStrategy: PathManagementStrategy.Manual },
   });
-const subject = new SettingsValidator();
-let spyPlatform: jest.SpiedFunction<typeof os.platform>;
+
+const subject = new (await import('../settingsValidator')).default();
 
 beforeEach(() => {
-  spyPlatform = jest.spyOn(os, 'platform');
+  modules.os.platform.mockReturnValue(process.platform);
 });
-
 afterEach(() => {
-  spyPlatform.mockRestore();
+  modules.os.platform.mockRestore();
 });
 
 cfg.virtualMachine.memoryInGB ||= getDefaultMemory();
-subject.k8sVersions = ['1.23.4', '1.0.0'];
-describe(SettingsValidator, () => {
+subject.k8sVersions = ['1.29.4', '1.0.0'];
+describe('SettingsValidator', () => {
   it('should do nothing when given existing settings', () => {
     const [needToUpdate, errors] = subject.validateSettings(cfg, cfg);
 
@@ -66,37 +74,92 @@ describe(SettingsValidator, () => {
     });
   });
 
+  it('should reject numeric strings with trailing characters', () => {
+    const [needToUpdate, errors, isFatal] = subject.validateSettings(cfg, { kubernetes: { port: '6443oops' as unknown as number } });
+
+    expect({ needToUpdate, errors, isFatal }).toEqual({
+      needToUpdate: false,
+      errors:       ['Invalid value for "kubernetes.port": <"6443oops">'],
+      isFatal:      false,
+    });
+  });
+
+  it('should reject a fractional port', () => {
+    const [needToUpdate, errors, isFatal] = subject.validateSettings(cfg, { kubernetes: { port: '6443.7' as unknown as number } });
+
+    expect({ needToUpdate, errors, isFatal }).toEqual({
+      needToUpdate: false,
+      errors:       ['Invalid value for "kubernetes.port": <6443.7>'],
+      isFatal:      false,
+    });
+  });
+
+  it('should reject a fractional CPU count', () => {
+    modules.os.platform.mockReturnValue('linux');
+    const [needToUpdate, errors, isFatal] = subject.validateSettings(cfg, { virtualMachine: { numberCPUs: 2.5 } });
+
+    expect({ needToUpdate, errors, isFatal }).toEqual({
+      needToUpdate: false,
+      errors:       ['Invalid value for "virtualMachine.numberCPUs": <2.5>'],
+      isFatal:      false,
+    });
+  });
+
+  it('should reject a fractional CPU count given as a string', () => {
+    modules.os.platform.mockReturnValue('linux');
+    const [needToUpdate, errors, isFatal] = subject.validateSettings(cfg, { virtualMachine: { numberCPUs: '2.5' as unknown as number } });
+
+    expect({ needToUpdate, errors, isFatal }).toEqual({
+      needToUpdate: false,
+      errors:       ['Invalid value for "virtualMachine.numberCPUs": <2.5>'],
+      isFatal:      false,
+    });
+  });
+
+  it('should accept a fractional memory size', () => {
+    modules.os.platform.mockReturnValue('linux');
+    const [needToUpdate, errors] = subject.validateSettings(cfg, { virtualMachine: { memoryInGB: cfg.virtualMachine.memoryInGB + 0.5 } });
+
+    expect({ needToUpdate, errors }).toEqual({
+      needToUpdate: true,
+      errors:       [],
+    });
+  });
+
   describe('all standard fields', () => {
     // Special fields that cannot be checked here; this includes enums and maps.
     const specialFields = [
       ['application', 'pathManagementStrategy'],
+      ['application', 'locale'],
+      ['application', 'theme'],
       ['containerEngine', 'allowedImages', 'locked'],
+      ['containerEngine', 'mobyStorageDriver'],
       ['containerEngine', 'name'],
       ['experimental', 'kubernetes', 'options', 'spinkube'],
+      ['experimental', 'virtualMachine', 'diskSize'], // Special parsing.
       ['experimental', 'virtualMachine', 'mount', '9p', 'cacheMode'],
       ['experimental', 'virtualMachine', 'mount', '9p', 'msizeInKib'],
       ['experimental', 'virtualMachine', 'mount', '9p', 'protocolVersion'],
       ['experimental', 'virtualMachine', 'mount', '9p', 'securityModel'],
-      ['experimental', 'virtualMachine', 'mount', 'type'],
-      ['experimental', 'virtualMachine', 'type'],
-      ['experimental', 'virtualMachine', 'useRosetta'],
       ['experimental', 'virtualMachine', 'proxy', 'noproxy'],
       ['kubernetes', 'version'],
       ['version'],
+      ['virtualMachine', 'mount', 'type'],
+      ['virtualMachine', 'type'],
+      ['virtualMachine', 'useRosetta'],
       ['WSL', 'integrations'],
     ];
 
     // Fields that can only be set on specific platforms.
     const platformSpecificFields: Record<string, ReturnType<typeof os.platform>> = {
       'application.adminAccess':                      'linux',
-      'experimental.virtualMachine.networkingTunnel': 'win32',
       'experimental.virtualMachine.proxy.enabled':    'win32',
       'experimental.virtualMachine.proxy.address':    'win32',
       'experimental.virtualMachine.proxy.password':   'win32',
       'experimental.virtualMachine.proxy.port':       'win32',
       'experimental.virtualMachine.proxy.username':   'win32',
+      'experimental.virtualMachine.sshPortForwarder': 'darwin',
       'kubernetes.ingress.localhostOnly':             'win32',
-      'virtualMachine.hostResolver':                  'win32',
       'virtualMachine.memoryInGB':                    'darwin',
       'virtualMachine.numberCPUs':                    'linux',
     };
@@ -131,7 +194,7 @@ describe(SettingsValidator, () => {
 
         if (keyPath.join('.') in platformSpecificFields) {
           beforeEach(() => {
-            spyPlatform.mockReturnValue(platformSpecificFields[keyPath.join('.')]);
+            modules.os.platform.mockReturnValue(platformSpecificFields[keyPath.join('.')]);
           });
         }
 
@@ -292,9 +355,40 @@ describe(SettingsValidator, () => {
     });
   });
 
+  describe('containerEngine.mobyStorageDriver', () => {
+    describe('should accept valid values', () => {
+      const validValues = ['classic', 'snapshotter', 'auto'] as const;
+      const pairs = validValues.flatMap(l => validValues.map(r => [l, r] as const));
+
+      test.each(pairs)('%s -> %s', (from, to) => {
+        const [needToUpdate, errors] = subject.validateSettings(
+          _.merge({}, cfg, { containerEngine: { mobyStorageDriver: from } }),
+          { containerEngine: { mobyStorageDriver: to } },
+        );
+
+        expect({ needToUpdate, errors }).toEqual({
+          needToUpdate: from !== to,
+          errors:       [],
+        });
+      });
+    });
+    it('should reject invalid values', () => {
+      const [needToUpdate, errors, isFatal] = subject.validateSettings(
+        cfg,
+        { containerEngine: { mobyStorageDriver: 'pikachu' as any } },
+      );
+
+      expect({ needToUpdate, errors, isFatal }).toEqual({
+        needToUpdate: false,
+        errors:       [expect.stringContaining('Invalid value for "containerEngine.mobyStorageDriver": <"pikachu">; must be one of ["classic","snapshotter","auto"]')],
+        isFatal:      true,
+      });
+    });
+  });
+
   describe('WSL.integrations', () => {
     beforeEach(() => {
-      spyPlatform.mockReturnValue('win32');
+      modules.os.platform.mockReturnValue('win32');
     });
 
     it('should reject invalid values', () => {
@@ -307,8 +401,18 @@ describe(SettingsValidator, () => {
       });
     });
 
+    test.each([null, [true]])('should reject %p', (integrations) => {
+      const [needToUpdate, errors, isFatal] = subject.validateSettings(cfg, { WSL: { integrations: integrations as unknown as Record<string, boolean> } });
+
+      expect({ needToUpdate, errors, isFatal }).toEqual({
+        needToUpdate: false,
+        errors:       [expect.stringContaining('Proposed field "WSL.integrations" should be an object')],
+        isFatal:      false,
+      });
+    });
+
     it('should reject being set on non-Windows', () => {
-      spyPlatform.mockReturnValue('haiku');
+      modules.os.platform.mockReturnValue('haiku');
       const [needToUpdate, errors, isFatal] = subject.validateSettings(cfg, { WSL: { integrations: { foo: true } } });
 
       expect({ needToUpdate, errors, isFatal }).toEqual({
@@ -395,9 +499,71 @@ describe(SettingsValidator, () => {
     });
   });
 
+  describe('application.theme', () => {
+    describe('should accept valid settings', () => {
+      test.each(Object.keys(Theme))('%s', (key) => {
+        const value = Theme[key as keyof typeof Theme];
+        const [needToUpdate, errors] = subject.validateSettings({
+          ...cfg,
+          application: { ...cfg.application, theme: Theme.SYSTEM },
+        }, { application: { theme: value } });
+
+        expect({ needToUpdate, errors }).toEqual({
+          needToUpdate: value !== Theme.SYSTEM,
+          errors:       [],
+        });
+      });
+    });
+
+    it('should reject invalid values', () => {
+      const [needToUpdate, errors, isFatal] = subject.validateSettings(cfg,
+        { application: { theme: 'invalid' as Theme } });
+
+      expect({ needToUpdate, errors, isFatal }).toEqual({
+        needToUpdate: false,
+        errors:       [`Invalid value for "application.theme": <"invalid">; must be one of ["system","light","dark"]`],
+        isFatal:      true,
+      });
+    });
+  });
+
+  describe('application.locale', () => {
+    it('should accept valid locales', () => {
+      const [needToUpdate, errors] = subject.validateSettings({
+        ...cfg,
+        application: { ...cfg.application, locale: 'en-us' },
+      }, { application: { locale: 'de' } });
+
+      expect({ needToUpdate, errors }).toEqual({
+        needToUpdate: true,
+        errors:       [],
+      });
+    });
+
+    it('should accept no-op changes', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg,
+        { application: { locale: 'en-us' } });
+
+      expect({ needToUpdate, errors }).toEqual({
+        needToUpdate: false,
+        errors:       [],
+      });
+    });
+
+    it('should reject invalid values', () => {
+      const [needToUpdate, errors, isFatal] = subject.validateSettings(cfg,
+        { application: { locale: 'invalid' as unknown as settings.Locale } });
+
+      expect(needToUpdate).toBe(false);
+      expect(isFatal).toBe(true);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain('Invalid value for "application.locale"');
+    });
+  });
+
   describe('pathManagementStrategy', () => {
     beforeEach(() => {
-      spyPlatform.mockReturnValue('linux');
+      modules.os.platform.mockReturnValue('linux');
     });
     describe('should accept valid settings', () => {
       test.each(Object.keys(PathManagementStrategy))('%s', (strategy) => {
@@ -523,6 +689,7 @@ describe(SettingsValidator, () => {
               errors:       ['field "containerEngine.allowedImages.enabled" is locked'],
               isFatal:      true,
             });
+            expect(subject.hasLockedFieldError).toBe(true);
           });
           it('can be set to the same value', () => {
             const currentEnabled = allowedImageListConfig.containerEngine.allowedImages.enabled;
@@ -533,6 +700,7 @@ describe(SettingsValidator, () => {
               needToUpdate: false,
               errors:       [],
             });
+            expect(subject.hasLockedFieldError).toBe(false);
           });
         });
 
@@ -699,6 +867,51 @@ describe(SettingsValidator, () => {
 
       expect(errors).toEqual(expectedErrors);
     });
+
+    it('should reject arrays', () => {
+      const [, errors] = subject.validateSettings(cfg, { application: { extensions: { installed: ['tag'] as unknown as Record<string, string> } } });
+
+      expect(errors).toEqual([expect.stringContaining('application.extensions.installed')]);
+      expect(errors[0]).toContain('not a valid mapping');
+    });
+  });
+
+  describe('experimental.virtual-machine.disk-size', () => {
+    describe('parsing inputs', () => {
+      test.each<['accept' | 'reject', string]>([
+        ['accept', '100GiB'], // default value
+        ['accept', '1.23GiB'], // with fractional number
+        ['reject', '1.GiB'], // Trailing dot on number
+        ['accept', '100 GiB'],  // with space between number and unit
+        ['accept', '1.23 GiB'], // fractional number with space
+        ['accept', '1234'], // no units
+        ['accept', '123k'], // kilobytes, no byte suffix
+        ['accept', '123mb'], // megabytes, with b suffix
+        ['accept', '1234 tib'], // terabytes (spellcheck-ignore-line)
+        ['reject', '1234 stuff'], // extra trailing text
+      ])('should %s %s', (outcome, input) => {
+        const errorMessage = `Invalid value for "experimental.virtualMachine.diskSize": <${ JSON.stringify(input) }>`;
+        const expectedErrors = outcome === 'accept' ? [] : [errorMessage];
+        const oldConfig = _.set(_.cloneDeep(cfg), 'experimental.virtualMachine.diskSize', 1);
+        const [, errors] = subject.validateSettings(oldConfig, { experimental: { virtualMachine: { diskSize: input } } });
+
+        expect(errors).toEqual(expectedErrors);
+      });
+    });
+    describe('rejecting smaller values', () => {
+      test.each<['accept' | 'reject', string, string]>([
+        ['accept', '100GiB', '100GiB'],
+        ['accept', '100GiB', '1TB'],
+        ['reject', '1G', '100M'],
+      ])('should %s going from %s to %s', (outcome, currentValue, desiredValue) => {
+        const errorMessage = `Cannot decrease "experimental.virtualMachine.diskSize" from ${ currentValue } to ${ desiredValue }`;
+        const expectedErrors = outcome === 'accept' ? [] : [errorMessage];
+        const oldConfig = _.set(_.cloneDeep(cfg), 'experimental.virtualMachine.diskSize', currentValue);
+        const [, errors] = subject.validateSettings(oldConfig, { experimental: { virtualMachine: { diskSize: desiredValue } } });
+
+        expect(errors).toEqual(expectedErrors);
+      });
+    });
   });
 
   it('should complain about unchangeable fields', () => {
@@ -744,6 +957,21 @@ describe(SettingsValidator, () => {
     ]);
   });
 
+  it('rejects null and arrays for object settings', () => {
+    for (const [field, value, expectedValue] of [
+      ['kubernetes', null, 'null'],
+      ['kubernetes.options', [], '[]'],
+    ] as const) {
+      const [needToUpdate, errors, isFatal] = subject.validateSettings(cfg, _.set({}, field, value));
+
+      expect({ needToUpdate, errors, isFatal }).toEqual({
+        needToUpdate: false,
+        errors:       [`Setting "${ field }" should wrap an inner object, but got <${ expectedValue }>.`],
+        isFatal:      false,
+      });
+    }
+  });
+
   // Add some fields that are very unlikely to ever collide with newly introduced fields.
   it('should ignore unrecognized settings', () => {
     const [needToUpdate, errors, isFatal] = subject.validateSettings(cfg, {
@@ -766,7 +994,7 @@ describe(SettingsValidator, () => {
 
     expect({ needToUpdate, errors, isFatal }).toEqual({
       needToUpdate: false,
-      errors:       expect.objectContaining({ length: 1 }),
+      errors:       [expect.anything()],
       isFatal:      false,
     });
   });
@@ -803,19 +1031,14 @@ describe(SettingsValidator, () => {
     ]);
   });
 
-  describe('experimental.virtualMachine.type', () => {
-    let spyArch: jest.SpiedFunction<typeof os.arch>;
-    let spyMacOsVersion: jest.SpiedFunction<typeof osVersion.getMacOsVersion>;
-
+  describe('virtualMachine.type', () => {
     beforeEach(() => {
-      spyPlatform.mockReturnValue('darwin');
-      spyArch = jest.spyOn(os, 'arch');
-      spyMacOsVersion = jest.spyOn(osVersion, 'getMacOsVersion');
+      modules.os.platform.mockReturnValue('darwin');
     });
 
     afterEach(() => {
-      spyArch.mockRestore();
-      spyMacOsVersion.mockRestore();
+      modules.os.arch.mockRestore();
+      modules['@pkg/utils/osVersion'].getMacOsVersion.mockRestore();
     });
 
     function checkForError(needToUpdate: boolean, errors: string[], errorMessage: string) {
@@ -826,61 +1049,57 @@ describe(SettingsValidator, () => {
       ]);
     }
 
-    function getVMTypeSetting(vmType: VMType) {
+    function getVMTypeSetting(vmType: VMType): RecursivePartial<settings.Settings> {
       return {
-        experimental: {
-          virtualMachine: {
-            type: vmType,
-          },
+        virtualMachine: {
+          type: vmType,
         },
       };
     }
 
-    function getMountTypeSetting(mountType: MountType) {
+    function getMountTypeSetting(mountType: MountType): RecursivePartial<settings.Settings> {
       return {
-        experimental: {
-          virtualMachine: {
-            mount: {
-              type: mountType,
-            },
+        virtualMachine: {
+          mount: {
+            type: mountType,
           },
         },
       };
     }
 
     it('should reject VZ if architecture is arm and macOS version < 13.3.0', () => {
-      spyArch.mockReturnValue('arm64');
-      spyMacOsVersion.mockReturnValue(new SemVer('13.2.0'));
+      modules.os.arch.mockReturnValue('arm64');
+      modules['@pkg/utils/osVersion'].getMacOsVersion.mockReturnValue(new SemVer('13.2.0'));
       const [needToUpdate, errors] = subject.validateSettings(
         cfg, getVMTypeSetting(VMType.VZ));
 
       checkForError(
         needToUpdate, errors,
-        'Setting experimental.virtualMachine.type to \"vz\" on ARM requires macOS 13.3 (Ventura) or later.',
+        'Setting virtualMachine.type to \"vz\" on ARM requires macOS 13.3 (Ventura) or later.',
       );
     });
 
     it('should reject VZ if architecture is Intel macOS version < 13.0.0', () => {
-      spyArch.mockReturnValue('x64');
-      spyMacOsVersion.mockReturnValue(new SemVer('12.0.0'));
+      modules.os.arch.mockReturnValue('x64');
+      modules['@pkg/utils/osVersion'].getMacOsVersion.mockReturnValue(new SemVer('12.0.0'));
       const [needToUpdate, errors] = subject.validateSettings(
         cfg, getVMTypeSetting(VMType.VZ));
 
       checkForError(
         needToUpdate, errors,
-        'Setting experimental.virtualMachine.type to \"vz\" on Intel requires macOS 13.0 (Ventura) or later.',
+        'Setting virtualMachine.type to \"vz\" on Intel requires macOS 13.0 (Ventura) or later.',
       );
     });
 
     it('should reject VZ if mount type is 9p', () => {
-      spyMacOsVersion.mockReturnValue(new SemVer('13.3.0'));
+      modules['@pkg/utils/osVersion'].getMacOsVersion.mockReturnValue(new SemVer('13.3.0'));
       const [needToUpdate, errors] = subject.validateSettings(
         _.merge({}, cfg, getMountTypeSetting(MountType.NINEP)), getVMTypeSetting(VMType.VZ));
 
       checkForError(
         needToUpdate, errors,
-        'Setting experimental.virtualMachine.type to \"vz\" requires that ' +
-        'experimental.virtual-machine.mount.type is \"reverse-sshfs\" or \"virtiofs\".',
+        'Setting virtualMachine.type to \"vz\" requires that ' +
+        'virtual-machine.mount.type is \"reverse-sshfs\" or \"virtiofs\".',
       );
     });
 
@@ -890,9 +1109,219 @@ describe(SettingsValidator, () => {
 
       checkForError(
         needToUpdate, errors,
-        'Setting experimental.virtualMachine.type to \"qemu\" requires that ' +
-        'experimental.virtual-machine.mount.type is \"reverse-sshfs\" or \"9p\".',
+        'Setting virtualMachine.type to \"qemu\" requires that ' +
+        'virtual-machine.mount.type is \"reverse-sshfs\" or \"9p\".',
       );
+    });
+  });
+
+  describe('noproxy', () => {
+    const fqname = 'experimental.virtualMachine.proxy.noproxy';
+
+    function noproxySetting(noproxy: string[]): RecursivePartial<settings.Settings> {
+      return { experimental: { virtualMachine: { proxy: { noproxy } } } };
+    }
+
+    beforeEach(() => {
+      modules.os.platform.mockReturnValue('win32');
+    });
+
+    it('should accept an empty noproxy list', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting([]));
+
+      expect({ needToUpdate, errors }).toEqual({ needToUpdate: true, errors: [] });
+    });
+
+    it('should accept valid IPv4 addresses', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['192.168.1.1']));
+
+      expect({ needToUpdate, errors }).toEqual({ needToUpdate: true, errors: [] });
+    });
+
+    it('should accept valid IPv4 CIDR subnets', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['10.0.0.0/8', '172.16.0.0/12']));
+
+      expect({ needToUpdate, errors }).toEqual({ needToUpdate: true, errors: [] });
+    });
+
+    it('should accept valid IPv6 addresses', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['::1', 'fe80::1']));
+
+      expect({ needToUpdate, errors }).toEqual({ needToUpdate: true, errors: [] });
+    });
+
+    it('should accept valid IPv6 CIDR subnets', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['fd00::/8', '::1/128']));
+
+      expect({ needToUpdate, errors }).toEqual({ needToUpdate: true, errors: [] });
+    });
+
+    it('should accept the default noproxy list unchanged without errors', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(cfg.experimental.virtualMachine.proxy.noproxy));
+
+      expect({ needToUpdate, errors }).toEqual({ needToUpdate: false, errors: [] });
+    });
+
+    it('should accept domain names', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['example.com']));
+
+      expect({ needToUpdate, errors }).toEqual({ needToUpdate: true, errors: [] });
+    });
+
+    it('should accept wildcard domain entries', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['*.example.com']));
+
+      expect({ needToUpdate, errors }).toEqual({ needToUpdate: true, errors: [] });
+    });
+
+    it('should accept leading-dot domain entries', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['.example.com']));
+
+      expect({ needToUpdate, errors }).toEqual({ needToUpdate: true, errors: [] });
+    });
+
+    it('should accept domain names with subdomains', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['sub.example.com']));
+
+      expect({ needToUpdate, errors }).toEqual({ needToUpdate: true, errors: [] });
+    });
+
+    it('should accept mixed IP and domain entries', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['10.0.0.0/8', 'example.com', '*.internal.corp']));
+
+      expect({ needToUpdate, errors }).toEqual({ needToUpdate: true, errors: [] });
+    });
+
+    it('should accept single-label hostnames', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['localhost']));
+
+      expect({ needToUpdate, errors }).toEqual({ needToUpdate: true, errors: [] });
+    });
+
+    it('should reject bare wildcard', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['*.']));
+
+      expect(needToUpdate).toBe(false);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain('invalid entries');
+    });
+
+    it('should reject domains with labels starting with hyphens', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['-example.com']));
+
+      expect(needToUpdate).toBe(false);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain('invalid entries');
+    });
+
+    it('should reject duplicate entries', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['10.0.0.1', '10.0.0.1']));
+
+      expect(needToUpdate).toBe(false);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain('duplicate');
+    });
+
+    it('should reject non-array values', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, { experimental: { virtualMachine: { proxy: { noproxy: 'not-an-array' as any } } } });
+
+      expect(needToUpdate).toBe(false);
+      expect(errors).toHaveLength(1);
+    });
+
+    it('should reject CIDR with out-of-range prefix length', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['10.0.0.0/33']));
+
+      expect(needToUpdate).toBe(false);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain('invalid entries');
+    });
+
+    it('should reject CIDR with non-numeric prefix', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['10.0.0.0/abc']));
+
+      expect(needToUpdate).toBe(false);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain('invalid entries');
+    });
+
+    it('should report all invalid entries at once', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['-invalid', '10.0.0.0/8', 'also-invalid-']));
+
+      expect(needToUpdate).toBe(false);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain('-invalid');
+      expect(errors[0]).toContain('also-invalid-');
+    });
+
+    it('should reject IPv6 CIDR with out-of-range prefix length', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['::1/129']));
+
+      expect(needToUpdate).toBe(false);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain('invalid entries');
+    });
+
+    it('should reject entries with whitespace', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting([' 10.0.0.1', '10.0.0.2 ', 'example .com']));
+
+      expect(needToUpdate).toBe(false);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain('invalid entries');
+    });
+
+    it('should reject wildcard or dot-prefixed IP addresses', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['*.10.0.0.1', '.10.0.0.1', '*.::1', '.::1']));
+
+      expect(needToUpdate).toBe(false);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain('invalid entries');
+    });
+
+    it('should accept a domain at the 253-character maximum length', () => {
+      // 3 labels of 63 chars + 3 dots + final label = 192 + final label length
+      const label63 = 'a'.repeat(63);
+      const domain = `${ label63 }.${ label63 }.${ label63 }.${ 'a'.repeat(61) }`;
+
+      expect(domain.length).toBe(253);
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting([domain]));
+
+      expect({ needToUpdate, errors }).toEqual({ needToUpdate: true, errors: [] });
+    });
+
+    it('should reject a domain exceeding 253 characters', () => {
+      const label63 = 'a'.repeat(63);
+      const domain = `${ label63 }.${ label63 }.${ label63 }.${ 'a'.repeat(62) }`;
+
+      expect(domain.length).toBe(254);
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting([domain]));
+
+      expect(needToUpdate).toBe(false);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain('invalid entries');
+    });
+
+    it('should accept a label at the 63-character maximum length', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting([`${ 'a'.repeat(63) }.com`]));
+
+      expect({ needToUpdate, errors }).toEqual({ needToUpdate: true, errors: [] });
+    });
+
+    it('should reject a label exceeding 63 characters', () => {
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting([`${ 'a'.repeat(64) }.com`]));
+
+      expect(needToUpdate).toBe(false);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain('invalid entries');
+    });
+
+    it('should be gated to win32 platform', () => {
+      modules.os.platform.mockReturnValue('darwin');
+      const [needToUpdate, errors] = subject.validateSettings(cfg, noproxySetting(['10.0.0.1']));
+
+      expect(needToUpdate).toBe(false);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain('isn\'t supported');
     });
   });
 });

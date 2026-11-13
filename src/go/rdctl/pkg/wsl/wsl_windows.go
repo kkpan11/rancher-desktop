@@ -1,62 +1,65 @@
 package wsl
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"slices"
 	"strings"
 
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/windows"
-	"golang.org/x/text/encoding/unicode"
+
+	"github.com/rancher-sandbox/rancher-desktop/src/go/rdctl/pkg/lima"
 )
 
 type WSL interface {
 	// Deletes all WSL distros pertaining to Rancher Desktop.
-	UnregisterDistros() error
+	UnregisterDistros(ctx context.Context) error
 	// Exports a distro as a .vhdx file and stores the result at
 	// the path given in fileName.
-	ExportDistro(distroName, fileName string) error
+	ExportDistro(ctx context.Context, distroName, fileName string) error
 	// Imports a distro from a .vhdx file stored at path fileName
 	// and names it distroName. Installs the distro in the directory
 	// given by installLocation.
-	ImportDistro(distroName, installLocation, fileName string) error
+	ImportDistro(ctx context.Context, distroName, installLocation, fileName string) error
 }
 
 type WSLImpl struct{}
 
-func (wsl WSLImpl) UnregisterDistros() error {
-	cmd := exec.Command("wsl", "--list", "--quiet")
+func (wsl WSLImpl) UnregisterDistros(ctx context.Context) error {
+	cmd := exec.CommandContext(ctx, "wsl", "--list", "--quiet")
+	// Force WSL to output UTF-8 so it's easier to process. (os.Environ returns a
+	// copy, so appending to it is safe.)
+	cmd.Env = append(os.Environ(), "WSL_UTF8=1")
 	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-	rawBytes, err := cmd.CombinedOutput()
+	cmd.Stderr = os.Stderr
+	rawBytes, err := cmd.Output()
 	if err != nil {
-		return fmt.Errorf("error getting current WSLs: %w", err)
+		return fmt.Errorf("error getting current WSL distributions: %w", err)
 	}
-	decoder := unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM).NewDecoder()
-	actualOutput, err := decoder.String(string(rawBytes))
-	if err != nil {
-		return fmt.Errorf("error getting current WSLs: %w", err)
-	}
-	actualOutput = strings.ReplaceAll(actualOutput, "\r", "")
-	wsls := strings.Split(actualOutput, "\n")
-	wslsToKill := []string{}
-	for _, s := range wsls {
-		if s == "rancher-desktop" || s == "rancher-desktop-data" {
-			wslsToKill = append(wslsToKill, s)
+	distrosToKill := []string{}
+	for _, s := range strings.Fields(string(rawBytes)) {
+		if slices.Contains([]string{DistributionName, DataDistributionName, lima.InstanceFullName}, s) {
+			distrosToKill = append(distrosToKill, s)
 		}
 	}
 
-	for _, wsl := range wslsToKill {
-		cmd := exec.Command("wsl", "--unregister", wsl)
+	for _, distro := range distrosToKill {
+		cmd := exec.CommandContext(ctx, "wsl", "--unregister", distro)
 		cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
-			logrus.Errorf("Error unregistering WSL distribution %s: %s\n", wsl, err)
+			logrus.Errorf("Error unregistering WSL distribution %s: %s\n", distro, err)
 		}
 	}
 	return nil
 }
 
-func (wsl WSLImpl) ExportDistro(distroName, fileName string) error {
-	cmd := exec.Command("wsl.exe", "--export", distroName, fileName)
+func (wsl WSLImpl) ExportDistro(ctx context.Context, distroName, fileName string) error {
+	cmd := exec.CommandContext(ctx, "wsl.exe", "--export", distroName, fileName)
 	// Prevents "signals" (think ctrl+C) from affecting called subprocess
 	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 	if output, err := cmd.Output(); err != nil {
@@ -65,8 +68,8 @@ func (wsl WSLImpl) ExportDistro(distroName, fileName string) error {
 	return nil
 }
 
-func (wsl WSLImpl) ImportDistro(distroName, installLocation, fileName string) error {
-	cmd := exec.Command("wsl.exe", "--import", distroName, installLocation, fileName, "--version", "2")
+func (wsl WSLImpl) ImportDistro(ctx context.Context, distroName, installLocation, fileName string) error {
+	cmd := exec.CommandContext(ctx, "wsl.exe", "--import", distroName, installLocation, fileName, "--version", "2")
 	// Prevents "signals" (think ctrl+C) from affecting called subprocess
 	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 	if output, err := cmd.Output(); err != nil {

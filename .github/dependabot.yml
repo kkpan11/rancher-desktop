@@ -1,120 +1,80 @@
 version: 2
 updates:
 
-  # Maintain dependencies for GitHub Actions
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "daily"
-    open-pull-requests-limit: 5
-    labels: ["component/dependencies"]
+# Maintain dependencies for GitHub Actions
+- package-ecosystem: "github-actions"
+  directories:
+  - "/"
+  - "/.github/actions/*/"
+  schedule:
+    interval: "daily"
+  cooldown:
+    default-days: 7
+  open-pull-requests-limit: 12
+  labels: ["component/dependencies"]
+  groups:
+    # init and analyze share a config file and abort when their versions differ.
+    codeql-action:
+      patterns: ["github/codeql-action/*"]
 
-  # Maintain dependencies for npm
-  - package-ecosystem: "npm"
-    directory: "/"
-    schedule:
-      interval: "daily"
-    open-pull-requests-limit: 5
-    labels: ["component/dependencies"]
-    ignore:
-      - # Needs to be updated along with NodeJS version.
-        dependency-name: "@types/node"
-        versions: [ ">18" ]
-      - # Need to migrate to Vue 3 before moving beyond 2.7.x.
-        dependency-name: "vue"
-        versions: [ ">2" ]
-      - # @vue/test-utils v2 is for Vue 3; we're on Vue 2 for now
-        dependency-name: "@vue/test-utils"
-        versions: [ ">1" ]
-      - # Since we no longer pull in Nuxt (i.e. we have "ejected"), newer
-        # versions of this package mis-detect and think we're using Nuxt 3 (with
-        # Vue 3), and uses the wrong set of linters.  This happened in v12, so
-        # we ignore everything higher than 11.
-        dependency-name: "@nuxtjs/eslint-config-typescript"
-        versions: [ ">11" ]
-      - # Electron major bumps are too complicated; we need to do those manually.
-        dependency-name: "electron"
-        update-types: [ "version-update:semver-major" ]
-      - # node-fetch 3+ requires ECMAScript modules, but Electron doesn't
-        # support that. See https://github.com/electron/electron/issues/21457
-        dependency-name: "node-fetch"
-        versions: [ ">2" ]
-      - # This needs to be done in lockstep with node-fetch.
-        dependency-name: "@types/node-fetch"
-        versions: [ ">2" ]
-      - # We don't utilize @rancher/shell in a meaningful way. It is safe to
-        # ignore until we arrive a solution that uses it.
-        dependency-name: "@rancher/shell"
-        versions: [ ">0.1" ]
-      - # unfetch release 5.0.0 dropped necessary files.
-        # See https://github.com/developit/unfetch/issues/ 162, 163, 167, 172, 176
-        # Not the best-maintained library out there.
-        # It's used only by the nuxt pseudo-submodule
-        # Assume the next release will fix it.
-        dependency-name: "unfetch"
-        versions: [ "5.0.0" ]
+# Maintain dependencies for npm
+- package-ecosystem: "npm"
+  directory: "/"
+  schedule:
+    interval: "daily"
+  cooldown:
+    default-days: 7
+  open-pull-requests-limit: 12
+  labels: ["component/dependencies"]
+  ignore:
+  - # Needs to be updated along with NodeJS version.
+    dependency-name: "@types/node"
+    update-types: [version-update:semver-major]
+  - # We don't utilize @rancher/shell in a meaningful way. It is safe to
+    # ignore until we arrive a solution that uses it.
+    dependency-name: "@rancher/shell"
+    versions: [">0.1"]
+  - # We are currently using @vue/cli-service which depends on an older version
+    # of webpack.  Upgrading webpack past what we currently have causes
+    # conflicts between the different versions of webpack.  Disable further
+    # updates of webpack until we can migrate off @vue/cli-service (which is
+    # unlikely to be fixed as it is in maintenance mode).
+    dependency-name: "webpack"
+  - # TypeScript 7 is the Go port; its npm package exports only version and
+    # versionMajorMinor, so ts-loader and @typescript-eslint fail with a
+    # TypeError.  Drop this rule once they support 7.x.
+    dependency-name: "typescript"
+    update-types: [version-update:semver-major]
+  - # @rancher/components is currently undergoing major changes, where new
+    # components under different names are being introduced.  The old components
+    # are not being maintained as well.  Instead of updating, we will have
+    # better results forking instead.
+    dependency-name: "@rancher/components"
+  groups:
+    # vue pins @vue/compiler-sfc exactly, so separate bumps break the lockfile.
+    vue:
+      patterns: ["vue", "@vue/compiler-sfc"]
+    # These pin shared @jest/* packages exactly, so separate bumps break the
+    # lockfile.
+    jest:
+      patterns: ["jest", "babel-jest", "jest-environment-jsdom"]
 
-  # Maintain dependencies for Golang
-  - package-ecosystem: "gomod"
-    directory: "/src/go/docker-credential-none"
-    schedule:
-      interval: "daily"
-    open-pull-requests-limit: 1
-    labels: ["component/dependencies"]
-    reviewers: [ "jandubois" ]
-
-  - package-ecosystem: "gomod"
-    directory: "/src/go/extension-proxy"
-    schedule:
-      interval: "daily"
-    open-pull-requests-limit: 1
-    labels: ["component/dependencies"]
-    reviewers: [ "Nino-K" ]
-
-  - package-ecosystem: "gomod"
-    directory: "/src/go/github-runner-monitor"
-    schedule:
-      interval: "daily"
-    open-pull-requests-limit: 1
-    labels: ["component/dependencies"]
-    reviewers: [ "mook-as" ]
-
-  - package-ecosystem: "gomod"
-    directory: "/src/go/mock-wsl"
-    schedule:
-      interval: "daily"
-    open-pull-requests-limit: 1
-    labels: ["component/dependencies"]
-    reviewers: [ "Nino-K" ]
-
-  - package-ecosystem: "gomod"
-    directory: "/src/go/nerdctl-stub"
-    schedule:
-      interval: "daily"
-    open-pull-requests-limit: 1
-    labels: ["component/dependencies"]
-    reviewers: [ "Nino-K" ]
-
-  - package-ecosystem: "gomod"
-    directory: "/src/go/rdctl"
-    schedule:
-      interval: "daily"
-    open-pull-requests-limit: 1
-    labels: ["component/dependencies"]
-    reviewers: [ "jandubois" ]
-
-  - package-ecosystem: "gomod"
-    directory: "/src/go/vtunnel"
-    schedule:
-      interval: "daily"
-    open-pull-requests-limit: 1
-    labels: ["component/dependencies"]
-    reviewers: [ "Nino-K" ]
-
-  - package-ecosystem: "gomod"
-    directory: "/src/go/wsl-helper"
-    schedule:
-      interval: "daily"
-    open-pull-requests-limit: 1
-    labels: ["component/dependencies"]
-    reviewers: [ "Nino-K" ]
+# Maintain dependencies for Golang
+- package-ecosystem: "gomod"
+  directories:
+  - "/src/go/*"
+  - "/src/go/**/*"
+  - "/scripts"
+  schedule:
+    interval: "daily"
+# cooldown:
+#   default-days: 7
+  open-pull-requests-limit: 12
+  labels: ["component/dependencies"]
+  groups:
+    containerd:
+      patterns: ["github.com/containerd/containerd/*"]
+    golang-x:
+      patterns: ["golang.org/x/*"]
+    k8s:
+      patterns: ["k8s.io/*"]

@@ -1,5 +1,5 @@
 wait_for_kubelet() {
-    local desired_version=${1:-$RD_KUBERNETES_PREV_VERSION}
+    local desired_version=${1:-$RD_KUBERNETES_VERSION}
     local timeout=$(($(date +%s) + RD_KUBELET_TIMEOUT * 60))
     trace "waiting for Kubernetes ${desired_version} to be available"
     while true; do
@@ -35,10 +35,29 @@ wait_for_kubelet() {
     done
 }
 
+# unwrap_kube_list removes the "List" wrapper from the JSON in $output if .kind is "List".
+# Returns an error if the number of .items in the List isn't exactly 1.
+unwrap_kube_list() {
+    local json=$output
+
+    run jq_output '.kind'
+    assert_success
+    if [[ $output == "List" ]]; then
+        run jq --raw-output '.items | length' <<<"$json"
+        assert_success
+        assert_output "1"
+
+        run jq --raw-output '.items[0]' <<<"$json"
+        assert_success
+        json=$output
+    fi
+    echo "$json"
+}
+
 assert_kube_deployment_available() {
     local jsonpath="jsonpath={.status.conditions[?(@.type=='Available')].status}"
     run --separate-stderr kubectl get deployment "$@" --output "$jsonpath"
-    assert_success || return
+    assert_success
     assert_output "True"
 }
 
@@ -47,11 +66,25 @@ wait_for_kube_deployment_available() {
     try assert_kube_deployment_available "$@"
 }
 
+assert_pod_containers_are_running() {
+    run kubectl get pod "$@" --output json
+    assert_success
+
+    # Make sure the query returned just a single pod
+    run unwrap_kube_list
+    assert_success
+
+    # Confirm that **all** containers of the pod are in "running" state
+    run jq_output '[.status.containerStatuses[].state | keys] | add | unique | .[]'
+    assert_success
+    assert_output "running"
+}
+
 traefik_ip() {
     local jsonpath='jsonpath={.status.loadBalancer.ingress[0].ip}'
     run --separate-stderr kubectl get service traefik --namespace kube-system --output "$jsonpath"
-    assert_success || return
-    assert_output || return
+    assert_success
+    assert_output
     echo "$output"
 }
 
@@ -63,7 +96,7 @@ traefik_hostname() {
         # BUG BUG BUG
 
         # local ip
-        # ip=$(traefik_ip) || return
+        # ip=$(traefik_ip)
         # echo "${ip}.sslip.io"
 
         # caller must have called `skip_unless_host_ip`
@@ -75,6 +108,7 @@ traefik_hostname() {
 }
 
 wait_for_traefik() {
+    trace "waiting for the traefik service to get an IP address"
     try traefik_ip
 }
 

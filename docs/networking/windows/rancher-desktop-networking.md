@@ -1,5 +1,5 @@
 
-# [Rancher Desktop Networking](https://github.com/rancher-sandbox/rancher-desktop-networking)
+# [Rancher Desktop Networking](../../../src/go/networking/)
 
 Rancher Desktop Networking primarily acts as a layer 2 switch between the host (currently Windows only) and the VM (WSL) using the `AF_VSOCK` protocol. It facilitates the transmission of Ethernet frames from the VM to the host. Additionally, it provides `DNS`, `DHCP`, and dynamic port forwarding functionalities. The Rancher Desktop Networking comprises several key services: `host-switch`, `vm-switch`, `network-setup`, and `wsl-proxy`. It utilizes [gvisor's](https://github.com/google/gvisor) network stack and draws inspiration from the [gvisor-tap-vsock](https://github.com/google/gvisor) project.
 
@@ -20,24 +20,24 @@ end
 subgraph  netNs["Isolated Network Namespace"]
 vsockVM{"VM Switch"}
 tapDevice("eth0")
-veth-rd1("veth-rd1")
+veth-rd-ns("veth-rd-ns")
 containers["containers"]
 services["services"]
 end
 subgraph  WSL["WSL"]
 netNs
 other-distro(("Other Distros"))
-veth-rd0("veth-rd0")
+veth-rd-wsl("veth-rd-wsl")
 wsl-proxy{"wsl-proxy"}
 end
 vsockHost  <---->  eth  &  dns
 eth  <---->  syscall
 vsockHost  ---->  portForwarding
 tapDevice  -- ethernet frames -->  vsockVM
-veth-rd1  -- ethernet frames -->  vsockVM
-veth-rd0  <---->  veth-rd1
+veth-rd-ns  -- ethernet frames -->  vsockVM
+veth-rd-wsl  <---->  veth-rd-ns
 other-distro  <---->  wsl-proxy
-wsl-proxy  <---->  veth-rd0
+wsl-proxy  <---->  veth-rd-wsl
 containers  <---->  tapDevice
 services  <---->  tapDevice
 vsockVM <-- AF_VSOCK ---> vsockHost
@@ -54,22 +54,24 @@ The host-switch runs on the Windows host and acts as a receiver for all traffic 
 ## Supported Flags:
 
 - **debug**: Enables debug logging.
-- **subnet**: This flag defines a subnet range with a CIDR suffix for a virtual network. If it is not defined, it uses `192.168.127.0/24` as the default range. It is important to note that this value needs to match the [subnet](https://github.com/rancher-sandbox/rancher-desktop-networking/blob/6abacdc804d6414f17439a97f22e0c9c87f6249d/cmd/vm/switch_linux.go#L59) flag in the vm-switch.
+- **subnet**: This flag defines a subnet range with a CIDR suffix for a virtual network. If it is not defined, it uses `192.168.127.0/24` as the default range. It is important to note that this value needs to match the [subnet](https://github.com/rancher-sandbox/rancher-desktop/blob/6abacdc804d6414f17439a97f22e0c9c87f6249d/cmd/vm/switch_linux.go#L59) flag in the vm-switch.
 - **port-forward**: This is a list of static ports that need to be pre-forwarded to the WSL VM. These ports are not dynamically retrieved from any of the APIs that the Rancher Desktop guest agent interacts with.
 
 ## network-setup:
 
 The reason for its creation was that the `AF_VSOCK` connection could not be established between the host and a process residing inside the network namespace within the VM, as such capability is not currently supported by `AF_VSOCK`. As a result, the network setup was created. Its main responsibility is to respond to the handshake request from the `host-switch.exe`. Once the handshake process is successful with the `host-switch`, the `network-setup` process creates a new network namespace and attempts to start its subprocess, `vm-switch`, in the newly created network namespace. It also hands over the `AF_VSOCK` connection to the `vm-switch` as a file descriptor in the new namespace.
 
-Additionally, it calls unshare with provided arguments through [---unshare-args](https://github.com/rancher-sandbox/rancher-desktop-networking/blob/6abacdc804d6414f17439a97f22e0c9c87f6249d/cmd/network/setup_linux.go#L272). The process also establishes a Virtual Ethernet pair consisting of two endpoints: `veth-rd0` and `veth-rd1`. `veth-rd0` resides within the default namespace and is configured to listen on the IP address `192.168.1.1`. Conversely, `veth-rd1` is located within a network namespace and is assigned the IP address `192.168.1.2`. The virtual Ethernet pair allows accessibility from the default network into the network namespace, which is particularly useful when WSL integration is enabled.
+Additionally, it calls unshare with provided arguments through [---unshare-args](https://github.com/rancher-sandbox/rancher-desktop/blob/6abacdc804d6414f17439a97f22e0c9c87f6249d/cmd/network/setup_linux.go#L272). The process also establishes a Virtual Ethernet pair consisting of two endpoints: `veth-rd-ns` and `veth-rd-wsl`. `veth-rd-wsl` resides within the default namespace and is configured to listen on the IP address `192.168.143.2`. Conversely, `veth-rd-ns` is located within a network namespace and is assigned the IP address `192.168.143.1`. The virtual Ethernet pair allows accessibility from the default network into the network namespace, which is particularly useful when WSL integration is enabled.
 
 ## Supported Flags:
 
 - **debug**: enable the debug logging
 
+- **trace-packets**: Forward per-packet tracing to the `vm-switch` process (see the `vm-switch` flag below). Off by default; very verbose.
+
 - **tap-interface**: The name of the tap interface that is created by the vm-switch upon startup, e.g., `eth0`, `eth1`. This value is passed to the `vm-switch` process when the `network-setup` attempts to start it. If no value is provided, the default name of `eth0` is used.
 
-- **subnet**: A subnet range with a CIDR suffix that is associated with the tap interface in the network namespace. If it is not defined, it uses `192.168.127.0/24` as the default range. It is important to note that this value needs to match the [subnet](https://github.com/rancher-sandbox/rancher-desktop-networking/blob/6abacdc804d6414f17439a97f22e0c9c87f6249d/cmd/host/switch_windows.go#L54) flag in the `host-switch`.
+- **subnet**: A subnet range with a CIDR suffix that is associated with the tap interface in the network namespace. If it is not defined, it uses `192.168.127.0/24` as the default range. It is important to note that this value needs to match the [subnet](https://github.com/rancher-sandbox/rancher-desktop/blob/6abacdc804d6414f17439a97f22e0c9c87f6249d/cmd/host/switch_windows.go#L54) flag in the `host-switch`.
 
 - **tap-mac-address**: MAC address associated with the tap interface created by the vm-switch in the network namespace. If no address is provided, the default address of `5a:94:ef:e4:0c:ee`is used.
 
@@ -77,19 +79,21 @@ Additionally, it calls unshare with provided arguments through [---unshare-args]
 
 - **vm-switch-logfile**: The path to the logfile for the vm-switch process.
 
-- **unshare-arg**: The command argument to pass to the unshare program in addition to the following [arguments](https://github.com/rancher-sandbox/rancher-desktop-networking/blob/6abacdc804d6414f17439a97f22e0c9c87f6249d/cmd/network/setup_linux.go#L272).
+- **unshare-arg**: The command argument to pass to the unshare program in addition to the following [arguments](https://github.com/rancher-sandbox/rancher-desktop/blob/6abacdc804d6414f17439a97f22e0c9c87f6249d/cmd/network/setup_linux.go#L272).
 
 - **logfile**: Path to the logfile for the `network-setup` process.
 
 ## vm-switch:
 
-Once the network-setup starts the `vm-switch` process in the new namespace, the `vm-switch` creates a tap device (`eth0`) and a loopback device (`lo`). When the `eth0` tap device is successfully created, it uses the `DHCP` client to acquire an IP address within the defined range from the `DHCP` server. Once the `eth0` tap device is up and running, the kernel forwards all raw Ethernet frames originating from the network namespace to the tap device. In addition to the traffic from the network namespace, the kernel also forwards all the traffic that arrives at `veth-rd1` from its pair, `veth-rd0`, in the default namespace.
+Once the network-setup starts the `vm-switch` process in the new namespace, the `vm-switch` creates a tap device (`eth0`) and a loopback device (`lo`). When the `eth0` tap device is successfully created, it uses the `DHCP` client to acquire an IP address within the defined range from the `DHCP` server. Once the `eth0` tap device is up and running, the kernel forwards all raw Ethernet frames originating from the network namespace to the tap device. In addition to the traffic from the network namespace, the kernel also forwards all the traffic that arrives at `veth-rd-ns` from its pair, `veth-rd-wsl`, in the default namespace.
 
 The tap device forwards the Ethernet frames over [vsock](https://wiki.qemu.org/Features/VirtioVsock) to the host. The process on the host (`host-switch.exe`) decapsulates the frames. Since host-switch maintains both internal (`vm-switch` to `host-switch.exe`) and external (`host-switch.exe` to the internet) connections, it connects to the external endpoints via syscalls.
 
 ## Supported Flags:
 
 - **debug**: Enable the debug logging
+
+- **trace-packets**: Log a decoded dump of every packet in both directions. **Off by default** and deliberately independent of `-debug`, because it is extremely verbose and writes to `vm-switch.log` on the data-plane hot path. Enable it at startup by launching Rancher Desktop with `RD_VMSWITCH_TRACE=1` in the environment, or toggle it on/off at runtime (without restarting the network stack) by sending `SIGUSR1` to the `vm-switch` process. `vm-switch` runs in the top-level WSL (init) PID namespace, so signal it from there — e.g. `wsl -d rancher-desktop --exec sh -c 'kill -USR1 $(pgrep vm-switch)'` — **not** via `rdctl shell`, which enters the Rancher Desktop network namespace where `vm-switch` is not visible.
 
 - **tap-interface**: Tap interface name to create, eg. eth0, eth1
 
@@ -111,7 +115,7 @@ Its primary function comes into play when WSL integration is activated alongside
 
 - **socketFile**: This is the path to the `.sock` file for the UNIX socket connection established between the Rancher Desktop guest agent and the `wsl-proxy`. If not provided, the default value of `/run/wsl-proxy.sock` is used.
 
-- **upstreamAddress**: This is the IP address associated with the upstream server to use. It corresponds to the address of the veth pair connecting the default namespace to the network namespace, specifically `veth-rd1`. The default value is `192.168.1.2`.
+- **upstreamAddress**: This is the IP address associated with the upstream server to use. It corresponds to the address of the veth pair connecting the default namespace to the network namespace, specifically `veth-rd-ns`. The default value is `192.168.143.1`.
 
 
 ## Process Timelines:

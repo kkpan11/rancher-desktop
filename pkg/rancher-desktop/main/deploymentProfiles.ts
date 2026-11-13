@@ -8,6 +8,9 @@ import * as nativeReg from 'native-reg';
 
 import * as settings from '@pkg/config/settings';
 import * as settingsImpl from '@pkg/config/settingsImpl';
+// t() uses English fallback here because deployment profiles are read during
+// early startup, before initMainI18n() has loaded the user's locale.
+import { t } from '@pkg/main/i18n';
 import { spawnFile } from '@pkg/utils/childProcess';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
@@ -34,7 +37,7 @@ const REGISTRY_PROFILE_PATHS = [
  * defaults or locked profile, the user directory will not be read.
  * @returns type validated defaults and locked deployment profiles, and throws
  *          an error if there is an error parsing the locked profile.
- * NOTE: The renderer process can not access the 'native-reg' library, so the
+ * NOTE: The renderer process cannot access the 'native-reg' library, so the
  *       win32 portions of the deployment profile reader functions must be
  *       located in the main process.
  */
@@ -49,16 +52,17 @@ export async function readDeploymentProfiles(registryProfilePath = REGISTRY_PROF
     defaults: {},
     locked:   {},
   };
-  let defaults: undefined|RecursivePartial<settings.Settings>;
-  let locked: undefined|RecursivePartial<settings.Settings>;
+  let defaults: undefined | RecursivePartial<settings.Settings>;
+  let locked: undefined | RecursivePartial<settings.Settings>;
   let fullDefaultPath = '';
   let fullLockedPath = '';
 
   switch (os.platform()) {
   case 'linux': {
     const linuxPaths = {
-      [paths.deploymentProfileSystem]: ['defaults.json', 'locked.json'],
-      [paths.deploymentProfileUser]:   ['rancher-desktop.defaults.json', 'rancher-desktop.locked.json'],
+      [paths.deploymentProfileSystem]:    ['defaults.json', 'locked.json'],
+      [paths.altDeploymentProfileSystem]: ['defaults.json', 'locked.json'],
+      [paths.deploymentProfileUser]:      ['rancher-desktop.defaults.json', 'rancher-desktop.locked.json'],
     };
 
     for (const configDir in linuxPaths) {
@@ -75,7 +79,7 @@ export async function readDeploymentProfiles(registryProfilePath = REGISTRY_PROF
   }
 
   case 'darwin':
-    for (const rootPath of [paths.deploymentProfileSystem, paths.deploymentProfileUser]) {
+    for (const rootPath of [paths.deploymentProfileSystem, paths.altDeploymentProfileSystem, paths.deploymentProfileUser]) {
       [defaults, locked] = await parseJsonFromPlists(rootPath, 'io.rancherdesktop.profile.defaults.plist', 'io.rancherdesktop.profile.locked.plist');
       fullDefaultPath = join(rootPath, 'io.rancherdesktop.profile.defaults.plist');
       fullLockedPath = join(rootPath, 'io.rancherdesktop.profile.locked.plist');
@@ -87,13 +91,13 @@ export async function readDeploymentProfiles(registryProfilePath = REGISTRY_PROF
   }
   if (defaults) {
     if (!('version' in defaults)) {
-      throw new DeploymentProfileError(`Invalid deployment file ${ fullDefaultPath }: no version specified. You'll need to add a version field to make it valid (current version is ${ settings.CURRENT_SETTINGS_VERSION }).`);
+      throw new DeploymentProfileError(t('deploymentProfile.noVersion', { path: fullDefaultPath, version: settings.CURRENT_SETTINGS_VERSION }));
     }
     defaults = settingsImpl.migrateSpecifiedSettingsToCurrentVersion(defaults, false);
   }
   if (locked) {
     if (!('version' in locked)) {
-      throw new DeploymentProfileError(`Invalid deployment file ${ fullLockedPath }: no version specified. You'll need to add a version field to make it valid (current version is ${ settings.CURRENT_SETTINGS_VERSION }).`);
+      throw new DeploymentProfileError(t('deploymentProfile.noVersion', { path: fullLockedPath, version: settings.CURRENT_SETTINGS_VERSION }));
     }
     locked = settingsImpl.migrateSpecifiedSettingsToCurrentVersion(locked, true);
   }
@@ -108,14 +112,14 @@ export async function readDeploymentProfiles(registryProfilePath = REGISTRY_PROF
 // So read the text into a string variable, and have `plutil` read it via stdin.
 // It's no error if a deployment profile doesn't exist.
 // Any other error needs to show up in a dialog box and terminate processing.
-async function convertAndParsePlist(inputPath: string): Promise<undefined|RecursivePartial<settings.Settings>> {
+async function convertAndParsePlist(inputPath: string): Promise<undefined | RecursivePartial<settings.Settings>> {
   let plutilResult: { stdout?: string, stderr?: string };
   let body: stream.Readable;
   const args = ['-convert', 'json', '-r', '-o', '-', '-'];
   const getErrorString = (error: any) => error.stdout || error.stderr || error.toString();
 
   try {
-    body = stream.Readable.from(fs.readFileSync(inputPath, { encoding: 'utf-8' }));
+    body = stream.Readable.from(fs.readFileSync(inputPath));
   } catch (error: any) {
     if (error.code === 'ENOENT') {
       return;
@@ -149,7 +153,7 @@ async function convertAndParsePlist(inputPath: string): Promise<undefined|Recurs
  *          throws an exception if there is an error parsing the locked file.
  */
 
-async function parseJsonFromPlists(rootPath: string, defaultsPath: string, lockedPath: string): Promise<Array<undefined|RecursivePartial<settings.Settings>>> {
+async function parseJsonFromPlists(rootPath: string, defaultsPath: string, lockedPath: string): Promise<(undefined | RecursivePartial<settings.Settings>)[]> {
   return [
     await convertAndParsePlist(join(rootPath, defaultsPath)),
     await convertAndParsePlist(join(rootPath, lockedPath)),
@@ -164,7 +168,7 @@ async function parseJsonFromPlists(rootPath: string, defaultsPath: string, locke
  * @returns the defaults and/or locked objects if they exist, or
  *          throws an exception if there is an error parsing the locked file.
  */
-function parseJsonFiles(rootPath: string, defaultsPath: string, lockedPath: string): Array<undefined|RecursivePartial<settings.Settings>> {
+function parseJsonFiles(rootPath: string, defaultsPath: string, lockedPath: string): (undefined | RecursivePartial<settings.Settings>)[] {
   return [defaultsPath, lockedPath].map((configPath) => {
     const fullPath = join(rootPath, configPath);
 
@@ -183,9 +187,9 @@ function parseJsonFiles(rootPath: string, defaultsPath: string, lockedPath: stri
  */
 class Win32DeploymentReader {
   protected registryPathProfiles: string[][];
-  protected registryPathCurrent: string[];
+  protected registryPathCurrent:  string[];
   protected keyName = '';
-  protected errors: string[] = [];
+  protected errors:               string[] = [];
 
   constructor(registryPathProfiles: string[][]) {
     this.registryPathProfiles = registryPathProfiles;
@@ -234,7 +238,7 @@ class Win32DeploymentReader {
             if (!('version' in defaults)) {
               const registryPath = [keyName, ...this.registryPathCurrent, DEFAULTS_HIVE_NAME].join('\\');
 
-              throw new DeploymentProfileError(`Invalid default-deployment: no version specified at ${ registryPath }. You'll need to add a version field to make it valid (current version is ${ settings.CURRENT_SETTINGS_VERSION }).`);
+              throw new DeploymentProfileError(t('deploymentProfile.noVersionRegistry', { path: registryPath, version: settings.CURRENT_SETTINGS_VERSION }));
             }
             defaults = settingsImpl.migrateSpecifiedSettingsToCurrentVersion(defaults, false);
           }
@@ -242,7 +246,7 @@ class Win32DeploymentReader {
             if (!('version' in locked)) {
               const registryPath = [keyName, ...this.registryPathCurrent, LOCKED_HIVE_NAME].join('\\');
 
-              throw new DeploymentProfileError(`Invalid locked-deployment: no version specified at ${ registryPath }. You'll need to add a version field to make it valid (current version is ${ settings.CURRENT_SETTINGS_VERSION }).`);
+              throw new DeploymentProfileError(t('deploymentProfile.noVersionRegistry', { path: registryPath, version: settings.CURRENT_SETTINGS_VERSION }));
             }
             locked = settingsImpl.migrateSpecifiedSettingsToCurrentVersion(locked, true);
           }
@@ -277,9 +281,9 @@ class Win32DeploymentReader {
   protected readRegistryUsingSchema(schemaObj: Record<string, any>, regKey: nativeReg.HKEY, pathParts: string[]): Record<string, any> {
     const newObject: Record<string, any> = {};
     const schemaKeys = Object.keys(schemaObj);
-    const commonKeys: Array<{schemaKey: string, registryKey: string}> = [];
+    const commonKeys: { schemaKey: string, registryKey: string }[] = [];
     const unknownKeys: string[] = [];
-    const userDefinedObjectKeys: Array<{schemaKey: string, registryKey: string}> = [];
+    const userDefinedObjectKeys: { schemaKey: string, registryKey: string }[] = [];
     let regValue: any;
 
     // Drop the initial 'defaults' or 'locked' field
@@ -441,7 +445,6 @@ class Win32DeploymentReader {
       return null;
     }
     const expectingArray = Array.isArray(schemaVal);
-    let parsedValue: any = null;
 
     switch (rawValue.type) {
     case nativeReg.ValueType.SZ:
@@ -466,7 +469,7 @@ class Win32DeploymentReader {
         this.errors.push(msg);
       } else if (isUserDefinedObject || (typeof schemaVal) === 'boolean' || (typeof schemaVal) === 'number') {
         // Otherwise the schema type is number or boolean. If it's boolean, reduce it to true/false
-        parsedValue = nativeReg.parseValue(rawValue) as number;
+        const parsedValue = nativeReg.parseValue(rawValue) as number;
 
         return (typeof schemaVal === 'boolean') ? !!parsedValue : parsedValue;
       } else {
@@ -545,19 +548,19 @@ function validateDeploymentProfileWithErrors(profile: any, errors: string[], sch
     if (Array.isArray(profileVal) || Array.isArray(schemaVal)) {
       if (Array.isArray(profileVal) !== Array.isArray(schemaVal)) {
         if (Array.isArray(schemaVal)) {
-          errors.push(`Error for field '${ fullPath(key) }': expecting value of type array, got '${ JSON.stringify(profileVal) }'`);
+          errors.push(t('validation.profileExpectedArray', { field: fullPath(key), value: JSON.stringify(profileVal) }));
         } else {
-          errors.push(`Error for field '${ fullPath(key) }': expecting value of type ${ typeof schemaVal }, got an array ${ JSON.stringify(profileVal) }`);
+          errors.push(t('validation.profileExpectedTypeGotArray', { field: fullPath(key), expectedType: typeof schemaVal, value: JSON.stringify(profileVal) }));
         }
       }
     } else if (typeof profileVal !== 'object') {
       if (typeof profileVal !== typeof schemaVal) {
-        errors.push(`Error for field '${ fullPath(key) }': expecting value of type ${ typeof schemaVal }, got '${ JSON.stringify(profileVal) }'`);
+        errors.push(t('validation.profileExpectedType', { field: fullPath(key), expectedType: typeof schemaVal, value: JSON.stringify(profileVal) }));
       }
     } else if (haveUserDefinedObject(parentPathParts.concat(key))) {
       // Keep this part of the profile
     } else if (typeof profileVal !== typeof schemaVal) {
-      errors.push(`Error for field '${ fullPath(key) }': expecting value of type ${ typeof schemaVal }, got '${ JSON.stringify(profileVal) }'`);
+      errors.push(t('validation.profileExpectedType', { field: fullPath(key), expectedType: typeof schemaVal, value: JSON.stringify(profileVal) }));
     } else {
       // Finally recurse and compare the schema sub-object with the specified sub-object
       validateDeploymentProfileWithErrors(profileVal, errors, schemaVal, [...parentPathParts, key]);
@@ -573,7 +576,7 @@ function isEquivalentIgnoreCase(a: string, b: string): boolean {
   return caseInsensitiveComparator.compare(a, b) === 0;
 }
 
-function fixProfileKeyCase(key: string, schemaKeys: string[]): string|null {
+function fixProfileKeyCase(key: string, schemaKeys: string[]): string | null {
   return schemaKeys.find(val => isEquivalentIgnoreCase(key, val)) ?? null;
 }
 

@@ -1,38 +1,14 @@
-import Vue from 'vue';
+import { watchEffect, ref, h } from 'vue';
+import { useStore } from 'vuex';
 
-import { escapeHtml } from '../utils/string';
-
-function stringFor(store, key, args, raw = false) {
-  const translation = store.getters['i18n/t'](key, args);
-
-  let out;
-
-  if ( translation !== undefined ) {
-    out = translation;
-  } else if ( args && Object.keys(args).length ) {
-    const argStr = Object.keys(args).map(k => `${ k }: ${ args[k] }`).join(', ');
-
-    out = `%${ key }(${ argStr })%`;
-    raw = true;
-  } else {
-    out = `%${ key }%`;
-  }
-
-  if ( raw ) {
-    return out;
-  } else {
-    return escapeHtml(out);
-  }
-}
-
-Vue.prototype.t = function(key, args, raw) {
-  return stringFor(this.$store, key, args, raw);
-};
+// The i18n/t getter returns the raw translation; escaping is the sink's job.
+// Text sinks ({{ }}, textContent) escape themselves; HTML sinks render
+// translator-controlled markup and sanitize via v-clean-html where the
+// content warrants it.
 
 function directive(el, binding, vnode /*, oldVnode */) {
-  const { context } = vnode;
-  const raw = binding.modifiers && binding.modifiers.raw === true;
-  const str = stringFor(context.$store, binding.value, {}, raw);
+  const { instance } = binding;
+  const str = instance.$store.getters['i18n/t'](binding.value, {});
 
   if ( binding.arg ) {
     el.setAttribute(binding.arg, str);
@@ -41,62 +17,73 @@ function directive(el, binding, vnode /*, oldVnode */) {
   }
 }
 
-export function directiveSsr(vnode, binding) {
-  const { context } = vnode;
-  const raw = binding.modifiers && binding.modifiers.raw === true;
-  const str = stringFor(context.$store, binding.value, {}, raw);
-
-  if ( binding.arg ) {
-    vnode.data.attrs[binding.arg] = str;
-  } else {
-    vnode.data.domProps = { innerHTML: str };
-  }
-}
-
-// InnerHTML: <some-tag v-t="'some.key'" />
-// As an attribute: <some-tag v-t:title="'some.key'" />
-Vue.directive('t', {
-  bind() {
-    directive(...arguments);
-  },
-
-  update() {
-    directive(...arguments);
-  },
-});
-
-// Basic (but you might want the directive above): <t k="some.key" />
-// With interpolation: <t k="some.key" count="1" :foo="bar" />
-Vue.component('t', {
-  inheritAttrs: false,
-  props:        {
-    k: {
-      type:     String,
-      required: true,
-    },
-    raw: {
-      type:    Boolean,
-      default: false,
-    },
-    tag: {
-      type:    [String, Object],
-      default: 'span',
-    },
-  },
-
-  render(h) {
-    const msg = stringFor(this.$store, this.k, this.$attrs, this.raw);
-
-    if ( this.raw ) {
-      return h(
-        this.tag,
-        { domProps: { innerHTML: msg } },
-      );
-    } else {
-      return h(
-        this.tag,
-        [msg],
-      );
+const i18n = {
+  name:    'i18n',
+  install: (vueApp, _options) => {
+    if (vueApp.config.globalProperties.t && vueApp.directive('t') && vueApp.component('t')) {
+      console.debug('Skipping i18n install. Directive, component, and option already exist.');
     }
+
+    vueApp.config.globalProperties.t = function(key, args) {
+      return this.$store.getters['i18n/t'](key, args);
+    };
+
+    // InnerHTML: <some-tag v-t="'some.key'" />
+    // As an attribute: <some-tag v-t:title="'some.key'" />
+    vueApp.directive('t', {
+      beforeMount() {
+        directive(...arguments);
+      },
+      updated() {
+        directive(...arguments);
+      },
+    });
+
+    // Basic (but you might want the directive above): <t k="some.key" />
+    // With interpolation: <t k="some.key" count="1" :foo="bar" />
+    // raw renders the translation as innerHTML instead of a text child.
+    vueApp.component('t', {
+      inheritAttrs: false,
+      props:        {
+        k: {
+          type:     String,
+          required: true,
+        },
+        raw: {
+          type:    Boolean,
+          default: false,
+        },
+        tag: {
+          type:    [String, Object],
+          default: 'span',
+        },
+      },
+      setup(props, ctx) {
+        const msg = ref('');
+        const store = useStore();
+
+        watchEffect(() => {
+          msg.value = store.getters['i18n/t'](props.k, ctx.attrs);
+        });
+
+        return { msg };
+      },
+      render() {
+        if (this.raw) {
+          return h(
+            this.tag,
+            { innerHTML: this.msg },
+          );
+        } else {
+          return h(
+            this.tag,
+            { },
+            [this.msg],
+          );
+        }
+      },
+    });
   },
-});
+};
+
+export default i18n;

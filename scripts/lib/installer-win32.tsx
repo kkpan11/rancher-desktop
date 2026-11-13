@@ -10,20 +10,20 @@
 import fs from 'fs';
 import path from 'path';
 
-import asar from '@electron/asar';
+import { extractFile } from '@electron/asar';
 import Mustache from 'mustache';
 import yaml from 'yaml';
 
 import buildUtils from './build-utils';
 import generateFileList from './installer-win32-gen';
 
-import { simpleSpawn } from 'scripts/simple_process';
+import { simpleSpawn } from '@/scripts/simple_process';
 
 /**
  * Return the contents of package.json embedded in the application.
  */
 function getPackageJson(appDir: string): Record<string, any> {
-  const packageBytes = asar.extractFile(path.join(appDir, 'resources', 'app.asar'), 'package.json');
+  const packageBytes = extractFile(path.join(appDir, 'resources', 'app.asar'), 'package.json');
 
   return JSON.parse(packageBytes.toString('utf-8'));
 }
@@ -69,15 +69,13 @@ export default async function buildInstaller(workDir: string, appDir: string, ou
   await writeUpdateConfig(appDir);
   const fileList = await generateFileList(appDir);
   const template = await fs.promises.readFile(path.join(process.cwd(), 'build', 'wix', 'main.wxs'), 'utf-8');
-  const output = Mustache.render(template, {
-    appVersion, fileList, compressionLevel: 'high',
-  });
+  const output = Mustache.render(template, { appVersion, fileList });
   const wixDir = path.join(process.cwd(), 'resources', 'host', 'wix');
 
   console.log('Writing out WiX definition...');
   await fs.promises.writeFile(path.join(workDir, 'project.wxs'), output);
   console.log('Compiling WiX...');
-  const iconPath = path.join(appDir, 'resources', 'resources', 'win32', 'bin', 'rdctl.exe');
+  const iconPath = path.join(appDir, 'resources', 'resources', 'icons', 'icon.ico');
   const inputs = [
     path.join(workDir, 'project.wxs'),
     path.join(process.cwd(), 'build', 'wix', 'dialogs.wxs'),

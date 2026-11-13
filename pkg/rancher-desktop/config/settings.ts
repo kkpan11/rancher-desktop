@@ -1,10 +1,12 @@
 // This file contains exportable types and constants used for managing preferences
 // All the actual data and functions are in settingsImpl.ts
 
+import os from 'os';
+
 import { PathManagementStrategy } from '@pkg/integrations/pathManager';
 import { RecursivePartial } from '@pkg/utils/typeUtils';
 
-export const CURRENT_SETTINGS_VERSION = 12 as const;
+export const CURRENT_SETTINGS_VERSION = 19 as const;
 
 export enum VMType {
   QEMU = 'qemu',
@@ -35,7 +37,7 @@ export enum ProtocolVersion {
 }
 
 export enum SecurityModel {
-  PASSTHROUGH ='passthrough',
+  PASSTHROUGH = 'passthrough',
   MAPPED_XATTR = 'mapped-xattr',
   MAPPED_FILE = 'mapped-file',
   NONE = 'none',
@@ -47,6 +49,15 @@ export enum CacheMode {
   FSCACHE = 'fscache',
   MMAP = 'mmap',
 }
+
+export enum Theme {
+  SYSTEM = 'system',
+  LIGHT = 'light',
+  DARK = 'dark',
+}
+
+/** Locales with a bundled translation file; keep in sync with the enum in command-api.yaml. */
+export type Locale = 'de' | 'en-us' | 'es' | 'fr' | 'it' | 'ja' | 'ko' | 'pt-br' | 'vi' | 'zh-hans';
 
 export class SettingsError extends Error {
   toString() {
@@ -64,7 +75,7 @@ export const defaultSettings = {
     extensions:  {
       allowed: {
         enabled: false,
-        list:    [] as Array<string>,
+        list:    [] as string[],
       },
       /** Installed extensions, mapping to the installed version (tag). */
       installed: { } as Record<string, string>,
@@ -76,23 +87,29 @@ export const defaultSettings = {
     autoStart:              false,
     startInBackground:      false,
     hideNotificationIcon:   false,
+    locale:                 'en-us' as Locale,
     window:                 { quitOnClose: false },
+    theme:                  Theme.SYSTEM,
   },
   containerEngine: {
     allowedImages: {
       enabled:  false,
-      patterns: [] as Array<string>,
+      patterns: [] as string[],
     },
-    name: ContainerEngine.MOBY,
+    mobyStorageDriver: 'auto' as 'classic' | 'snapshotter' | 'auto',
+    name:              ContainerEngine.MOBY,
   },
   virtualMachine: {
-    memoryInGB:   2,
-    numberCPUs:   2,
-    /**
-     * when set to true Dnsmasq is disabled and all DNS resolution
-     * is handled by host-resolver on Windows platform only.
-     */
-    hostResolver: true,
+    memoryInGB: 2,
+    numberCPUs: 2,
+    /** can only be set to VMType.VZ on macOS Ventura and later */
+    type:       process.platform === 'darwin' && parseInt(os.release(), 10) >= 23 ? VMType.VZ : VMType.QEMU,
+    /** can only be used when type is VMType.VZ, and only on aarch64 */
+    useRosetta: false,
+    mount:      {
+      // Mount type defaults to virtiofs when using VZ.
+      type: process.platform === 'darwin' && parseInt(os.release(), 10) >= 23 ? MountType.VIRTIOFS : MountType.REVERSE_SSHFS,
+    },
   },
   WSL:        { integrations: {} as Record<string, boolean> },
   kubernetes: {
@@ -113,8 +130,12 @@ export const defaultSettings = {
     namespace: 'default',
   },
   diagnostics: {
-    showMuted:   false,
-    mutedChecks: {} as Record<string, boolean>,
+    showMuted:    false,
+    mutedChecks:  {} as Record<string, boolean>,
+    connectivity: {
+      interval: 5_000,
+      timeout:  5_000,
+    },
   },
   /**
    * Experimental settings
@@ -124,12 +145,8 @@ export const defaultSettings = {
     /** can only be enabled if containerEngine.webAssembly.enabled is true */
     kubernetes:      { options: { spinkube: false } },
     virtualMachine:  {
-      /** can only be set to VMType.VZ on macOS Ventura and later */
-      type:       VMType.QEMU,
-      /** can only be used when type is VMType.VZ, and only on aarch64 */
-      useRosetta: false,
-      mount:      {
-        type: MountType.REVERSE_SSHFS,
+      diskSize: '100GiB',
+      mount:    {
         '9p': {
           securityModel:   SecurityModel.NONE,
           protocolVersion: ProtocolVersion.NINEP2000_L,
@@ -137,9 +154,7 @@ export const defaultSettings = {
           cacheMode:       CacheMode.MMAP,
         },
       },
-      /** windows only: if set, use gvisor based network rather than host-resolver/dnsmasq. */
-      networkingTunnel: true,
-      proxy:            {
+      proxy: {
         enabled:  false,
         address:  '',
         password: '',
@@ -148,6 +163,8 @@ export const defaultSettings = {
         noproxy:  ['0.0.0.0/8', '10.0.0.0/8', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12', '192.168.0.0/16',
           '224.0.0.0/4', '240.0.0.0/4'],
       },
+      /** Lima only: when true, use SSH port forwarding instead of gRPC. */
+      sshPortForwarder: false,
     },
   },
 };
@@ -160,7 +177,7 @@ export type LockedSettingsType = Record<string, any>;
 
 export interface DeploymentProfileType {
   defaults: RecursivePartial<Settings>;
-  locked: RecursivePartial<Settings>;
+  locked:   RecursivePartial<Settings>;
 }
 
 // Imported from dashboard/config/settings.js

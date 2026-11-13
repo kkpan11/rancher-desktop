@@ -7,39 +7,109 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import stream from 'stream';
+import util from 'util';
 
-import fetch from 'node-fetch';
+import { simpleSpawn } from '@/scripts/simple_process';
 
 type ChecksumAlgorithm = 'sha1' | 'sha256' | 'sha512';
 
-export type DownloadOptions = {
-  expectedChecksum?: string;
-  checksumAlgorithm?: ChecksumAlgorithm;
-  // Whether to re-download files that already exist.
-  overwrite?: boolean;
-  // The file mode required.
-  access?: number;
-  // The file needs a new ad-hoc signature.
-  codesign?: boolean;
-};
+/**
+ * A sha256 checksum as stored in `dependencies.yaml`, where the prefix names
+ * the algorithm for readers of the file.  Values always carry lowercase hex,
+ * so any two compare with `===`.
+ */
+export type Sha256Checksum = `sha256:${ string }`;
+
+/** Parses a raw value as a {@link Sha256Checksum}, or throws. */
+export function parseSha256Checksum(value: unknown): Sha256Checksum {
+  if (typeof value !== 'string' || !/^sha256:[0-9a-f]{64}$/i.test(value)) {
+    throw new Error(`Invalid sha256 checksum ${ JSON.stringify(value) }; expected "sha256:<64 hex chars>"`);
+  }
+
+  return value.toLowerCase() as Sha256Checksum;
+}
+
+async function sha256File(filePath: string): Promise<Sha256Checksum> {
+  return `sha256:${ await hashFile(filePath, 'sha256') }`;
+}
+
+export interface DownloadOptions {
+  /** The checksum the downloaded bytes must match. */
+  expectedChecksum?: Sha256Checksum;
+  /** Whether to re-download files that already exist. */
+  overwrite?:        boolean;
+  /** The file mode required. */
+  access?:           number;
+  /** The file needs a new ad-hoc signature. */
+  codesign?:         boolean;
+}
 
 export type ArchiveDownloadOptions = DownloadOptions & {
   // The name in the archive of the file; defaults to base name of the destination.
   entryName?: string;
 };
 
-async function fetchWithRetry(url: string) {
-  while (true) {
-    try {
-      return await fetch(url);
-    } catch (ex: any) {
-      if (ex && ex.errno === 'EAI_AGAIN') {
-        console.log(`Recoverable error downloading ${ url }, retrying...`);
-        continue;
-      }
-      console.dir(ex);
-      throw ex;
+/** Network error codes worth retrying: DNS hiccups and dropped connections. */
+const RETRYABLE_CODES = new Set([
+  'EAI_AGAIN',               // DNS lookup timed out
+  'ECONNRESET',              // connection reset by peer mid-transfer
+  'ECONNREFUSED',            // connection refused
+  'ETIMEDOUT',               // connection timed out
+  'EPIPE',                   // broken pipe
+  'UND_ERR_CONNECT_TIMEOUT', // undici connect timeout
+  'UND_ERR_SOCKET',          // undici socket closed early
+]);
+
+/**
+ * Returns the retryable network error code carried by `ex`, if any.  `fetch`
+ * wraps the underlying socket error as `TypeError: fetch failed` with the real
+ * error in `cause`, so we walk the `cause` chain to any depth.
+ */
+function retryableNetworkError(ex: any): string | undefined {
+  for (const prop of ['code', 'errno']) {
+    if (typeof ex?.[prop] === 'string' && RETRYABLE_CODES.has(ex[prop])) {
+      return ex[prop];
     }
+  }
+  if (ex?.cause) {
+    return retryableNetworkError(ex.cause);
+  }
+}
+
+/**
+ * Fetches `url`, retrying transient network failures (a DNS hiccup or a dropped
+ * connection such as ECONNRESET) with exponential backoff.  The default
+ * schedule — 1s, 2s, 4s, 8s, 16s, then 30s — spans ~2 minutes before giving up,
+ * after which a CI re-run covers a longer outage.  Non-transient errors
+ * propagate immediately.
+ */
+export async function fetchWithRetry(
+  url: string,
+  { retries = 8, baseDelayMs = 1_000, maxDelayMs = 30_000 } = {},
+): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fetch(url, { redirect: 'follow' });
+    } catch (ex: any) {
+      const code = retryableNetworkError(ex);
+
+      if (!code || attempt >= retries) {
+        throw ex;
+      }
+      const delayMs = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
+
+      console.log(`Recoverable error (${ code }) downloading ${ url }, retrying in ${ Math.round(delayMs / 1_000) }s (${ attempt + 1 }/${ retries })...`);
+      await util.promisify(setTimeout)(delayMs);
+    }
+  }
+}
+
+function checkDownloadStatusOrThrow(url: string, response: Response): void {
+  if (!response.ok) {
+    const requestId = response.headers.get('x-github-request-id');
+    const requestAnnotation = requestId ? ` [request: ${ requestId }]` : '';
+    throw new Error(`Error downloading ${ url } (${ response.status }) ${ response.statusText }${ requestAnnotation }`);
   }
 }
 
@@ -51,16 +121,38 @@ async function fetchWithRetry(url: string) {
  */
 export async function download(url: string, destPath: string, options: DownloadOptions = {}): Promise<void> {
   const expectedChecksum = options.expectedChecksum;
-  const checksumAlgorithm = options.checksumAlgorithm ?? 'sha256';
   const overwrite = options.overwrite ?? false;
   const access = options.access ?? fs.constants.X_OK;
+
+  // Codesign rewrites destPath in place, so its bytes no longer match
+  // the upstream digest.  Keep the verified bytes at .unsigned and
+  // hash that on cache-hit checks.
+  const hashTarget = options.codesign ? `${ destPath }.unsigned` : destPath;
 
   if (!overwrite) {
     try {
       await fs.promises.access(destPath, access);
-      console.log(`${ destPath } already exists, not re-downloading.`);
+      if (expectedChecksum) {
+        try {
+          const actualChecksum = await sha256File(hashTarget);
 
-      return;
+          if (actualChecksum === expectedChecksum) {
+            console.log(`${ destPath } already exists with expected checksum, not re-downloading.`);
+
+            return;
+          }
+          console.log(`${ destPath } exists but the checksum of ${ hashTarget } differs ([${ actualChecksum }] vs expected [${ expectedChecksum }]); re-downloading.`);
+        } catch (ex: any) {
+          if (ex.code !== 'ENOENT') {
+            throw ex;
+          }
+          console.log(`${ destPath } exists but ${ hashTarget } is missing; re-downloading.`);
+        }
+      } else {
+        console.log(`${ destPath } already exists, not re-downloading.`);
+
+        return;
+      }
     } catch (ex: any) {
       if (ex.code !== 'ENOENT') {
         throw ex;
@@ -71,30 +163,52 @@ export async function download(url: string, destPath: string, options: DownloadO
   await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
   const response = await fetchWithRetry(url);
 
-  if (!response.ok) {
-    throw new Error(`Error downloading ${ url }: ${ response.statusText }`);
+  checkDownloadStatusOrThrow(url, response);
+  if (!response.body) {
+    throw new Error(`Error downloading ${ url }: did not receive response body`);
   }
   const tempPath = `${ destPath }.download`;
 
   try {
     const file = fs.createWriteStream(tempPath);
-    const promise = new Promise(resolve => file.on('finish', resolve));
 
-    response.body.pipe(file);
-    await promise;
+    await response.body.pipeTo(stream.Writable.toWeb(file));
 
     if (expectedChecksum) {
-      const actualChecksum = await getChecksumForFile(tempPath, checksumAlgorithm);
+      const actualChecksum = await sha256File(tempPath);
 
       if (actualChecksum !== expectedChecksum) {
-        throw new Error(`Expecting URL ${ url } to have ${ checksumAlgorithm } [${ expectedChecksum }], got [${ actualChecksum }]`);
+        throw new Error(`Expecting URL ${ url } to have checksum [${ expectedChecksum }], got [${ actualChecksum }]`);
       }
     }
     const mode =
             (access & fs.constants.X_OK) ? 0o755 : (access & fs.constants.W_OK) ? 0o644 : 0o444;
 
     await fs.promises.chmod(tempPath, mode);
-    await fs.promises.rename(tempPath, destPath);
+    if (options.codesign) {
+      const unsignedPath = `${ destPath }.unsigned`;
+
+      await fs.promises.rename(tempPath, unsignedPath);
+      await fs.promises.copyFile(unsignedPath, destPath);
+      await fs.promises.chmod(destPath, mode);
+      const result = spawnSync(
+        'codesign',
+        ['--force', '--sign', '-', destPath],
+        { stdio: 'inherit' },
+      );
+
+      if (result.status !== 0) {
+        // Drop the unsigned cache so the next run re-downloads and re-signs;
+        // otherwise the cache-hit path would hash the unsigned file and skip
+        // the failed signing step forever.
+        await fs.promises.rm(unsignedPath, { force: true });
+        const detail = result.error ? `: ${ result.error.message }` : '';
+
+        throw new Error(`codesign failed for ${ destPath } (exit ${ result.status })${ detail }`);
+      }
+    } else {
+      await fs.promises.rename(tempPath, destPath);
+    }
   } finally {
     try {
       await fs.promises.unlink(tempPath);
@@ -104,28 +218,21 @@ export async function download(url: string, destPath: string, options: DownloadO
       }
     }
   }
-
-  if (options.codesign) {
-    spawnSync(
-      'codesign',
-      ['--force', '--sign', '-', destPath],
-      { stdio: 'inherit' },
-    );
-  }
 }
 
 /**
- * Compute the checksum for a given file
- * @param inputPath The file to checksum.
- * @param checksumAlgorithm The checksum algorithm to use.
- * @returns The hex-encoded checksum of the file.
+ * Streams the file at `filePath` through the named hash and returns the
+ * hex-encoded digest.  Read errors propagate to the caller.
  */
-async function getChecksumForFile(inputPath: string, checksumAlgorithm: ChecksumAlgorithm = 'sha256'): Promise<string> {
-  const hash = crypto.createHash(checksumAlgorithm);
+export async function hashFile(filePath: string, algorithm: ChecksumAlgorithm = 'sha256'): Promise<string> {
+  const hash = crypto.createHash(algorithm);
 
-  await new Promise((resolve) => {
-    hash.on('finish', resolve);
-    fs.createReadStream(inputPath).pipe(hash);
+  await new Promise<void>((resolve, reject) => {
+    const stream = fs.createReadStream(filePath);
+
+    stream.on('error', reject);
+    hash.on('finish', () => resolve());
+    stream.pipe(hash);
   });
 
   return hash.digest('hex');
@@ -139,9 +246,7 @@ async function getChecksumForFile(inputPath: string, checksumAlgorithm: Checksum
 export async function getResource(url: string): Promise<string> {
   const response = await fetchWithRetry(url);
 
-  if (!response.ok) {
-    throw new Error(`Error downloading ${ url }: ${ response.statusText }`);
-  }
+  checkDownloadStatusOrThrow(url, response);
 
   return await response.text();
 }
@@ -156,32 +261,31 @@ export async function getResource(url: string): Promise<string> {
  * @returns The full path of the final binary.
  */
 export async function downloadTarGZ(url: string, destPath: string, options: ArchiveDownloadOptions = {}): Promise<string> {
-  const overwrite = options.overwrite ?? false;
   const access = options.access ?? fs.constants.X_OK;
-
-  if (!overwrite) {
-    try {
-      await fs.promises.access(destPath, access);
-      console.log(`${ destPath } already exists, not re-downloading.`);
-
-      return destPath;
-    } catch (ex: any) {
-      if (ex.code !== 'ENOENT') {
-        throw ex;
-      }
-    }
-  }
-  const binaryBasename = path.basename(destPath, '.exe');
-  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `rd-${ binaryBasename }-`));
+  const tgzPath = `${ destPath.replace(/\.exe$/, '') }.tar.gz`;
   const fileToExtract = options.entryName || path.basename(destPath);
+  const mode =
+        (access & fs.constants.X_OK) ? 0o755 : (access & fs.constants.W_OK) ? 0o644 : 0o444;
+
+  await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+
+  // Persist the verified archive next to destPath; download() handles
+  // the cache-hit checksum check against the manifest.  Strip codesign
+  // because that runs against the extracted binary, not the archive.
+  const { codesign: _codesign, ...inner } = options;
+
+  await download(url, tgzPath, { ...inner, access: fs.constants.W_OK });
+
+  // Re-extract on every postinstall so destPath always reflects the
+  // current archive, even after a version bump that re-downloaded
+  // tgzPath above.  copyFile overwrites destPath unconditionally,
+  // so a postinstall run while Rancher Desktop or another shell
+  // holds the binary fails with EBUSY/EPERM on Windows or ETXTBSY
+  // on Linux.
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `rd-${ path.basename(destPath, '.exe') }-`));
+  const args = ['tar', '-zxf', tgzPath, '--directory', workDir, fileToExtract];
 
   try {
-    const tgzPath = path.join(workDir, `${ binaryBasename }.tar.gz`);
-    const args = ['tar', '-zxf', tgzPath, '--directory', workDir, fileToExtract];
-    const mode =
-            (access & fs.constants.X_OK) ? 0o755 : (access & fs.constants.W_OK) ? 0o644 : 0o444;
-
-    await download(url, tgzPath, { ...options, access: fs.constants.W_OK });
     if (os.platform().startsWith('win')) {
       // On Windows, force use the bundled bsdtar.
       // We may find GNU tar on the path, which looks at the Windows-style path
@@ -193,9 +297,9 @@ export async function downloadTarGZ(url: string, destPath: string, options: Arch
       }
       args[0] = path.join(systemRoot, 'system32', 'tar.exe');
     }
-    execFileSync(args[0], args.slice(1), { stdio: 'inherit' });
-    fs.copyFileSync(path.join(workDir, fileToExtract), destPath);
-    fs.chmodSync(destPath, mode);
+    await simpleSpawn(args[0], args.slice(1));
+    await fs.promises.copyFile(path.join(workDir, fileToExtract), destPath);
+    await fs.promises.chmod(destPath, mode);
   } finally {
     fs.rmSync(workDir, { recursive: true, maxRetries: 10 });
   }
@@ -213,32 +317,31 @@ export async function downloadTarGZ(url: string, destPath: string, options: Arch
  * @returns The full path of the final binary.
  */
 export async function downloadZip(url: string, destPath: string, options: ArchiveDownloadOptions = {}): Promise<string> {
-  const overwrite = options.overwrite ?? false;
   const access = options.access ?? fs.constants.X_OK;
-
-  if (!overwrite) {
-    try {
-      await fs.promises.access(destPath, access);
-      console.log(`${ destPath } already exists, not re-downloading.`);
-
-      return destPath;
-    } catch (ex: any) {
-      if (ex.code !== 'ENOENT') {
-        throw ex;
-      }
-    }
-  }
-  const binaryBasename = path.basename(destPath, '.exe');
-  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `rd-${ binaryBasename }-`));
+  const zipPath = `${ destPath.replace(/\.exe$/, '') }.zip`;
   const fileToExtract = options.entryName || path.basename(destPath);
   const mode =
         (access & fs.constants.X_OK) ? 0o755 : (access & fs.constants.W_OK) ? 0o644 : 0o444;
 
-  try {
-    const zipPath = path.join(workDir, `${ binaryBasename }.zip`);
-    const args = ['unzip', '-q', '-o', zipPath, fileToExtract, '-d', workDir];
+  await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
 
-    await download(url, zipPath, { ...options, access: fs.constants.W_OK });
+  // Persist the verified archive next to destPath; download() handles
+  // the cache-hit checksum check against the manifest.  Strip codesign
+  // because that runs against the extracted binary, not the archive.
+  const { codesign: _codesign, ...inner } = options;
+
+  await download(url, zipPath, { ...inner, access: fs.constants.W_OK });
+
+  // Re-extract on every postinstall so destPath always reflects the
+  // current archive, even after a version bump that re-downloaded
+  // zipPath above.  copyFileSync overwrites destPath unconditionally,
+  // so a postinstall run while Rancher Desktop or another shell
+  // holds the binary fails with EBUSY/EPERM on Windows or ETXTBSY
+  // on Linux.
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `rd-${ path.basename(destPath, '.exe') }-`));
+  const args = ['unzip', '-q', '-o', zipPath, fileToExtract, '-d', workDir];
+
+  try {
     execFileSync(args[0], args.slice(1), { stdio: 'inherit' });
     fs.copyFileSync(path.join(workDir, fileToExtract), destPath);
     fs.chmodSync(destPath, mode);

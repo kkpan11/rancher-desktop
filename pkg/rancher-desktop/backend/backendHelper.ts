@@ -8,19 +8,28 @@ import yaml from 'yaml';
 import CERT_MANAGER from '@pkg/assets/scripts/cert-manager.yaml';
 import INSTALL_CONTAINERD_SHIMS_SCRIPT from '@pkg/assets/scripts/install-containerd-shims';
 import CONTAINERD_CONFIG from '@pkg/assets/scripts/k3s-containerd-config.toml';
+import _SECCOMP_PROFILE_RAW from '@pkg/assets/scripts/seccomp.json';
 import SPIN_OPERATOR from '@pkg/assets/scripts/spin-operator.yaml';
 import { BackendSettings, VMExecutor } from '@pkg/backend/backend';
 import { LockedFieldError } from '@pkg/config/commandLineOptions';
 import { ContainerEngine, Settings } from '@pkg/config/settings';
 import * as settingsImpl from '@pkg/config/settingsImpl';
 import SettingsValidator from '@pkg/main/commandServer/settingsValidator';
+import { t } from '@pkg/main/i18n';
+import mainEvents from '@pkg/main/mainEvents';
+import { minimumUpgradeVersion, SemanticVersionEntry } from '@pkg/utils/kubeVersions';
 import Logging from '@pkg/utils/logging';
 import paths from '@pkg/utils/paths';
 import { jsonStringifyWithWhiteSpace } from '@pkg/utils/stringify';
 import { showMessageBox } from '@pkg/window';
 
+// raw-loader returns the file's text at runtime, but resolveJsonModule
+// makes TypeScript see a parsed object.  Cast at the import.
+const SECCOMP_PROFILE = _SECCOMP_PROFILE_RAW as unknown as string;
+
 const CONTAINERD_CONFIG_TOML = '/etc/containerd/config.toml';
 const DOCKER_DAEMON_JSON = '/etc/docker/daemon.json';
+const SECCOMP_PROFILE_PATH = '/etc/rancher-desktop/seccomp.json';
 
 const MANIFEST_DIR = '/var/lib/rancher/k3s/server/manifests';
 
@@ -90,7 +99,7 @@ export default class BackendHelper {
 
       // no special cases for 'localhost' and 'host-without-dot:port'; they won't work within the VM
       if (repo[0].includes('.')) {
-        host = repo.shift() as string;
+        host = repo.shift()!;
         if (host === 'docker.io') {
           host = 'registry-1.docker.io';
           // 'docker.io/busybox' means 'registry-1.docker.io/library/busybox'
@@ -114,7 +123,7 @@ export default class BackendHelper {
       }
 
       // match for "image:tag@digest" (tag and digest are both optional)
-      const match = repo[repo.length - 1].match(/^(?<image>.*?)(:(?<tag>.*?))?(@(?<digest>.*))?$/);
+      const match = /^(?<image>.*?)(:(?<tag>.*?))?(@(?<digest>.*))?$/.exec(repo[repo.length - 1]);
       let tag = '[^/]+';
 
       // Strip tag and digest from last fragment of the image name.
@@ -143,19 +152,29 @@ export default class BackendHelper {
     return patterns;
   }
 
-  /**
-   * k3s versions 1.24.1 to 1.24.3 don't support the --docker option and need to talk to
-   * a cri_dockerd endpoint when using the moby engine.
-   */
   static requiresCRIDockerd(engineName: string, kubeVersion: string | semver.SemVer): boolean {
-    return engineName === ContainerEngine.MOBY && semver.gte(kubeVersion, '1.24.1') && semver.lte(kubeVersion, '1.24.3');
+    if (engineName !== ContainerEngine.MOBY) {
+      return false;
+    }
+    const ranges = [
+      // versions 1.24.1 to 1.24.3 don't support the --docker option
+      '1.24.1 - 1.24.3',
+      // cri-dockerd bundled with k3s is not compatible with docker 25.x (using API 1.44)
+      // see https://github.com/k3s-io/k3s/issues/9279
+      '1.26.8 - 1.26.13',
+      '1.27.5 - 1.27.10',
+      '1.28.0 - 1.28.6',
+      '1.29.0 - 1.29.1',
+    ];
+
+    return semver.satisfies(kubeVersion, ranges.join('||'));
   }
 
   static checkForLockedVersion(newVersion: semver.SemVer, cfg: BackendSettings, sv: SettingsValidator): void {
     const [, errors] = sv.validateSettings(cfg as Settings, { kubernetes: { version: newVersion.raw } }, settingsImpl.getLockedSettings());
 
     if (errors.length > 0) {
-      if (errors.some(err => err.match(/field ".*" is locked/))) {
+      if (sv.hasLockedFieldError) {
         throw new LockedFieldError(`Error in deployment profiles:\n${ errors.join('\n') }`);
       } else {
         throw new Error(`Validation errors for requested version ${ newVersion }: ${ errors.join('\n') }`);
@@ -166,13 +185,13 @@ export default class BackendHelper {
   /**
    * Validate the cfg.kubernetes.version string
    * If it's valid and available, use it.
-   * Otherwise fall back to the first (recommended) available version.
+   * Otherwise fall back to the minimum upgrade version (highest patch release of lowest available version).
    */
-  static async getDesiredVersion(cfg: BackendSettings, availableVersions: semver.SemVer[], noModalDialogs: boolean, settingsWriter: (_: any) => void): Promise<semver.SemVer> {
+  static async getDesiredVersion(cfg: BackendSettings, availableVersions: SemanticVersionEntry[], noModalDialogs: boolean, settingsWriter: (_: any) => void): Promise<semver.SemVer> {
     const currentConfigVersionString = cfg?.kubernetes?.version;
     let storedVersion: semver.SemVer | null;
-    let matchedVersion: semver.SemVer | undefined;
-    const invalidK8sVersionMainMessage = `Requested kubernetes version '${ currentConfigVersionString }' is not a valid version.`;
+    let matchedVersion: SemanticVersionEntry | undefined;
+    const invalidK8sVersionMainMessage = t('dialog.invalidK8sVersion.message', { version: currentConfigVersionString });
     const sv = new SettingsValidator();
     const lockedSettings = settingsImpl.getLockedSettings();
     const versionIsLocked = lockedSettings.kubernetes?.version ?? false;
@@ -187,13 +206,20 @@ export default class BackendHelper {
       throw new Error('No kubernetes version available.');
     }
 
-    sv.k8sVersions = availableVersions.map(v => v.version);
+    const upgradeVersion = minimumUpgradeVersion(availableVersions);
+
+    if (!upgradeVersion) {
+      // This should never be reached, as `availableVersions` isn't empty.
+      throw new Error('Failed to find upgrade version.');
+    }
+
+    sv.k8sVersions = availableVersions.map(v => v.version.version);
     if (currentConfigVersionString) {
       storedVersion = semver.parse(currentConfigVersionString);
       if (storedVersion) {
         matchedVersion = availableVersions.find((v) => {
           try {
-            return v.compare(storedVersion as semver.SemVer) === 0;
+            return semver.eq(v.version, storedVersion!);
           } catch (err: any) {
             console.error(`Can't compare versions ${ storedVersion } and ${ v }: `, err);
             if (!(err instanceof TypeError)) {
@@ -206,9 +232,9 @@ export default class BackendHelper {
         });
         if (matchedVersion) {
           // This throws a LockedFieldError if it fails.
-          this.checkForLockedVersion(matchedVersion, cfg, sv);
+          this.checkForLockedVersion(matchedVersion.version, cfg, sv);
 
-          return matchedVersion;
+          return matchedVersion.version;
         } else if (versionIsLocked) {
           // This is a bit subtle. If we're here, the user specified a nonexistent version in the locked manifest.
           // We can't switch to the default version, so throw a fatal error.
@@ -220,7 +246,7 @@ export default class BackendHelper {
         throw new LockedFieldError(`Locked kubernetes version '${ currentConfigVersionString }' isn't a valid version.`);
       }
       const message = invalidK8sVersionMainMessage;
-      const detail = `Falling back to the most recent stable version of ${ availableVersions[0] }`;
+      const detail = t('dialog.invalidK8sVersion.detail', { version: upgradeVersion.version.version });
 
       if (noModalDialogs) {
         console.log(`${ message } ${ detail }`);
@@ -229,18 +255,18 @@ export default class BackendHelper {
           message,
           detail,
           type:    'warning',
-          buttons: ['OK'],
-          title:   'Invalid Kubernetes Version',
+          buttons: [t('generic.ok')],
+          title:   t('dialog.invalidK8sVersion.title'),
         };
 
         await showMessageBox(options, true);
       }
     }
     // No (valid) stored version; save the default one.
-    // Because no version was specified, there can't be a locked version field, so no need to call checkForLockedVersion
-    settingsWriter({ kubernetes: { version: availableVersions[0].version } });
+    // Because no version was specified, there can't be a locked version field, so no need to call checkForLockedVersion.
+    settingsWriter({ kubernetes: { version: upgradeVersion.version.version } });
 
-    return availableVersions[0];
+    return upgradeVersion.version;
   }
 
   /**
@@ -254,7 +280,7 @@ export default class BackendHelper {
       const files = await vmx.execCommand({ capture: true }, '/bin/ls', '-1', '-p', '/usr/local/bin');
 
       for (const file of files.split(/\n/)) {
-        const match = file.match(/^containerd-shim-([-a-z]+)-v\d+$/);
+        const match = /^containerd-shim-([-a-z]+)-v\d+$/.exec(file);
 
         if (match) {
           shims[match[1]] = file;
@@ -339,6 +365,12 @@ export default class BackendHelper {
     let config = CONTAINERD_CONFIG;
 
     if (configureWASM) {
+      // containerd 2.1+ pulls images via the Transfer Service, which won't unpack
+      // non-host platforms; a wasi/wasm image then has no rootfs snapshot and its
+      // runtime-class container fails to create. Local pull unpacks wasi/wasm.
+      config += '\n[plugins."io.containerd.cri.v1.images"]\n';
+      config += '  use_local_image_pull = true\n';
+
       const shims = await BackendHelper.containerdShims(vmx);
 
       for (const shim in shims) {
@@ -352,9 +384,59 @@ export default class BackendHelper {
   }
 
   /**
-   * Configure the Moby containerd-snapshotter feature if WASM support is requested.
+   * Configure the Moby containerd-snapshotter feature if WASM support is
+   * requested, or if we have not previously run the daemon.
    */
-  static async writeMobyConfig(vmx: VMExecutor, configureWASM: boolean) {
+  static async configureMobyStorage(vmx: VMExecutor, storageDriver: 'classic' | 'snapshotter' | 'auto', configureWASM: boolean) {
+    // Due to issues with a botched migration, we will need to provide more logic
+    // to determine whether to use the containerd-snapshotter backend for moby
+    // storage.  See https://github.com/rancher-sandbox/rancher-desktop/issues/9732
+    // for more details.
+
+    // If this directory is not empty, we assume that there is data in the containerd snapshotter.
+    const snapshotterDir = '/var/lib/docker/containerd/daemon/io.containerd.snapshotter.v1.overlayfs/snapshots/';
+    // If this directory is not empty, we assume that there is data in the classic storage.
+    const classicDir = '/var/lib/docker/image/overlay2/imagedb/content/sha256/'; // no-spell-check
+
+    let useSnapshotter: boolean | undefined;
+
+    // Check if a directory (in the VM) has any subdirectories or files.
+    async function dirHasChildren(dir: string): Promise<boolean> {
+      try {
+        const stdout = await vmx.execCommand(
+          { root: true, expectFailure: true, capture: true },
+          '/usr/bin/find', dir, '-maxdepth', '0', '-not', '-empty');
+
+        return stdout.trim().length > 0;
+      } catch {
+        // Directory does not exist.
+        return false;
+      }
+    }
+
+    const hasSnapshotterData = await dirHasChildren(snapshotterDir);
+    const hasClassicData = await dirHasChildren(classicDir);
+
+    // If `storageDriver` is explicitly set, use that setting.
+    if (storageDriver !== 'auto') {
+      useSnapshotter = (storageDriver === 'snapshotter');
+    } else if (configureWASM) {
+      // WASM requires the containerd snapshotter.
+      useSnapshotter = true;
+    } else if (hasSnapshotterData) {
+      // If there is data in the containerd snapshotter store, use it.
+      useSnapshotter = true;
+    } else {
+      // If there is no data in the classic storage, use containerd snapshotter.
+      useSnapshotter = !hasClassicData;
+    }
+    mainEvents.emit('diagnostics-event', {
+      id: 'moby-storage',
+      hasClassicData,
+      hasSnapshotterData,
+      useSnapshotter,
+    });
+
     let config: Record<string, any>;
 
     try {
@@ -363,14 +445,32 @@ export default class BackendHelper {
       await vmx.execCommand({ root: true }, 'mkdir', '-p', path.dirname(DOCKER_DAEMON_JSON));
       config = {};
     }
+    config['min-api-version'] = '1.41';
+    config['seccomp-profile'] = SECCOMP_PROFILE_PATH;
     config['features'] ??= {};
-    config['features']['containerd-snapshotter'] = configureWASM;
+    config['features']['containerd-snapshotter'] = useSnapshotter;
+
+    if (config['features']['containerd-snapshotter']) {
+      // If we are using the containerd snapshotter, create /var/lib/docker/image
+      // to avoid breaking cri-dockerd.
+      await vmx.execCommand({ root: true }, 'mkdir', '-p', '/var/lib/docker/image');
+    }
     await vmx.writeFile(DOCKER_DAEMON_JSON, jsonStringifyWithWhiteSpace(config), 0o644);
   }
 
-  static async configureContainerEngine(vmx: VMExecutor, configureWASM: boolean) {
+  /**
+   * Write the AF_ALG-blocking seccomp profile (CVE-2026-31431 mitigation) to
+   * the VM. nerdctl picks it up via the wrapper script; Docker via daemon.json.
+   */
+  static async writeSeccompProfile(vmx: VMExecutor): Promise<void> {
+    await vmx.execCommand({ root: true }, 'mkdir', '-p', '/etc/rancher-desktop');
+    await vmx.writeFile(SECCOMP_PROFILE_PATH, SECCOMP_PROFILE, 0o644);
+  }
+
+  static async configureContainerEngine(vmx: VMExecutor, configureWASM: boolean, mobyStorageDriver: 'classic' | 'snapshotter' | 'auto') {
     await BackendHelper.installContainerdShims(vmx, configureWASM);
     await BackendHelper.writeContainerdConfig(vmx, configureWASM);
-    await BackendHelper.writeMobyConfig(vmx, configureWASM);
+    await BackendHelper.writeSeccompProfile(vmx);
+    await BackendHelper.configureMobyStorage(vmx, mobyStorageDriver, configureWASM);
   }
 }

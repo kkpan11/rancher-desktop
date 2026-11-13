@@ -1,6 +1,5 @@
 declare module '*.vue' {
-  import Vue from 'vue';
-  /* Load @nuxt/types, as a side effect it augments Vue */
-  import {} from '@nuxt/types';
-  export default Vue;
+  import type { DefineComponent } from 'vue';
+  const component: DefineComponent<object, object, any>;
+  export default component;
 }
